@@ -195,20 +195,24 @@ class AkShareClient:
     # ================================================================
     @staticmethod
     @retry_on_error()
-    @cached("ak_stock_profile", ttl=86400)  # 缓存24小时
-    def get_stock_profile(symbol: str) -> pd.DataFrame:
+    @cached("ak_stock_profile_cninfo", ttl=86400)
+    def get_stock_profile_cninfo(symbol: str) -> pd.DataFrame:
         """
-        获取个股公司简介
+        获取个股公司简介（巨潮资讯）
         
         Args:
-            symbol: 股票代码 (如 "000001")
+            symbol: 股票代码
         
         Returns:
             DataFrame with company profile
         """
-        logger.info(f"Fetching profile for: {symbol}")
-        df = ak.stock_individual_info_em(symbol=symbol)
-        return df
+        logger.info(f"Fetching cninfo profile for: {symbol}")
+        try:
+            df = ak.stock_profile_cninfo(symbol=symbol)
+            return df
+        except Exception as e:
+            logger.warning(f"Failed to get cninfo profile for {symbol}: {e}")
+            return pd.DataFrame()
 
     @staticmethod
     @retry_on_error()

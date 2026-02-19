@@ -77,6 +77,25 @@ class ProfileSyncer:
             return {}
         
         result = {}
+        
+        # 处理巨潮资讯格式（stock_profile_cninfo）- 单行多列
+        if "公司名称" in df.columns or "机构简介" in df.columns:
+            row = df.iloc[0]
+            for col in df.columns:
+                value = row[col]
+                if value and str(value) != "nan" and str(value).strip():
+                    result[col] = str(value).strip()
+            return result
+        
+        # 处理同花顺主营介绍格式（stock_zyjs_ths）
+        if "主营业务" in df.columns:
+            for col in df.columns:
+                value = df[col].iloc[0] if len(df) > 0 else ""
+                if value and str(value) != "nan":
+                    result[col] = str(value).strip()
+            return result
+        
+        # 处理 item-value 格式
         if "item" in df.columns or "项目" in df.columns:
             for _, row in df.iterrows():
                 item = row.get("item", row.get("项目", ""))
@@ -85,6 +104,7 @@ class ProfileSyncer:
                     result[str(item).strip()] = str(value).strip()
             return result
 
+        # 处理两列格式
         if len(df.columns) >= 2:
             first_col = df.columns[0]
             second_col = df.columns[1]
@@ -97,8 +117,23 @@ class ProfileSyncer:
         return result
     
     def _get_profile_df(self, symbol: str, market: str) -> pd.DataFrame:
+        """获取公司简介数据"""
         if market == "CN":
-            return akshare_client.get_stock_profile(symbol)
+            # A股优先使用巨潮资讯（信息最全）
+            try:
+                df = akshare_client.get_stock_profile_cninfo(symbol)
+                if not df.empty:
+                    return df
+            except Exception as e:
+                logger.debug(f"cninfo failed for {symbol}, trying ths: {e}")
+            
+            # 备用：同花顺主营介绍
+            try:
+                return akshare_client.get_stock_business(symbol)
+            except Exception as e:
+                logger.warning(f"Failed to get business for {symbol}: {e}")
+                return pd.DataFrame()
+        
         if market == "HK":
             return akshare_client.get_stock_profile_hk(symbol)
         if market == "US":
@@ -111,6 +146,7 @@ class ProfileSyncer:
         
         Args:
             symbol: 股票代码
+            market: 市场代码
         
         Returns:
             同步结果
@@ -125,18 +161,21 @@ class ProfileSyncer:
             
             # 提取关键字段
             main_business = info.get("主营业务", info.get("经营范围", ""))
-            business_scope = info.get("经营范围", "")
-            products = info.get("核心产品", info.get("主要产品", ""))
-            company_profile = info.get("公司简介", info.get("公司介绍", ""))
+            business_scope = info.get("经营范围", info.get("主营业务", ""))
+            products = info.get("核心产品", info.get("主要产品", info.get("产品名称", "")))
+            company_profile = info.get("公司简介", info.get("公司介绍", info.get("机构简介", "")))
             
-            # 保存到数据库
+            # 获取资产名称
+            asset_name = ""
             with db_manager.meta_session() as session:
-                # 检查资产是否存在
                 asset = session.get(Asset, symbol)
                 if not asset:
                     logger.warning(f"Asset {symbol} not found")
                     return None
-                
+                asset_name = asset.name
+            
+            # 保存到数据库
+            with db_manager.meta_session() as session:
                 # 检查 profile 是否存在
                 profile = session.get(AssetProfile, symbol)
                 
@@ -158,7 +197,7 @@ class ProfileSyncer:
                 session.add(profile)
             
             # 向量化存储到 ChromaDB
-            self._vectorize_profile(symbol, asset.name, main_business, company_profile, market)
+            self._vectorize_profile(symbol, asset_name, main_business, company_profile, market)
             
             return {
                 "symbol": symbol,
@@ -185,65 +224,71 @@ class ProfileSyncer:
         - overview: 公司简介
         - business: 主营业务
         """
-        collection = self._get_collection()
-        now = datetime.utcnow().isoformat()
-        
-        chunks_to_add = []
-        
-        # 公司简介 chunk
-        if company_profile and len(company_profile) > 10:
-            chunks_to_add.append({
-                "id": self._generate_doc_id(symbol, "overview"),
-                "document": f"{name}: {company_profile}",
-                "metadata": {
-                    "symbol": symbol,
-                    "name": name,
-                    "market": market,
-                    "chunk_type": "overview",
-                    "source": "akshare",
-                    "confidence": 1.0,
-                    "doc_version": 1,
-                    "updated_at": now,
-                }
-            })
-        
-        # 主营业务 chunk
-        if main_business and len(main_business) > 10:
-            chunks_to_add.append({
-                "id": self._generate_doc_id(symbol, "business"),
-                "document": f"{name} 主营业务: {main_business}",
-                "metadata": {
-                    "symbol": symbol,
-                    "name": name,
-                    "market": market,
-                    "chunk_type": "business",
-                    "source": "akshare",
-                    "confidence": 1.0,
-                    "doc_version": 1,
-                    "updated_at": now,
-                }
-            })
-        
-        # 批量添加到 ChromaDB
-        if chunks_to_add:
-            ids = [c["id"] for c in chunks_to_add]
-            documents = [c["document"] for c in chunks_to_add]
-            metadatas = [c["metadata"] for c in chunks_to_add]
+        try:
+            # 每次获取新的 collection 实例（线程安全）
+            from core.db import get_collection
+            collection = get_collection('company_chunks')
             
-            # 先删除旧的
-            try:
-                collection.delete(ids=ids)
-            except Exception:
-                pass
+            now = datetime.utcnow().isoformat()
             
-            # 添加新的
-            collection.add(
-                ids=ids,
-                documents=documents,
-                metadatas=metadatas,
-            )
+            chunks_to_add = []
             
-            logger.debug(f"Added {len(chunks_to_add)} chunks for {symbol}")
+            # 公司简介 chunk
+            if company_profile and len(company_profile) > 10:
+                chunks_to_add.append({
+                    "id": self._generate_doc_id(symbol, "overview"),
+                    "document": f"{name}: {company_profile}",
+                    "metadata": {
+                        "symbol": symbol,
+                        "name": name,
+                        "market": market,
+                        "chunk_type": "overview",
+                        "source": "akshare",
+                        "confidence": 1.0,
+                        "doc_version": 1,
+                        "updated_at": now,
+                    }
+                })
+            
+            # 主营业务 chunk
+            if main_business and len(main_business) > 10:
+                chunks_to_add.append({
+                    "id": self._generate_doc_id(symbol, "business"),
+                    "document": f"{name} 主营业务: {main_business}",
+                    "metadata": {
+                        "symbol": symbol,
+                        "name": name,
+                        "market": market,
+                        "chunk_type": "business",
+                        "source": "akshare",
+                        "confidence": 1.0,
+                        "doc_version": 1,
+                        "updated_at": now,
+                    }
+                })
+            
+            # 批量添加到 ChromaDB
+            if chunks_to_add:
+                ids = [c["id"] for c in chunks_to_add]
+                documents = [c["document"] for c in chunks_to_add]
+                metadatas = [c["metadata"] for c in chunks_to_add]
+                
+                # 先删除旧的
+                try:
+                    collection.delete(ids=ids)
+                except Exception:
+                    pass
+                
+                # 添加新的
+                collection.add(
+                    ids=ids,
+                    documents=documents,
+                    metadatas=metadatas,
+                )
+                
+                logger.debug(f"Added {len(chunks_to_add)} chunks for {symbol}")
+        except Exception as e:
+            logger.error(f"Error vectorizing profile for {symbol}: {e}")
     
     def sync_profiles_batch(
         self,
@@ -271,29 +316,29 @@ class ProfileSyncer:
         }
         
         try:
-            # 获取所有资产
+            # 获取所有资产的 symbol 和 market
             with db_manager.meta_session() as session:
-                statement = select(Asset).where(Asset.market == market)
-                assets = list(session.exec(statement).all())
+                statement = select(Asset.symbol, Asset.market).where(Asset.market == market)
+                assets_data = list(session.exec(statement).all())
             
             if limit:
-                assets = assets[:limit]
+                assets_data = assets_data[:limit]
             
-            result["total"] = len(assets)
-            logger.info(f"Syncing profiles for {len(assets)} stocks...")
+            result["total"] = len(assets_data)
+            logger.info(f"Syncing profiles for {len(assets_data)} stocks...")
             
-            for i, asset in enumerate(assets):
+            for i, (symbol, asset_market) in enumerate(assets_data):
                 try:
                     # 检查是否已有简介
                     if skip_existing:
                         with db_manager.meta_session() as session:
-                            existing = session.get(AssetProfile, asset.symbol)
+                            existing = session.get(AssetProfile, symbol)
                             if existing and existing.main_business:
                                 result["skipped"] += 1
                                 continue
                     
                     # 同步简介
-                    sync_result = self.sync_profile(asset.symbol, market=market)
+                    sync_result = self.sync_profile(symbol, market=asset_market)
                     
                     if sync_result:
                         result["synced"] += 1
@@ -302,10 +347,10 @@ class ProfileSyncer:
                     
                     # 进度日志
                     if (i + 1) % 50 == 0:
-                        logger.info(f"Progress: {i + 1}/{len(assets)}")
+                        logger.info(f"Progress: {i + 1}/{len(assets_data)}")
                 
                 except Exception as e:
-                    logger.error(f"Error processing {asset.symbol}: {e}")
+                    logger.error(f"Error processing {symbol}: {e}")
                     result["errors"] += 1
             
             self._update_sync_log(

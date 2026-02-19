@@ -147,17 +147,17 @@ class IndustrySyncer:
             # 获取所有行业
             with db_manager.meta_session() as session:
                 statement = select(Industry)
-                industries = list(session.exec(statement).all())
+                industries_data = [(i.code, i.name) for i in session.exec(statement).all()]
             
             if limit:
-                industries = industries[:limit]
+                industries_data = industries_data[:limit]
             
-            logger.info(f"Processing constituents for {len(industries)} industries...")
+            logger.info(f"Processing constituents for {len(industries_data)} industries...")
             
-            for industry in industries:
+            for industry_code, industry_name in industries_data:
                 try:
                     # 获取成分股
-                    df = akshare_client.get_industry_constituents(industry.name)
+                    df = akshare_client.get_industry_constituents(industry_name)
                     
                     if df is None or df.empty:
                         continue
@@ -178,7 +178,7 @@ class IndustrySyncer:
                                 # 检查关联是否存在
                                 statement = select(AssetIndustryLink).where(
                                     AssetIndustryLink.symbol == symbol,
-                                    AssetIndustryLink.industry_code == industry.code,
+                                    AssetIndustryLink.industry_code == industry_code,
                                 )
                                 existing = session.exec(statement).first()
                                 
@@ -189,7 +189,7 @@ class IndustrySyncer:
                                 else:
                                     link = AssetIndustryLink(
                                         symbol=symbol,
-                                        industry_code=industry.code,
+                                        industry_code=industry_code,
                                         is_primary=True,
                                     )
                                     session.add(link)
@@ -205,7 +205,7 @@ class IndustrySyncer:
                         logger.info(f"Processed {result['industries_processed']} industries...")
                 
                 except Exception as e:
-                    logger.error(f"Error processing industry {industry.name}: {e}")
+                    logger.error(f"Error processing industry {industry_name}: {e}")
                     result["errors"] += 1
             
             self._update_sync_log(

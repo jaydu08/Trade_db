@@ -330,6 +330,64 @@ def clear_cache():
     click.echo("✓ Cache cleared!")
 
 
+@cli.group()
+def strategy():
+    """运行策略"""
+    pass
+
+
+@strategy.command("chain")
+@click.argument("industry")
+@click.option("--top-k", type=int, default=10, help="每个关键词返回结果数")
+@click.option("--min-amount", type=float, default=10000000, help="最小成交额（元）")
+@click.option("--threshold", type=float, default=0.6, help="信号强度阈值")
+@click.option("--no-save", is_flag=True, help="不保存信号到数据库")
+def chain_mining_cmd(industry: str, top_k: int, min_amount: float, threshold: float, no_save: bool):
+    """产业链挖掘策略
+    
+    示例：
+        python main.py strategy chain "AI眼镜"
+        python main.py strategy chain "新能源汽车" --top-k 15
+    """
+    click.echo(f"Running chain mining strategy for: {industry}")
+    click.echo("=" * 50)
+    
+    from strategies.chain_mining import chain_mining_strategy
+    
+    try:
+        result = chain_mining_strategy.run(
+            industry=industry,
+            top_k=top_k,
+            min_amount=min_amount,
+            strength_threshold=threshold,
+            save_to_db=not no_save,
+        )
+        
+        click.echo(f"\n✓ Strategy completed!")
+        click.echo(f"  Chain nodes: {result['chain_nodes']}")
+        click.echo(f"  Matched stocks: {result['matched_stocks']}")
+        click.echo(f"  Filtered stocks: {result['filtered_stocks']}")
+        click.echo(f"  Signals generated: {result['signals_generated']}")
+        
+        if result['stocks']:
+            click.echo(f"\nTop stocks:")
+            for i, stock in enumerate(result['stocks'][:10], 1):
+                click.echo(
+                    f"  {i}. [{stock['symbol']}] {stock['name']} "
+                    f"(匹配度: {stock['match_score']:.2f}, "
+                    f"涨跌: {stock['change_pct']:+.2f}%)"
+                )
+        
+        if not no_save:
+            click.echo(f"\n✓ Signals saved to database")
+    
+    except Exception as e:
+        click.echo(f"✗ Strategy failed: {e}", err=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
 def _parse_markets(markets: str) -> list[str]:
     items = [m.strip().upper() for m in markets.split(",") if m.strip()]
     if not items:

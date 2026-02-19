@@ -146,17 +146,17 @@ class ConceptSyncer:
             # 获取所有概念
             with db_manager.meta_session() as session:
                 statement = select(Concept)
-                concepts = list(session.exec(statement).all())
+                concepts_data = [(c.code, c.name) for c in session.exec(statement).all()]
             
             if limit:
-                concepts = concepts[:limit]
+                concepts_data = concepts_data[:limit]
             
-            logger.info(f"Processing constituents for {len(concepts)} concepts...")
+            logger.info(f"Processing constituents for {len(concepts_data)} concepts...")
             
-            for concept in concepts:
+            for concept_code, concept_name in concepts_data:
                 try:
                     # 获取成分股
-                    df = akshare_client.get_concept_constituents(concept.name)
+                    df = akshare_client.get_concept_constituents(concept_name)
                     
                     if df is None or df.empty:
                         continue
@@ -177,7 +177,7 @@ class ConceptSyncer:
                                 # 检查关联是否存在
                                 statement = select(AssetConceptLink).where(
                                     AssetConceptLink.symbol == symbol,
-                                    AssetConceptLink.concept_code == concept.code,
+                                    AssetConceptLink.concept_code == concept_code,
                                 )
                                 existing = session.exec(statement).first()
                                 
@@ -188,7 +188,7 @@ class ConceptSyncer:
                                 else:
                                     link = AssetConceptLink(
                                         symbol=symbol,
-                                        concept_code=concept.code,
+                                        concept_code=concept_code,
                                         weight=1.0,
                                     )
                                     session.add(link)
@@ -204,7 +204,7 @@ class ConceptSyncer:
                         logger.info(f"Processed {result['concepts_processed']} concepts...")
                 
                 except Exception as e:
-                    logger.error(f"Error processing concept {concept.name}: {e}")
+                    logger.error(f"Error processing concept {concept_name}: {e}")
                     result["errors"] += 1
             
             self._update_sync_log(
