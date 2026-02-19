@@ -27,3 +27,14 @@ __all__ = [
     "PeerGroup",
     "PeerGroupMember",
 ]
+
+# 解决循环依赖: 集中更新 Forward Refs
+Asset.model_rebuild()
+AssetExt.model_rebuild()
+AssetProfile.model_rebuild()
+Concept.model_rebuild()
+AssetConceptLink.model_rebuild()
+Industry.model_rebuild()
+AssetIndustryLink.model_rebuild()
+PeerGroup.model_rebuild()
+PeerGroupMember.model_rebuild()

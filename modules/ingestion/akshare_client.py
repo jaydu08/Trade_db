@@ -55,7 +55,7 @@ class AkShareClient:
     """
     AkShare 客户端封装
     
-    提供常用的 A 股数据获取方法
+    提供常用的市场数据获取方法
     """
     
     # ================================================================
@@ -74,6 +74,28 @@ class AkShareClient:
         logger.info("Fetching A-share stock list...")
         df = ak.stock_info_a_code_name()
         logger.info(f"Fetched {len(df)} A-share stocks")
+        return df
+
+    @staticmethod
+    @retry_on_error()
+    @cached("ak_stock_hk", ttl=3600)
+    def get_stock_info_hk() -> pd.DataFrame:
+        logger.info("Fetching HK stock list...")
+        df = AkShareClient._safe_call(
+            ["stock_hk_spot_em", "stock_hk_spot"]
+        )
+        logger.info(f"Fetched {len(df)} HK stocks")
+        return df
+
+    @staticmethod
+    @retry_on_error()
+    @cached("ak_stock_us", ttl=3600)
+    def get_stock_info_us() -> pd.DataFrame:
+        logger.info("Fetching US stock list...")
+        df = AkShareClient._safe_call(
+            ["stock_us_spot_em", "stock_us_spot"]
+        )
+        logger.info(f"Fetched {len(df)} US stocks")
         return df
     
     @staticmethod
@@ -187,6 +209,26 @@ class AkShareClient:
         logger.info(f"Fetching profile for: {symbol}")
         df = ak.stock_individual_info_em(symbol=symbol)
         return df
+
+    @staticmethod
+    @retry_on_error()
+    @cached("ak_stock_profile_hk", ttl=86400)
+    def get_stock_profile_hk(symbol: str) -> pd.DataFrame:
+        logger.info(f"Fetching HK profile for: {symbol}")
+        return AkShareClient._safe_call(
+            ["stock_hk_profile_em", "stock_hk_profile"],
+            symbol=symbol,
+        )
+
+    @staticmethod
+    @retry_on_error()
+    @cached("ak_stock_profile_us", ttl=86400)
+    def get_stock_profile_us(symbol: str) -> pd.DataFrame:
+        logger.info(f"Fetching US profile for: {symbol}")
+        return AkShareClient._safe_call(
+            ["stock_us_profile_em", "stock_us_profile"],
+            symbol=symbol,
+        )
     
     @staticmethod
     @retry_on_error()
@@ -226,6 +268,18 @@ class AkShareClient:
         df = ak.stock_zh_a_spot_em()
         logger.info(f"Fetched {len(df)} realtime quotes")
         return df
+
+    @staticmethod
+    def _safe_call(func_names: list[str], **kwargs) -> pd.DataFrame:
+        for name in func_names:
+            func = getattr(ak, name, None)
+            if func is None:
+                continue
+            try:
+                return func(**kwargs)
+            except Exception as e:
+                logger.warning(f"AkShare call {name} failed: {e}")
+        return pd.DataFrame()
     
     @staticmethod
     @retry_on_error()

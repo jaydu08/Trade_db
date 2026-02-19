@@ -58,7 +58,7 @@ class Concept(SQLModel, AuditMixin, LiteReservedFieldsMixin, ExtraFieldMixin, ta
     )
     
     # 关系
-    asset_links: list["AssetConceptLink"] = Relationship(back_populates="concept")
+    # asset_links: list["AssetConceptLink"] = Relationship(back_populates="concept")
 
 
 class AssetConceptLink(SQLModel, AuditMixin, ExtraFieldMixin, table=True):
@@ -98,10 +98,11 @@ class AssetConceptLink(SQLModel, AuditMixin, ExtraFieldMixin, table=True):
     )
     
     # 关系
-    asset: Optional["Asset"] = Relationship(back_populates="concept_links")
-    concept: Optional[Concept] = Relationship(back_populates="asset_links")
+    # asset: "Asset" = Relationship(back_populates="concept_links")
+    # concept: "Concept" = Relationship(back_populates="asset_links")
 
 
 # 更新 forward references
+from domain.meta.asset import Asset
 Concept.model_rebuild()
 AssetConceptLink.model_rebuild()

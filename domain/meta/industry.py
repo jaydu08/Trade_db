@@ -58,7 +58,7 @@ class Industry(SQLModel, AuditMixin, LiteReservedFieldsMixin, ExtraFieldMixin, t
     )
     
     # 关系
-    asset_links: list["AssetIndustryLink"] = Relationship(back_populates="industry")
+    # asset_links: list["AssetIndustryLink"] = Relationship(back_populates="industry")
 
 
 class AssetIndustryLink(SQLModel, AuditMixin, ExtraFieldMixin, table=True):
@@ -93,10 +93,11 @@ class AssetIndustryLink(SQLModel, AuditMixin, ExtraFieldMixin, table=True):
     )
     
     # 关系
-    asset: Optional["Asset"] = Relationship(back_populates="industry_links")
-    industry: Optional[Industry] = Relationship(back_populates="asset_links")
+    # asset: "Asset" = Relationship(back_populates="industry_links")
+    # industry: "Industry" = Relationship(back_populates="asset_links")
 
 
 # 更新 forward references
+from domain.meta.asset import Asset
 Industry.model_rebuild()
 AssetIndustryLink.model_rebuild()

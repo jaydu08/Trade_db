@@ -17,13 +17,13 @@ logger = logging.getLogger(__name__)
 
 class AssetSyncer:
     """
-    资产同步器 - 从 AkShare 同步 A 股股票列表到 meta.db
+    资产同步器 - 从 AkShare 同步股票列表到 meta.db
     """
     
     def __init__(self):
-        self.sync_log: Optional[DataSyncLog] = None
+        self.sync_log_id: Optional[int] = None
     
-    def _create_sync_log(self, sync_type: str = "FULL") -> DataSyncLog:
+    def _create_sync_log(self, sync_type: str = "FULL") -> int:
         """创建同步日志"""
         log = DataSyncLog(
             table_name="asset",
@@ -36,7 +36,7 @@ class AssetSyncer:
             session.add(log)
             session.commit()
             session.refresh(log)
-            return log
+            return log.id
     
     def _update_sync_log(
         self,
@@ -70,19 +70,44 @@ class AssetSyncer:
         except Exception:
             return None
     
-    def sync_a_shares(self, full_sync: bool = True) -> dict:
-        """
-        同步 A 股股票列表
-        
-        Args:
-            full_sync: 是否全量同步
-        
-        Returns:
-            同步结果统计
-        """
+    def _extract_symbol_name(self, row: pd.Series) -> tuple[str, str]:
+        symbol_candidates = [
+            "code", "代码", "symbol", "Symbol", "股票代码", "证券代码", "代码.1"
+        ]
+        name_candidates = [
+            "name", "名称", "Name", "股票名称", "证券名称"
+        ]
+        symbol = ""
+        name = ""
+        for key in symbol_candidates:
+            value = row.get(key, "")
+            if value:
+                symbol = str(value).strip()
+                break
+        for key in name_candidates:
+            value = row.get(key, "")
+            if value:
+                name = str(value).strip()
+                break
+        return symbol, name
+
+    def _get_market_df(self, market: str) -> pd.DataFrame:
+        if market == "CN":
+            return akshare_client.get_stock_info_a()
+        if market == "HK":
+            return akshare_client.get_stock_info_hk()
+        if market == "US":
+            return akshare_client.get_stock_info_us()
+        raise ValueError(f"Unsupported market: {market}")
+
+    def sync_market(self, market: str, full_sync: bool = True) -> dict:
         sync_type = "FULL" if full_sync else "INCREMENTAL"
-        self.sync_log = self._create_sync_log(sync_type)
-        
+        try:
+            self.sync_log_id = self._create_sync_log(sync_type)
+        except Exception as e:
+            logger.error(f"Failed to create sync log: {e}")
+            raise
+
         result = {
             "total": 0,
             "inserted": 0,
@@ -91,17 +116,15 @@ class AssetSyncer:
         }
         
         try:
-            # 获取股票列表
-            df = akshare_client.get_stock_info_a()
+            df = self._get_market_df(market)
             result["total"] = len(df)
             
-            logger.info(f"Processing {len(df)} stocks...")
+            logger.info(f"Processing {len(df)} stocks for {market}...")
             
             with db_manager.meta_session() as session:
                 for _, row in df.iterrows():
                     try:
-                        symbol = str(row.get("code", row.get("代码", ""))).strip()
-                        name = str(row.get("name", row.get("名称", ""))).strip()
+                        symbol, name = self._extract_symbol_name(row)
                         
                         if not symbol or not name:
                             continue
@@ -120,7 +143,7 @@ class AssetSyncer:
                             asset = Asset(
                                 symbol=symbol,
                                 name=name,
-                                market="CN",
+                                market=market,
                                 asset_type="STOCK",
                                 listing_status="ACTIVE",
                             )
@@ -133,7 +156,7 @@ class AssetSyncer:
             
             # 更新同步日志
             self._update_sync_log(
-                self.sync_log.id,
+                self.sync_log_id,
                 status="SUCCESS",
                 record_count=result["inserted"] + result["updated"],
             )
@@ -143,12 +166,30 @@ class AssetSyncer:
         
         except Exception as e:
             logger.error(f"Asset sync failed: {e}")
-            self._update_sync_log(
-                self.sync_log.id,
-                status="FAILED",
-                error_msg=str(e),
-            )
+            if self.sync_log_id:
+                self._update_sync_log(
+                    self.sync_log_id,
+                    status="FAILED",
+                    error_msg=str(e),
+                )
             raise
+
+    def sync_markets(self, markets: list[str], full_sync: bool = True) -> dict:
+        summary = {
+            "markets": {},
+            "total": 0,
+            "inserted": 0,
+            "updated": 0,
+            "errors": 0,
+        }
+        for market in markets:
+            result = self.sync_market(market, full_sync=full_sync)
+            summary["markets"][market] = result
+            summary["total"] += result.get("total", 0)
+            summary["inserted"] += result.get("inserted", 0)
+            summary["updated"] += result.get("updated", 0)
+            summary["errors"] += result.get("errors", 0)
+        return summary
     
     def get_all_assets(self, market: str = "CN") -> list[Asset]:
         """获取所有资产"""
@@ -174,4 +215,8 @@ asset_syncer = AssetSyncer()
 
 def sync_assets(full_sync: bool = True) -> dict:
     """同步资产的便捷函数"""
-    return asset_syncer.sync_a_shares(full_sync)
+    return asset_syncer.sync_market("CN", full_sync)
+
+
+def sync_assets_by_markets(markets: list[str], full_sync: bool = True) -> dict:
+    return asset_syncer.sync_markets(markets, full_sync)

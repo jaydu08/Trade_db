@@ -35,7 +35,7 @@ class ProfileSyncer:
             self.collection = get_collection("company_chunks")
         return self.collection
     
-    def _create_sync_log(self, table_name: str, sync_type: str = "FULL") -> DataSyncLog:
+    def _create_sync_log(self, table_name: str, sync_type: str = "FULL") -> int:
         """创建同步日志"""
         log = DataSyncLog(
             table_name=table_name,
@@ -48,7 +48,7 @@ class ProfileSyncer:
             session.add(log)
             session.commit()
             session.refresh(log)
-            return log
+            return log.id
     
     def _update_sync_log(
         self,
@@ -77,15 +77,35 @@ class ProfileSyncer:
             return {}
         
         result = {}
-        for _, row in df.iterrows():
-            item = row.get("item", row.get("项目", ""))
-            value = row.get("value", row.get("值", ""))
-            if item and value:
-                result[str(item).strip()] = str(value).strip()
+        if "item" in df.columns or "项目" in df.columns:
+            for _, row in df.iterrows():
+                item = row.get("item", row.get("项目", ""))
+                value = row.get("value", row.get("值", ""))
+                if item and value:
+                    result[str(item).strip()] = str(value).strip()
+            return result
+
+        if len(df.columns) >= 2:
+            first_col = df.columns[0]
+            second_col = df.columns[1]
+            for _, row in df.iterrows():
+                item = row.get(first_col, "")
+                value = row.get(second_col, "")
+                if item and value:
+                    result[str(item).strip()] = str(value).strip()
         
         return result
     
-    def sync_profile(self, symbol: str) -> Optional[dict]:
+    def _get_profile_df(self, symbol: str, market: str) -> pd.DataFrame:
+        if market == "CN":
+            return akshare_client.get_stock_profile(symbol)
+        if market == "HK":
+            return akshare_client.get_stock_profile_hk(symbol)
+        if market == "US":
+            return akshare_client.get_stock_profile_us(symbol)
+        return pd.DataFrame()
+
+    def sync_profile(self, symbol: str, market: str = "CN") -> Optional[dict]:
         """
         同步单个股票的公司简介
         
@@ -96,8 +116,7 @@ class ProfileSyncer:
             同步结果
         """
         try:
-            # 获取公司信息
-            df = akshare_client.get_stock_profile(symbol)
+            df = self._get_profile_df(symbol, market)
             info = self._parse_stock_info(df)
             
             if not info:
@@ -106,6 +125,8 @@ class ProfileSyncer:
             
             # 提取关键字段
             main_business = info.get("主营业务", info.get("经营范围", ""))
+            business_scope = info.get("经营范围", "")
+            products = info.get("核心产品", info.get("主要产品", ""))
             company_profile = info.get("公司简介", info.get("公司介绍", ""))
             
             # 保存到数据库
@@ -121,19 +142,23 @@ class ProfileSyncer:
                 
                 if profile:
                     profile.main_business = main_business
+                    profile.business_scope = business_scope or profile.business_scope
+                    profile.products = products or profile.products
                     profile.company_profile = company_profile
                     profile.updated_at = datetime.utcnow()
                 else:
                     profile = AssetProfile(
                         symbol=symbol,
                         main_business=main_business,
+                        business_scope=business_scope or None,
+                        products=products or None,
                         company_profile=company_profile,
                     )
                 
                 session.add(profile)
             
             # 向量化存储到 ChromaDB
-            self._vectorize_profile(symbol, asset.name, main_business, company_profile)
+            self._vectorize_profile(symbol, asset.name, main_business, company_profile, market)
             
             return {
                 "symbol": symbol,
@@ -151,6 +176,7 @@ class ProfileSyncer:
         name: str,
         main_business: str,
         company_profile: str,
+        market: str,
     ) -> None:
         """
         将公司简介向量化存储到 ChromaDB
@@ -172,7 +198,7 @@ class ProfileSyncer:
                 "metadata": {
                     "symbol": symbol,
                     "name": name,
-                    "market": "CN",
+                    "market": market,
                     "chunk_type": "overview",
                     "source": "akshare",
                     "confidence": 1.0,
@@ -189,7 +215,7 @@ class ProfileSyncer:
                 "metadata": {
                     "symbol": symbol,
                     "name": name,
-                    "market": "CN",
+                    "market": market,
                     "chunk_type": "business",
                     "source": "akshare",
                     "confidence": 1.0,
@@ -223,6 +249,7 @@ class ProfileSyncer:
         self,
         limit: Optional[int] = None,
         skip_existing: bool = True,
+        market: str = "CN",
     ) -> dict:
         """
         批量同步公司简介
@@ -234,7 +261,7 @@ class ProfileSyncer:
         Returns:
             同步结果统计
         """
-        sync_log = self._create_sync_log("asset_profile", "FULL")
+        sync_log_id = self._create_sync_log("asset_profile", "FULL")
         
         result = {
             "total": 0,
@@ -246,7 +273,7 @@ class ProfileSyncer:
         try:
             # 获取所有资产
             with db_manager.meta_session() as session:
-                statement = select(Asset).where(Asset.market == "CN")
+                statement = select(Asset).where(Asset.market == market)
                 assets = list(session.exec(statement).all())
             
             if limit:
@@ -266,7 +293,7 @@ class ProfileSyncer:
                                 continue
                     
                     # 同步简介
-                    sync_result = self.sync_profile(asset.symbol)
+                    sync_result = self.sync_profile(asset.symbol, market=market)
                     
                     if sync_result:
                         result["synced"] += 1
@@ -282,7 +309,7 @@ class ProfileSyncer:
                     result["errors"] += 1
             
             self._update_sync_log(
-                sync_log.id,
+                sync_log_id,
                 status="SUCCESS",
                 record_count=result["synced"],
             )
@@ -292,7 +319,7 @@ class ProfileSyncer:
         
         except Exception as e:
             logger.error(f"Profile sync failed: {e}")
-            self._update_sync_log(sync_log.id, status="FAILED", error_msg=str(e))
+            self._update_sync_log(sync_log_id, status="FAILED", error_msg=str(e))
             raise
     
     def search_companies(
@@ -342,14 +369,18 @@ class ProfileSyncer:
 profile_syncer = ProfileSyncer()
 
 
-def sync_profile(symbol: str) -> Optional[dict]:
+def sync_profile(symbol: str, market: str = "CN") -> Optional[dict]:
     """同步单个股票简介"""
-    return profile_syncer.sync_profile(symbol)
+    return profile_syncer.sync_profile(symbol, market)
 
 
-def sync_profiles(limit: Optional[int] = None, skip_existing: bool = True) -> dict:
+def sync_profiles(
+    limit: Optional[int] = None,
+    skip_existing: bool = True,
+    market: str = "CN",
+) -> dict:
     """批量同步公司简介"""
-    return profile_syncer.sync_profiles_batch(limit, skip_existing)
+    return profile_syncer.sync_profiles_batch(limit, skip_existing, market)
 
 
 def search_companies(query: str, n_results: int = 10) -> list[dict]:

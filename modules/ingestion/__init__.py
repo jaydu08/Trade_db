@@ -5,6 +5,7 @@ from modules.ingestion.akshare_client import akshare_client, AkShareClient
 from modules.ingestion.sync_asset import (
     asset_syncer,
     sync_assets,
+    sync_assets_by_markets,
 )
 from modules.ingestion.sync_concept import (
     concept_syncer,
@@ -30,6 +31,7 @@ __all__ = [
     # Asset Syncer
     "asset_syncer",
     "sync_assets",
+    "sync_assets_by_markets",
     # Concept Syncer
     "concept_syncer",
     "sync_concepts",

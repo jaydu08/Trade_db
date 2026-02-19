@@ -9,11 +9,13 @@ Usage:
     python main.py sync industries   # 同步行业分类
     python main.py sync profiles     # 同步公司简介
     python main.py sync all          # 同步所有数据
+    python main.py sync daemon       # 后台循环同步
     python main.py search "光波导"   # 语义搜索
     python main.py stats             # 显示统计信息
 """
 import sys
 import logging
+import time
 from pathlib import Path
 
 # 添加项目根目录到 path
@@ -61,15 +63,19 @@ def sync():
 
 
 @sync.command("assets")
-def sync_assets_cmd():
-    """同步 A 股股票列表"""
-    click.echo("Syncing A-share stocks...")
+@click.option("--markets", type=str, default="CN", help="市场列表: CN,HK,US,ALL")
+def sync_assets_cmd(markets: str):
+    """同步股票列表"""
+    click.echo("Syncing stocks...")
     
-    from modules.ingestion import sync_assets
+    from modules.ingestion import sync_assets_by_markets
     
     try:
-        result = sync_assets()
-        click.echo(f"✓ Synced {result['inserted']} new, {result['updated']} updated")
+        markets_list = _parse_markets(markets)
+        result = sync_assets_by_markets(markets_list)
+        click.echo(
+            f"✓ Synced {result['inserted']} new, {result['updated']} updated"
+        )
     except Exception as e:
         click.echo(f"✗ Sync failed: {e}", err=True)
         sys.exit(1)
@@ -122,15 +128,28 @@ def sync_industries_cmd(with_constituents: bool, limit: int):
 @sync.command("profiles")
 @click.option("--limit", type=int, default=None, help="限制同步数量")
 @click.option("--force", is_flag=True, help="强制重新同步已有数据")
-def sync_profiles_cmd(limit: int, force: bool):
+@click.option("--markets", type=str, default="CN", help="市场列表: CN,HK,US,ALL")
+def sync_profiles_cmd(limit: int, force: bool, markets: str):
     """同步公司简介并向量化"""
     click.echo("Syncing company profiles...")
     
     from modules.ingestion import sync_profiles
     
     try:
-        result = sync_profiles(limit=limit, skip_existing=not force)
-        click.echo(f"✓ Synced {result['synced']}, skipped {result['skipped']}, errors {result['errors']}")
+        markets_list = _parse_markets(markets)
+        summary = {"synced": 0, "skipped": 0, "errors": 0}
+        for market in markets_list:
+            result = sync_profiles(
+                limit=limit,
+                skip_existing=not force,
+                market=market,
+            )
+            summary["synced"] += result["synced"]
+            summary["skipped"] += result["skipped"]
+            summary["errors"] += result["errors"]
+        click.echo(
+            f"✓ Synced {summary['synced']}, skipped {summary['skipped']}, errors {summary['errors']}"
+        )
     except Exception as e:
         click.echo(f"✗ Sync failed: {e}", err=True)
         sys.exit(1)
@@ -138,20 +157,22 @@ def sync_profiles_cmd(limit: int, force: bool):
 
 @sync.command("all")
 @click.option("--profiles-limit", type=int, default=100, help="公司简介同步数量限制")
-def sync_all_cmd(profiles_limit: int):
+@click.option("--markets", type=str, default="CN,HK,US", help="市场列表: CN,HK,US,ALL")
+def sync_all_cmd(profiles_limit: int, markets: str):
     """同步所有数据"""
     click.echo("=" * 50)
     click.echo("Starting full sync...")
     click.echo("=" * 50)
     
     from modules.ingestion import (
-        sync_assets, sync_concepts, sync_industries, sync_profiles
+        sync_assets_by_markets, sync_concepts, sync_industries, sync_profiles
     )
     
     try:
+        markets_list = _parse_markets(markets)
         # 1. 同步股票列表
         click.echo("\n[1/4] Syncing assets...")
-        result = sync_assets()
+        result = sync_assets_by_markets(markets_list)
         click.echo(f"✓ Assets: {result['inserted']} new, {result['updated']} updated")
         
         # 2. 同步概念板块
@@ -166,8 +187,11 @@ def sync_all_cmd(profiles_limit: int):
         
         # 4. 同步公司简介 (限制数量)
         click.echo(f"\n[4/4] Syncing profiles (limit={profiles_limit})...")
-        result = sync_profiles(limit=profiles_limit)
-        click.echo(f"✓ Profiles: {result['synced']} synced")
+        profile_total = 0
+        for market in markets_list:
+            result = sync_profiles(limit=profiles_limit, market=market)
+            profile_total += result["synced"]
+        click.echo(f"✓ Profiles: {profile_total} synced")
         
         click.echo("\n" + "=" * 50)
         click.echo("Full sync completed!")
@@ -176,6 +200,41 @@ def sync_all_cmd(profiles_limit: int):
     except Exception as e:
         click.echo(f"✗ Sync failed: {e}", err=True)
         sys.exit(1)
+
+
+@sync.command("daemon")
+@click.option("--markets", type=str, default="CN,HK,US", help="市场列表: CN,HK,US,ALL")
+@click.option("--interval", type=int, default=3600, help="循环间隔(秒)")
+@click.option("--profiles-limit", type=int, default=0, help="公司简介同步数量限制")
+@click.option("--once", is_flag=True, help="只执行一次")
+def sync_daemon_cmd(markets: str, interval: int, profiles_limit: int, once: bool):
+    click.echo("Starting sync daemon...")
+    from modules.ingestion import (
+        sync_assets_by_markets,
+        sync_concepts,
+        sync_industries,
+        sync_profiles,
+    )
+    markets_list = _parse_markets(markets)
+    while True:
+        try:
+            click.echo("Syncing assets...")
+            sync_assets_by_markets(markets_list)
+            click.echo("Syncing concepts...")
+            sync_concepts()
+            click.echo("Syncing industries...")
+            sync_industries()
+            click.echo("Syncing profiles...")
+            for market in markets_list:
+                sync_profiles(
+                    limit=profiles_limit if profiles_limit > 0 else None,
+                    market=market,
+                )
+        except Exception as e:
+            click.echo(f"✗ Sync failed: {e}", err=True)
+        if once:
+            break
+        time.sleep(interval)
 
 
 @cli.command()
@@ -269,6 +328,15 @@ def clear_cache():
     click.echo("Clearing cache...")
     cache_manager.clear()
     click.echo("✓ Cache cleared!")
+
+
+def _parse_markets(markets: str) -> list[str]:
+    items = [m.strip().upper() for m in markets.split(",") if m.strip()]
+    if not items:
+        return ["CN"]
+    if "ALL" in items:
+        return ["CN", "HK", "US"]
+    return items
 
 
 if __name__ == "__main__":

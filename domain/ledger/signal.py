@@ -77,9 +77,9 @@ class Signal(SQLModel, CoreTableMixin, table=True):
     )
     
     # 关系
-    strategy_run: Optional["StrategyRun"] = Relationship(back_populates="signals")
-    orders: list["Order"] = Relationship(back_populates="signal")
-    extensions: list["SignalExt"] = Relationship(back_populates="signal")
+    # strategy_run: "StrategyRun" = Relationship(back_populates="signals")
+    # orders: list["Order"] = Relationship(back_populates="signal")
+    # extensions: list["SignalExt"] = Relationship(back_populates="signal")
 
 
 class SignalExt(SQLModel, ExtTableMixin, ExtFieldValueMixin, table=True):
@@ -99,9 +99,11 @@ class SignalExt(SQLModel, ExtTableMixin, ExtFieldValueMixin, table=True):
     )
     
     # 关系
-    signal: Optional[Signal] = Relationship(back_populates="extensions")
+    # signal: Optional[Signal] = Relationship(back_populates="extensions")
 
 
 # 更新 forward references
+from domain.ledger.strategy import StrategyRun
+from domain.ledger.order import Order
 Signal.model_rebuild()
 SignalExt.model_rebuild()

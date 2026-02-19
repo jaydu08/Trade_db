@@ -127,7 +127,7 @@ class StrategyRun(SQLModel, AuditMixin, ExtraFieldMixin, table=True):
     )
     
     # 关系
-    strategy: Optional[Strategy] = Relationship(back_populates="runs")
+    strategy: Strategy = Relationship(back_populates="runs")
     signals: list["Signal"] = Relationship(back_populates="strategy_run")
 
 

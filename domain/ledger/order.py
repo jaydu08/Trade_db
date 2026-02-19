@@ -95,8 +95,9 @@ class Order(SQLModel, AuditMixin, LiteReservedFieldsMixin, ExtraFieldMixin, tabl
     )
     
     # 关系
-    signal: Optional["Signal"] = Relationship(back_populates="orders")
+    # signal: "Signal" = Relationship(back_populates="orders")
 
 
 # 更新 forward references
+from domain.ledger.signal import Signal
 Order.model_rebuild()

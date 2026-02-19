@@ -23,7 +23,7 @@ class ConceptSyncer:
     def __init__(self):
         self.sync_log: Optional[DataSyncLog] = None
     
-    def _create_sync_log(self, table_name: str, sync_type: str = "FULL") -> DataSyncLog:
+    def _create_sync_log(self, table_name: str, sync_type: str = "FULL") -> int:
         """创建同步日志"""
         log = DataSyncLog(
             table_name=table_name,
@@ -36,7 +36,7 @@ class ConceptSyncer:
             session.add(log)
             session.commit()
             session.refresh(log)
-            return log
+            return log.id
     
     def _update_sync_log(
         self,
@@ -62,7 +62,7 @@ class ConceptSyncer:
         Returns:
             同步结果统计
         """
-        sync_log = self._create_sync_log("concept", "FULL")
+        sync_log_id = self._create_sync_log("concept", "FULL")
         
         result = {
             "total": 0,
@@ -110,7 +110,7 @@ class ConceptSyncer:
                         result["errors"] += 1
             
             self._update_sync_log(
-                sync_log.id,
+                sync_log_id,
                 status="SUCCESS",
                 record_count=result["inserted"] + result["updated"],
             )
@@ -120,7 +120,7 @@ class ConceptSyncer:
         
         except Exception as e:
             logger.error(f"Concept sync failed: {e}")
-            self._update_sync_log(sync_log.id, status="FAILED", error_msg=str(e))
+            self._update_sync_log(sync_log_id, status="FAILED", error_msg=str(e))
             raise
     
     def sync_concept_constituents(self, limit: Optional[int] = None) -> dict:
@@ -133,7 +133,7 @@ class ConceptSyncer:
         Returns:
             同步结果统计
         """
-        sync_log = self._create_sync_log("asset_concept_link", "FULL")
+        sync_log_id = self._create_sync_log("asset_concept_link", "FULL")
         
         result = {
             "concepts_processed": 0,
@@ -208,7 +208,7 @@ class ConceptSyncer:
                     result["errors"] += 1
             
             self._update_sync_log(
-                sync_log.id,
+                sync_log_id,
                 status="SUCCESS",
                 record_count=result["links_inserted"] + result["links_updated"],
             )
@@ -218,7 +218,7 @@ class ConceptSyncer:
         
         except Exception as e:
             logger.error(f"Concept constituents sync failed: {e}")
-            self._update_sync_log(sync_log.id, status="FAILED", error_msg=str(e))
+            self._update_sync_log(sync_log_id, status="FAILED", error_msg=str(e))
             raise
     
     def get_all_concepts(self) -> list[Concept]:

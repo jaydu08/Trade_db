@@ -23,7 +23,7 @@ class IndustrySyncer:
     def __init__(self):
         self.sync_log: Optional[DataSyncLog] = None
     
-    def _create_sync_log(self, table_name: str, sync_type: str = "FULL") -> DataSyncLog:
+    def _create_sync_log(self, table_name: str, sync_type: str = "FULL") -> int:
         """创建同步日志"""
         log = DataSyncLog(
             table_name=table_name,
@@ -36,7 +36,7 @@ class IndustrySyncer:
             session.add(log)
             session.commit()
             session.refresh(log)
-            return log
+            return log.id
     
     def _update_sync_log(
         self,
@@ -62,7 +62,7 @@ class IndustrySyncer:
         Returns:
             同步结果统计
         """
-        sync_log = self._create_sync_log("industry", "FULL")
+        sync_log_id = self._create_sync_log("industry", "FULL")
         
         result = {
             "total": 0,
@@ -111,7 +111,7 @@ class IndustrySyncer:
                         result["errors"] += 1
             
             self._update_sync_log(
-                sync_log.id,
+                sync_log_id,
                 status="SUCCESS",
                 record_count=result["inserted"] + result["updated"],
             )
@@ -121,12 +121,12 @@ class IndustrySyncer:
         
         except Exception as e:
             logger.error(f"Industry sync failed: {e}")
-            self._update_sync_log(sync_log.id, status="FAILED", error_msg=str(e))
+            self._update_sync_log(sync_log_id, status="FAILED", error_msg=str(e))
             raise
     
     def sync_industry_constituents(self, limit: Optional[int] = None) -> dict:
         """
-        同步行业板块成分股关联
+        同步行业分类成分股关联
         
         Args:
             limit: 限制同步的行业数量 (用于测试)
@@ -134,7 +134,7 @@ class IndustrySyncer:
         Returns:
             同步结果统计
         """
-        sync_log = self._create_sync_log("asset_industry_link", "FULL")
+        sync_log_id = self._create_sync_log("asset_industry_link", "FULL")
         
         result = {
             "industries_processed": 0,
@@ -209,7 +209,7 @@ class IndustrySyncer:
                     result["errors"] += 1
             
             self._update_sync_log(
-                sync_log.id,
+                sync_log_id,
                 status="SUCCESS",
                 record_count=result["links_inserted"] + result["links_updated"],
             )
@@ -219,7 +219,7 @@ class IndustrySyncer:
         
         except Exception as e:
             logger.error(f"Industry constituents sync failed: {e}")
-            self._update_sync_log(sync_log.id, status="FAILED", error_msg=str(e))
+            self._update_sync_log(sync_log_id, status="FAILED", error_msg=str(e))
             raise
     
     def get_all_industries(self) -> list[Industry]:

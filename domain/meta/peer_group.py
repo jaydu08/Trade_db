@@ -44,7 +44,7 @@ class PeerGroup(SQLModel, AuditMixin, ExtraFieldMixin, table=True):
     )
     
     # 关系
-    members: list["PeerGroupMember"] = Relationship(back_populates="group")
+    # members: list["PeerGroupMember"] = Relationship(back_populates="group")
 
 
 class PeerGroupMember(SQLModel, AuditMixin, ExtraFieldMixin, table=True):
@@ -85,7 +85,7 @@ class PeerGroupMember(SQLModel, AuditMixin, ExtraFieldMixin, table=True):
     )
     
     # 关系
-    group: Optional[PeerGroup] = Relationship(back_populates="members")
+    # group: PeerGroup = Relationship(back_populates="members")
 
 
 # 更新 forward references
