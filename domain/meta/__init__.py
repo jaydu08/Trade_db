@@ -8,12 +8,14 @@ from domain.meta.profile import AssetProfile
 from domain.meta.field_mapping import FieldMapping
 from domain.meta.sync_log import DataSyncLog
 from domain.meta.peer_group import PeerGroup, PeerGroupMember
+from domain.meta.financial import AssetFinancial
 
 __all__ = [
     # 资产
     "Asset",
     "AssetExt",
     "AssetProfile",
+    "AssetFinancial",
     # 概念
     "Concept",
     "AssetConceptLink",

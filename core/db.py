@@ -94,7 +94,8 @@ class DatabaseManager:
         from domain.meta import (
             Asset, AssetExt, Concept, AssetConceptLink,
             Industry, AssetIndustryLink, AssetProfile,
-            FieldMapping, DataSyncLog, PeerGroup, PeerGroupMember
+            FieldMapping, DataSyncLog, PeerGroup, PeerGroupMember,
+            AssetFinancial
         )
         SQLModel.metadata.create_all(self.meta_engine)
         logger.info("Meta database tables created")

@@ -160,10 +160,11 @@ class ProfileSyncer:
                 return None
             
             # 提取关键字段
-            main_business = info.get("主营业务", info.get("经营范围", ""))
-            business_scope = info.get("经营范围", info.get("主营业务", ""))
+            # Support both CN/HK (Chinese keys) and US (English keys from XueQiu)
+            main_business = info.get("主营业务", info.get("经营范围", info.get("main_operation_business", "")))
+            business_scope = info.get("经营范围", info.get("主营业务", info.get("operating_scope", "")))
             products = info.get("核心产品", info.get("主要产品", info.get("产品名称", "")))
-            company_profile = info.get("公司简介", info.get("公司介绍", info.get("机构简介", "")))
+            company_profile = info.get("公司简介", info.get("公司介绍", info.get("机构简介", info.get("org_cn_introduction", ""))))
             
             # 获取资产名称
             asset_name = ""

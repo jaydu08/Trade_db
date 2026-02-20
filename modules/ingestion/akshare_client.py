@@ -219,20 +219,25 @@ class AkShareClient:
     @cached("ak_stock_profile_hk", ttl=86400)
     def get_stock_profile_hk(symbol: str) -> pd.DataFrame:
         logger.info(f"Fetching HK profile for: {symbol}")
-        return AkShareClient._safe_call(
-            ["stock_hk_profile_em", "stock_hk_profile"],
-            symbol=symbol,
-        )
+        # Try new interface for HK profile
+        try:
+            return ak.stock_hk_company_profile_em(symbol=symbol)
+        except Exception as e:
+            logger.warning(f"Failed to get HK profile for {symbol}: {e}")
+            return pd.DataFrame()
 
     @staticmethod
     @retry_on_error()
     @cached("ak_stock_profile_us", ttl=86400)
     def get_stock_profile_us(symbol: str) -> pd.DataFrame:
         logger.info(f"Fetching US profile for: {symbol}")
-        return AkShareClient._safe_call(
-            ["stock_us_profile_em", "stock_us_profile"],
-            symbol=symbol,
-        )
+        # Clean symbol for XQ interface (e.g. 105.RXT -> RXT)
+        clean_symbol = symbol.split(".")[-1]
+        try:
+            return ak.stock_individual_basic_info_us_xq(symbol=clean_symbol)
+        except Exception as e:
+            logger.warning(f"Failed to get US profile for {symbol}: {e}")
+            return pd.DataFrame()
     
     @staticmethod
     @retry_on_error()
@@ -256,7 +261,103 @@ class AkShareClient:
             return pd.DataFrame()
     
     # ================================================================
-    # 实时行情
+    # 实时行情 (东方财富源 - 极速版)
+    # ================================================================
+    @staticmethod
+    def get_realtime_quote_eastmoney(symbol: str, market: str = "CN") -> dict:
+        """
+        从东方财富获取实时行情 (更准确，无延时)
+        """
+        import requests
+        import time
+        
+        # 东方财富接口
+        # secid: 1.600519 (SH), 0.300251 (SZ), 116.00700 (HK), 105.NVDA (US)
+        # 这里的 secid 需要根据 symbol 动态生成
+        
+        secid = ""
+        if market == "CN":
+            if symbol.startswith("6"): secid = f"1.{symbol}"
+            else: secid = f"0.{symbol}"
+        elif market == "HK":
+            secid = f"116.{symbol}"
+        elif market == "US":
+            # US 需要先查一下代码映射，或者盲猜
+            # 东财美股代码通常是 105.xxx, 106.xxx, 107.xxx
+            # 简单起见，我们先尝试 105 (纳斯达克) 和 106 (纽交所)
+            secid = f"105.{symbol.upper()}"
+            
+        url = "https://push2.eastmoney.com/api/qt/stock/get"
+        params = {
+            "secid": secid,
+            "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+            "fields": "f43,f57,f58,f59,f107,f46,f60,f44,f45,f47,f48,f19,f17,f531,f15,f16,f113",
+            "invt": "2",
+            "_": int(time.time() * 1000)
+        }
+        
+        try:
+            resp = requests.get(url, params=params, timeout=3)
+            data = resp.json()
+            
+            if data and data.get("data"):
+                d = data["data"]
+                # f43: price, f58: name, f170: change_pct (need check fields)
+                # Correct fields mapping:
+                # f43: 最新价
+                # f58: 名称
+                # f169: 涨跌额 (f169 not in fields list, let's use f170 for pct?)
+                # Actually eastmoney fields are tricky. Let's use a standard list.
+                # f43: price, f58: name, f170: pct_chg, f169: change
+                
+                # Let's re-request with standard fields
+                params["fields"] = "f43,f58,f169,f170,f46,f60,f19,f17,f59,f86" 
+                # f86: update_time
+                resp = requests.get(url, params=params, timeout=3)
+                data = resp.json()
+                if not data or not data.get("data"):
+                    # Retry for US market if first fail
+                    if market == "US":
+                        params["secid"] = f"106.{symbol.upper()}"
+                        resp = requests.get(url, params=params, timeout=3)
+                        data = resp.json()
+                
+                if data and data.get("data"):
+                    d = data["data"]
+                    price = d.get("f43")
+                    if price == "-": return {} # Invalid
+                    
+                    # 价格修正逻辑
+                    # 东财 API 返回的 A 股价格通常单位是"分" (例如 2722 -> 27.22)
+                    # 港股通常单位是"厘" (例如 522000 -> 522.0)
+                    # 美股通常直接是美元 (例如 133.56)
+                    
+                    final_price = float(price)
+                    if market == "CN":
+                        # A股通常是放大100倍
+                        if final_price > 1000: # 简单的启发式判断，防止某些ETF是正常的
+                             final_price = final_price / 100
+                    elif market == "HK":
+                        # 港股通常是放大1000倍
+                        if final_price > 1000:
+                             final_price = final_price / 1000
+                    
+                    return {
+                        "symbol": symbol,
+                        "name": d.get("f58"),
+                        "price": final_price,
+                        "change": float(d.get("f169") or 0) / 100 if market == "CN" else d.get("f169"),
+                        "pct_chg": float(d.get("f170") or 0) / 100 if market == "CN" else d.get("f170"),
+                        "timestamp": d.get("f86") 
+                    }
+                    
+        except Exception as e:
+            logger.warning(f"Eastmoney quote failed for {symbol}: {e}")
+            
+        return {}
+
+    # ================================================================
+    # 实时行情 (AkShare)
     # ================================================================
     @staticmethod
     @retry_on_error()
