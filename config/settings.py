@@ -6,6 +6,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Final, Dict
 
+import os
+
+# ============================================================
+# Telegram 配置
+# ============================================================
+TELEGRAM_BOT_TOKEN: Final[str] = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_ADMIN_ID: Final[int] = int(os.getenv("TELEGRAM_ADMIN_ID", "0") or 0)
+
 # ============================================================
 # 路径配置
 # ============================================================

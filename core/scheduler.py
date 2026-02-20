@@ -56,8 +56,18 @@ class TaskScheduler:
             name="研报同步",
             replace_existing=True
         )
+
+        # 3. 异动监控 (每 1 分钟)
+        from modules.monitor.scanner import MonitorService
+        self.scheduler.add_job(
+            MonitorService.scan_and_alert,
+            IntervalTrigger(minutes=1),
+            id="monitor_scan",
+            name="异动监控",
+            replace_existing=True
+        )
         
-        # 3. 财务数据/Profile 更新 (每天 02:00)
+        # 4. 财务数据/Profile 更新 (每天 02:00)
         # self.scheduler.add_job(...)
         
         logger.info(f"Registered {len(self.scheduler.get_jobs())} jobs.")

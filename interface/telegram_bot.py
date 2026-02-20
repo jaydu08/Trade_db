@@ -73,17 +73,43 @@ class TelegramHTMLRenderer:
         # 3. Join with newlines
         return '\n'.join(html_lines)
 
+# Global variable to store the last chat ID for notifications
+LAST_CHAT_ID = None
+bot_instance = None
+
 class TelegramBot:
     """
     Telegram Bot 服务
     """
     def __init__(self, token: str, allowed_users: List[int] = None):
+        global bot_instance
         self.token = token
         self.allowed_users = allowed_users or []
         self.app = ApplicationBuilder().token(token).build()
         # self.llm = get_llm_client() # Replaced by Agent
         
         self._register_handlers()
+        bot_instance = self
+
+    @staticmethod
+    async def send_alert(message: str):
+        """主动发送报警消息"""
+        if not bot_instance or not bot_instance.app:
+            logger.warning("Bot not initialized, cannot send alert.")
+            return
+            
+        if not LAST_CHAT_ID:
+            logger.warning("No chat ID found (User hasn't interacted yet). Cannot send alert.")
+            return
+            
+        try:
+            await bot_instance.app.bot.send_message(
+                chat_id=LAST_CHAT_ID, 
+                text=message, 
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send alert: {e}")
 
     def run(self):
         """启动 Bot (Blocking)"""
@@ -93,6 +119,12 @@ class TelegramBot:
     async def _check_auth(self, update: Update) -> bool:
         """鉴权"""
         user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+        
+        # Auto-record the chat ID for alerts
+        global LAST_CHAT_ID
+        LAST_CHAT_ID = chat_id
+
         if self.allowed_users and user_id not in self.allowed_users:
             await update.message.reply_text(f"⛔️ Access Denied (ID: {user_id})")
             return False
@@ -104,7 +136,58 @@ class TelegramBot:
         self.app.add_handler(CommandHandler("help", self.cmd_help))
         self.app.add_handler(CommandHandler("quote", self.cmd_quote))
         self.app.add_handler(CommandHandler("chain", self.cmd_chain))
+        self.app.add_handler(CommandHandler("monitor", self.cmd_monitor))
         self.app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self.handle_message))
+
+    async def cmd_monitor(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """股票监控管理"""
+        if not await self._check_auth(update): return
+        
+        args = context.args
+        if not args:
+            await update.message.reply_text(
+                "📉 **智能异动监控**\n\n"
+                "指令示例:\n"
+                "/monitor add 腾讯  (添加监控)\n"
+                "/monitor list     (查看列表)\n"
+                "/monitor del 00700 (移除监控)",
+                parse_mode="Markdown"
+            )
+            return
+
+        action = args[0].lower()
+        
+        try:
+            from modules.monitor.manager import MonitorManager
+            
+            if action == "add":
+                if len(args) < 2:
+                    await update.message.reply_text("请提供股票名称或代码。")
+                    return
+                query = " ".join(args[1:])
+                await update.message.reply_text(f"🔍 正在识别股票: {query}...")
+                
+                # Run in thread to avoid blocking
+                msg = await asyncio.to_thread(MonitorManager.add_stock, query)
+                await update.message.reply_text(msg)
+                
+            elif action == "list":
+                msg = await asyncio.to_thread(MonitorManager.list_stocks)
+                await update.message.reply_text(msg, parse_mode="Markdown")
+                
+            elif action == "del" or action == "remove":
+                if len(args) < 2:
+                    await update.message.reply_text("请提供要移除的代码。")
+                    return
+                symbol = args[1]
+                msg = await asyncio.to_thread(MonitorManager.remove_stock, symbol)
+                await update.message.reply_text(msg)
+                
+            else:
+                await update.message.reply_text("未知指令。请使用 add, list, 或 del。")
+                
+        except Exception as e:
+            await update.message.reply_text(f"❌ 操作失败: {e}")
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_auth(update): return
@@ -183,30 +266,63 @@ class TelegramBot:
             await update.message.reply_text(f"❌ 分析失败: {e}")
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """处理自然语言消息 (Agent 版)"""
+        """处理文本消息"""
         if not await self._check_auth(update): return
         
-        user_text = update.message.text
+        text = update.message.text.strip()
         
-        # Indicate typing
+        # 快捷指令处理
+        if text.startswith(("+", "add ", "监控 ")):
+            # 添加监控: +腾讯, add 腾讯, 监控 腾讯
+            query = text.lstrip("+").replace("add ", "").replace("监控 ", "").strip()
+            if query:
+                from modules.monitor.manager import MonitorManager
+                await update.message.reply_text(f"🔍 正在识别: {query}...")
+                
+                # Pass chat_id
+                chat_id = update.effective_chat.id
+                msg = await asyncio.to_thread(MonitorManager.add_stock, query, chat_id)
+                await update.message.reply_text(msg)
+            return
+            
+        if text.startswith(("-", "del ", "rm ", "删除 ")):
+            # 删除监控: -00700, del 00700
+            symbol = text.lstrip("-").replace("del ", "").replace("rm ", "").replace("删除 ", "").strip()
+            if symbol:
+                from modules.monitor.manager import MonitorManager
+                msg = await asyncio.to_thread(MonitorManager.remove_stock, symbol)
+                await update.message.reply_text(msg)
+            return
+            
+        if text.lower() in ("list", "ls", "监控列表", "自选股"):
+            # 查看列表
+            from modules.monitor.manager import MonitorManager
+            msg = await asyncio.to_thread(MonitorManager.list_stocks)
+            await update.message.reply_text(msg, parse_mode="Markdown")
+            return
+
+        # 默认行为：调用 Agent 进行对话
+        status_msg = await update.message.reply_text("🤖 思考中...")
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
         
         try:
-            # Run in thread
-            response = await asyncio.to_thread(agent_executor.run, user_text)
+            # Run Agent logic
+            response = await asyncio.to_thread(agent_executor.run, text)
             
             # Use HTML Renderer
             html_response = TelegramHTMLRenderer.render(response)
             
-            # Simple split for long messages
+            if not html_response or not html_response.strip():
+                html_response = response if response else "❌ 生成内容为空。"
+            
             if len(html_response) > 4000:
-                await update.message.reply_text(html_response[:4000], parse_mode="HTML")
+                await status_msg.edit_text(html_response[:4000], parse_mode="HTML")
                 await update.message.reply_text(html_response[4000:], parse_mode="HTML")
             else:
-                await update.message.reply_text(html_response, parse_mode="HTML")
+                await status_msg.edit_text(html_response, parse_mode="HTML")
                 
         except Exception as e:
-            await update.message.reply_text(f"Agent Error: {e}")
+            await status_msg.edit_text(f"❌ 错误: {e}")
 
 # Factory
 def create_bot():

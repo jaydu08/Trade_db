@@ -31,11 +31,14 @@ class Tools:
             # Try different backends in order
             for backend in ['api', 'html', 'lite']:
                 try:
-                    # logger.info(f"Trying DDGS backend: {backend}")
                     res = DDGS().text(query, max_results=5, backend=backend)
                     if res:
-                        results = res
-                        break
+                        # Validate structure
+                        if isinstance(res, list) and len(res) > 0 and 'body' in res[0]:
+                            results = res
+                            break
+                        else:
+                            logger.warning(f"DDGS returned invalid structure: {res}")
                 except Exception:
                     continue
         except Exception as e:

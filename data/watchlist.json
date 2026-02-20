@@ -1,0 +1,22 @@
+{
+  "GOOG": {
+    "symbol": "GOOG",
+    "market": "US",
+    "name": "GOOG",
+    "added_at": "2026-02-21 00:29:25.455153",
+    "last_alert_at": "2026-02-21 01:11:10.315701",
+    "alert_threshold_pct": 0.1,
+    "is_active": true,
+    "chat_id": 5573627236
+  },
+  "CRCL": {
+    "symbol": "CRCL",
+    "market": "US",
+    "name": "CRCL",
+    "added_at": "2026-02-21 00:29:04.923017",
+    "last_alert_at": null,
+    "alert_threshold_pct": 0.1,
+    "is_active": true,
+    "chat_id": 5573627236
+  }
+}

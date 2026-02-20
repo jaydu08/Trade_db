@@ -97,6 +97,8 @@ class DatabaseManager:
             FieldMapping, DataSyncLog, PeerGroup, PeerGroupMember,
             AssetFinancial
         )
+        from domain.monitor import Watchlist  # Register Watchlist
+        
         SQLModel.metadata.create_all(self.meta_engine)
         logger.info("Meta database tables created")
     

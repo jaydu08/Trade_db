@@ -3,7 +3,7 @@ Strategy 策略表
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, List
 
 from sqlmodel import SQLModel, Field, Relationship
 from sqlalchemy import Column, JSON, Index
@@ -62,7 +62,7 @@ class Strategy(SQLModel, AuditMixin, LiteReservedFieldsMixin, ExtraFieldMixin, t
     )
     
     # 关系
-    runs: list["StrategyRun"] = Relationship(back_populates="strategy")
+    runs: list = Relationship(back_populates="strategy")
 
 
 class StrategyRun(SQLModel, AuditMixin, ExtraFieldMixin, table=True):
@@ -128,7 +128,7 @@ class StrategyRun(SQLModel, AuditMixin, ExtraFieldMixin, table=True):
     
     # 关系
     strategy: Strategy = Relationship(back_populates="runs")
-    signals: list["Signal"] = Relationship(back_populates="strategy_run")
+    signals: list = Relationship(back_populates="strategy_run")
 
 
 # 避免循环导入

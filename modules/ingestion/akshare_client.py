@@ -328,26 +328,41 @@ class AkShareClient:
                     if price == "-": return {} # Invalid
                     
                     # 价格修正逻辑
-                    # 东财 API 返回的 A 股价格通常单位是"分" (例如 2722 -> 27.22)
-                    # 港股通常单位是"厘" (例如 522000 -> 522.0)
-                    # 美股通常直接是美元 (例如 133.56)
-                    
                     final_price = float(price)
+                    pct_chg = float(d.get("f170") or 0)
+                    change = float(d.get("f169") or 0)
+                    
                     if market == "CN":
                         # A股通常是放大100倍
-                        if final_price > 1000: # 简单的启发式判断，防止某些ETF是正常的
-                             final_price = final_price / 100
+                        if final_price > 1000: final_price = final_price / 100
+                        change = change / 100
+                        pct_chg = pct_chg / 100
                     elif market == "HK":
                         # 港股通常是放大1000倍
-                        if final_price > 1000:
-                             final_price = final_price / 1000
+                        if final_price > 1000: final_price = final_price / 1000
+                        # 港股涨跌幅通常不需要除，但如果是 414 这种整数，那就要除
+                        if abs(pct_chg) > 100: pct_chg = pct_chg / 100
+                        # change 也不确定，保守起见不乱动
+                    elif market == "US":
+                        # 美股情况复杂，东财可能返回放大100倍或1000倍的数值
+                        # 启发式：如果价格 > 5000 (BRK.A除外)，尝试缩小
+                        if final_price > 10000: 
+                            final_price = final_price / 1000 # 316140 -> 316.14
+                        elif final_price > 5000:
+                            final_price = final_price / 100
+                            
+                        # 涨跌幅：如果 > 50% (对于 GOOG 这种票)，肯定是放大了
+                        if abs(pct_chg) > 50: pct_chg = pct_chg / 100
+                        
+                        # 涨跌额同理
+                        if abs(change) > 50: change = change / 100
                     
                     return {
                         "symbol": symbol,
                         "name": d.get("f58"),
                         "price": final_price,
-                        "change": float(d.get("f169") or 0) / 100 if market == "CN" else d.get("f169"),
-                        "pct_chg": float(d.get("f170") or 0) / 100 if market == "CN" else d.get("f170"),
+                        "change": change,
+                        "pct_chg": pct_chg,
                         "timestamp": d.get("f86") 
                     }
                     
