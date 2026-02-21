@@ -297,7 +297,7 @@ class AkShareClient:
         }
         
         try:
-            resp = requests.get(url, params=params, timeout=3)
+            resp = requests.get(url, params=params, timeout=10)
             data = resp.json()
             
             if data and data.get("data"):
@@ -313,13 +313,13 @@ class AkShareClient:
                 # Let's re-request with standard fields
                 params["fields"] = "f43,f58,f169,f170,f46,f60,f19,f17,f59,f86" 
                 # f86: update_time
-                resp = requests.get(url, params=params, timeout=3)
+                resp = requests.get(url, params=params, timeout=10)
                 data = resp.json()
                 if not data or not data.get("data"):
                     # Retry for US market if first fail
                     if market == "US":
                         params["secid"] = f"106.{symbol.upper()}"
-                        resp = requests.get(url, params=params, timeout=3)
+                        resp = requests.get(url, params=params, timeout=10)
                         data = resp.json()
                 
                 if data and data.get("data"):
@@ -403,22 +403,16 @@ class AkShareClient:
     
     @staticmethod
     @retry_on_error()
-    @cached("ak_spot_single", ttl=60)
-    def get_stock_quote(symbol: str) -> dict:
-        """
-        获取单个股票实时行情
-        
-        Args:
-            symbol: 股票代码
-        
-        Returns:
-            dict with quote info
-        """
-        df = AkShareClient.get_realtime_quotes()
-        row = df[df["代码"] == symbol]
-        if row.empty:
-            return {}
-        return row.iloc[0].to_dict()
+    def get_stock_info_global_cls() -> pd.DataFrame:
+        """获取财联社全球电报"""
+        logger.info("Fetching CLS Global Telegraph...")
+        # Note: akshare API might change, ensure we use the correct one
+        try:
+            return ak.stock_info_global_cls()
+        except Exception as e:
+            logger.warning(f"Failed to fetch global news: {e}")
+            return pd.DataFrame()
+
 
 
 # 全局实例

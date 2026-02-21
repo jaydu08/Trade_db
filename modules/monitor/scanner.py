@@ -1,191 +1,192 @@
 import logging
 import datetime
-import json
-from pathlib import Path
+import concurrent.futures
+from typing import Optional
+from pydantic import BaseModel, Field
+
+from modules.monitor.repository import WatchlistRepository
+from modules.monitor.notifier import Notifier
 from modules.ingestion.akshare_client import akshare_client
-from interface.telegram_bot import bot_instance
+from core.llm import structured_output, simple_prompt
+# Import Tools to use the enhanced web_search
+from core.agent import Tools 
 
 logger = logging.getLogger(__name__)
 
-# 数据文件路径 (Same as Manager)
-DATA_DIR = Path("/root/Trade_db/data")
-WATCHLIST_FILE = DATA_DIR / "watchlist.json"
+# Thread pool for async analysis to avoid blocking the scanner loop
+analysis_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+
+class AnalysisResult(BaseModel):
+    reason: str = Field(description="The primary reason for the stock movement based on news. If unknown, state 'Unknown'.")
+    confidence: str = Field(description="Confidence level: High, Medium, or Low.")
+    summary: str = Field(description="A concise summary of the key events (max 100 words).")
+    sources: list[str] = Field(description="List of news sources or titles used.")
 
 class MonitorService:
     """
-    异动监控服务 (JSON Version)
+    Anomaly Monitor Service (Refactored)
     """
     
     @staticmethod
-    def _load_data() -> dict:
-        if not WATCHLIST_FILE.exists(): return {}
-        try:
-            with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return {}
-
-    @staticmethod
-    def _save_data(data: dict):
-        try:
-            with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-        except:
-            pass
-
-    @staticmethod
     def scan_and_alert():
         """
-        扫描所有监控股票，触发报警
+        Scan all watchlist items for anomalies.
         """
-        logger.info("Scanning watchlist for anomalies (JSON mode)...")
+        logger.info("Scanning watchlist...")
         
-        data = MonitorService._load_data()
-        if not data: return
+        repo = WatchlistRepository()
+        data = repo.load_all()
+        
+        if not data:
+            return
 
-        # Loop items
         for symbol, item in data.items():
-            if not item.get('is_active', True): continue
+            if not item.get('is_active', True):
+                continue
             
             try:
-                market = item['market']
-                
-                # 2. Get Quote
-                quote = akshare_client.get_realtime_quote_eastmoney(symbol, market)
-                if not quote: 
-                    # logger.warning(f"No quote for {symbol}")
-                    continue
-                
-                price = quote.get('price')
-                pct_chg = quote.get('pct_chg') # Float, e.g. 5.23
-                
-                if not pct_chg: continue
-                
-                # 3. Check Threshold
-                threshold = item.get('alert_threshold_pct', 5.0)
-                if abs(pct_chg) >= threshold:
-                    # 4. Check Cooldown (Daily)
-                    today = str(datetime.date.today())
-                    last_alert_str = item.get('last_alert_at')
-                    last_alert = last_alert_str.split()[0] if last_alert_str else None
-                    
-                    if last_alert != today:
-                        # TRIGGER ALERT!
-                        MonitorService.trigger_alert(item, quote)
-                        
-                        # Update JSON
-                        item['last_alert_at'] = str(datetime.datetime.now())
-                        data[symbol] = item
-                        MonitorService._save_data(data)
-                        
+                MonitorService._check_item(symbol, item, repo)
             except Exception as e:
                 logger.error(f"Error scanning {symbol}: {e}")
 
     @staticmethod
+    def _check_item(symbol: str, item: dict, repo: WatchlistRepository):
+        market = item['market']
+        
+        # 1. Get Quote
+        quote = akshare_client.get_realtime_quote_eastmoney(symbol, market)
+        if not quote:
+            return
+            
+        pct_chg = quote.get('pct_chg')
+        price = quote.get('price')
+        
+        if pct_chg is None:
+            return
+            
+        # 2. Check Threshold
+        threshold = item.get('alert_threshold_pct', 5.0)
+        
+        if abs(pct_chg) >= threshold:
+            # 3. Check Cooldown
+            today = str(datetime.date.today())
+            last_alert_str = item.get('last_alert_at')
+            last_alert = last_alert_str.split()[0] if last_alert_str else None
+            
+            if last_alert != today:
+                # 4. Trigger Alert
+                MonitorService.trigger_alert(item, quote)
+                
+                # 5. Update State
+                item['last_alert_at'] = str(datetime.datetime.now())
+                repo.add_item(symbol, item)
+
+    @staticmethod
     def trigger_alert(item: dict, quote: dict):
         """
-        触发报警 + 归因分析
+        Two-phase alert system:
+        1. Immediate price alert.
+        2. Async deep analysis.
         """
         symbol = item['symbol']
         name = item['name']
         pct = quote['pct_chg']
         price = quote['price']
+        chat_id = item.get('chat_id')
         
         direction = "📈 暴涨" if pct > 0 else "📉 暴跌"
         
-        # 1. Gather News (Dual Source)
-        news_context = ""
-        try:
-            # Source A: Akshare News (Eastmoney) - Primary Source
-            from modules.ingestion.akshare_client import akshare_client
-            # market needs to be converted? CN/HK/US.
-            # stock_news_em takes symbol.
-            # US stocks might not work well with stock_news_em, let's try
-            # For US, maybe 'GOOG' works.
-            
-            # Note: akshare_client.get_latest_news is for general news.
-            # We need specific stock news.
-            # Let's try to fetch it directly if akshare_client doesn't have it.
-            import akshare as ak
-            stock_news = ak.stock_news_em(symbol=symbol)
-            if not stock_news.empty:
-                # Take top 5 news
-                top_news = stock_news.head(5)
-                news_str = ""
-                for _, row in top_news.iterrows():
-                    news_str += f"- {row['发布时间']} {row['新闻标题']}: {row['新闻内容'][:50]}...\n"
-                news_context += f"【个股公告/新闻】:\n{news_str}\n\n"
-        except Exception as e:
-            logger.warning(f"Akshare news failed: {e}")
+        # Phase 1: Immediate Notification
+        short_msg = (
+            f"🚨 **{direction}预警**\n"
+            f"**标的**: {name} ({symbol})\n"
+            f"**幅度**: {pct}%\n"
+            f"**现价**: {price}\n"
+            f"⏳ 正在进行智能归因分析..."
+        )
+        Notifier.send_telegram(chat_id, short_msg)
+        
+        # Phase 2: Async Analysis
+        analysis_executor.submit(MonitorService._analyze_and_report, item, quote, direction)
 
-        try:
-            # Source B: Web Search (via Agent Tools) - Secondary Source
-            from core.agent import Tools
-            search_query = f"{name} {symbol} 今日 重大新闻" # Simplify query
-            web_news = Tools.web_search(search_query)
-            news_context += f"【全网搜索】:\n{web_news}\n\n"
-        except Exception as e:
-            news_context += f"搜索失败: {e}\n"
-
-        # 2. LLM Analysis
-        from core.agent import agent_executor
-        
-        prompt = f"""
-        【紧急任务】
-        标的：{name} ({symbol})
-        状态：今日{direction} {pct}%，现价 {price}。
-        
-        【已知情报】
-        {news_context}
-        
-        【要求】
-        1. 根据上述情报，分析股价异动的**真实原因**。
-        2. **严禁编造**财报、分红等未在情报中出现的信息。如果情报中没有相关信息，请直接说“暂未搜到明确驱动因素”。
-        3. 重点关注：新产品发布（如Gemini 3.1）、政策变化、大额订单等。
-        4. 简明扼要，列出核心驱动力。
+    @staticmethod
+    def _analyze_and_report(item: dict, quote: dict, direction: str):
         """
+        Deep analysis using LLM + Search
+        """
+        symbol = item['symbol']
+        name = item['name']
+        chat_id = item.get('chat_id')
         
-        analysis = agent_executor.run(prompt)
-        
-        final_msg = f"🚨 **{direction}预警**\n" \
-                    f"**标的**: {name} ({symbol})\n" \
-                    f"**幅度**: {pct}%\n" \
-                    f"**现价**: {price}\n\n" \
-                    f"🧐 **智能归因**:\n{analysis}"
-                    
-        # Send to Telegram (Use bot_instance directly)
-        logger.info(f"Final Alert:\n{final_msg}")
-        
-        target_chat_id = item.get('chat_id')
-        if not target_chat_id:
-            from config.settings import TELEGRAM_ADMIN_ID
-            target_chat_id = TELEGRAM_ADMIN_ID
-             
-        if not target_chat_id:
-            from interface.telegram_bot import LAST_CHAT_ID
-            target_chat_id = LAST_CHAT_ID
-        
-        if target_chat_id and bot_instance and bot_instance.app:
-            import asyncio
+        try:
+            # 1. Gather Info (Multi-source)
+            # Strategy: Search for specific stock news AND general market news if needed
+            
+            # A. Specific News
+            # Construct a better query: "{Symbol} stock news" + "{Name} latest"
+            # Split keywords are handled by Tools.web_search now.
+            # We combine them to ensure at least one hits.
+            specific_query = f"{symbol} {name} stock news latest" 
+            news_context = Tools.web_search(specific_query)
+            
+            # B. Check if we got enough info. If "not found", try market context
+            if "暂无相关新闻" in news_context or len(news_context) < 50:
+                logger.info(f"Specific news empty for {symbol}, trying market context...")
+                market_query = "US stock market news today tech sector" if item['market'] == 'US' else "A股 市场 科技板块 今日"
+                market_news = Tools.web_search(market_query)
+                news_context += f"\n\n【市场背景】:\n{market_news}"
+
+            # 2. LLM Analysis (Structured)
+            system_prompt = (
+                "你是专业的金融分析师。请根据提供的新闻分析股价异动原因。\n"
+                "**核心原则**：\n"
+                "1. 优先寻找个股特定的驱动因素（财报、产品、并购）。\n"
+                "2. 如果没有个股新闻，但有市场大盘新闻（如纳指大涨），则归因为'跟随大盘波动'。\n"
+                "3. 如果完全找不到原因，请在 reason 字段中如实填写 '暂未找到明确驱动因素'，严禁编造。\n"
+                "4. 输出必须是严格的JSON格式。"
+            )
+            
+            user_prompt = f"""
+            标的：{name} ({symbol})
+            状态：今日{direction} {quote['pct_chg']}%
+            
+            【新闻情报】
+            {news_context}
+            """
+            
             try:
-                # Create a new event loop for this thread if needed
-                try:
-                    loop = asyncio.get_event_loop()
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                
-                logger.info(f"Sending alert via bot_instance to {target_chat_id}...")
-                
-                # Use bot.send_message directly
-                # No parse_mode to be safe
-                loop.run_until_complete(
-                    bot_instance.app.bot.send_message(
-                        chat_id=target_chat_id, 
-                        text=final_msg
-                    )
+                # Use structured output for stability
+                result: AnalysisResult = structured_output(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    response_model=AnalysisResult
                 )
-                logger.info("Alert sent successfully via bot_instance.")
                 
-            except Exception as e:
-                logger.error(f"Failed to send telegram via bot_instance: {e}")
+                analysis_text = (
+                    f"🧐 **智能归因报告**: {name}\n\n"
+                    f"💡 **核心原因**: {result.reason}\n"
+                    f"📊 **置信度**: {result.confidence}\n"
+                    f"📝 **摘要**: {result.summary}\n\n"
+                    f"🔗 **参考源**: {', '.join(result.sources[:3])}"
+                )
+                
+            except Exception as llm_e:
+                logger.error(f"LLM Structured output failed, falling back to simple text: {llm_e}")
+                # Fallback to simple prompt
+                fallback_prompt = f"{user_prompt}\n请简要分析原因，不要废话。"
+                analysis_text = simple_prompt(fallback_prompt)
+                analysis_text = f"🧐 **智能归因**: {analysis_text}"
+
+            # 3. Send Report
+            Notifier.send_telegram(chat_id, analysis_text)
+            
+        except Exception as e:
+            logger.error(f"Analysis failed for {symbol}: {e}")
+            Notifier.send_telegram(chat_id, f"❌ 分析失败: {e}")
+
+    @staticmethod
+    def _gather_news(symbol: str, name: str) -> str:
+        # Deprecated: Logic moved to Tools.web_search and _analyze_and_report
+        return ""

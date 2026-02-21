@@ -1,13 +1,9 @@
-"""
-Agent Core - 实现 ReAct (Reasoning + Acting) 逻辑
-让 Bot 具备联网搜索和工具调用能力
-"""
 import logging
 import json
 import re
 from typing import List, Dict, Any
 
-from duckduckgo_search import DDGS
+# from duckduckgo_search import DDGS # Removed due to instability
 from core.llm import get_llm_client
 from modules.ingestion.akshare_client import akshare_client
 from modules.ingestion.sync_profile import profile_syncer
@@ -18,36 +14,108 @@ logger = logging.getLogger(__name__)
 # Tools Definition
 # ============================================================
 
+from modules.ingestion.caixin_client import caixin_client
+
 class Tools:
     @staticmethod
     def web_search(query: str) -> str:
-        """联网搜索，用于获取未知概念或最新信息 (Bocha AI 增强版)"""
+        """联网搜索，用于获取未知概念或最新信息 (Akshare News + Caixin + Bocha AI)"""
         logger.info(f"Tool: Searching web for '{query}'")
         
         results = []
         
-        # 1. Try DuckDuckGo (API mode)
+        # 0. Try Caixin Search (High Quality, Low Latency)
+        # Use simple heuristic to use Caixin: if it's macro or A-share related, or generic query
+        # But Caixin is good for general financial news.
         try:
-            # Try different backends in order
-            for backend in ['api', 'html', 'lite']:
-                try:
-                    res = DDGS().text(query, max_results=5, backend=backend)
-                    if res:
-                        # Validate structure
-                        if isinstance(res, list) and len(res) > 0 and 'body' in res[0]:
-                            results = res
-                            break
-                        else:
-                            logger.warning(f"DDGS returned invalid structure: {res}")
-                except Exception:
-                    continue
+            # Check if we should use Caixin (maybe limit to Chinese queries or specific keywords?)
+            # For now, let's try it for all queries as a high-quality source.
+            # We need to set a date range to get recent news, e.g., last 30 days.
+            import datetime
+            end_date = datetime.datetime.now().strftime("%Y-%m-%d")
+            start_date = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
+            
+            caixin_res = caixin_client.search(query, start_date=start_date, end_date=end_date)
+            if caixin_res and len(caixin_res) > 50 and "Error" not in caixin_res:
+                 results.append("【财新智能搜索】:\n" + caixin_res[:2000]) # Limit length
         except Exception as e:
-            logger.warning(f"DDG all backends failed: {e}")
+            logger.warning(f"Caixin search failed: {e}")
 
-        # 2. Backup: Bocha AI (Official API - Basic Web Search)
-        if not results:
+        # Split query into keywords for better matching
+        # e.g. "GOOG stock news" -> ["GOOG", "stock", "news"]
+        keywords = query.split()
+        
+        # 1. Primary Source: Akshare Global News (Real-time, Reliable)
+        try:
+            import akshare as ak
+            
+            # Use global news telegraph
+            # This is very fast and contains latest macro/tech news
+            # Use the new safe wrapper in akshare_client
+            df = akshare_client.get_stock_info_global_cls()
+            if not df.empty:
+                matches = []
+                for _, row in df.iterrows():
+                    title = str(row.get('title', ''))
+                    content = str(row.get('content', ''))
+                    text = f"{title} {content}"
+                    
+                    # Improved Matching Logic:
+                    # 1. Direct case-insensitive match of full query
+                    if query.lower() in text.lower():
+                        matches.append(f"{row['publish_time']} {title}: {content[:100]}...")
+                        continue
+                        
+                    # 2. Match ANY major keyword (if query is long)
+                    # Exclude common stop words for matching
+                    stop_words = {'news', 'stock', 'price', 'share', 'market', 'today', 'latest', 'breaking', '原因', '股价', '异动', '最新', '消息'}
+                    significant_keywords = [k for k in keywords if k.lower() not in stop_words and len(k) > 2]
+                    
+                    if significant_keywords:
+                        # If ANY significant keyword is found (e.g. "GOOG" or "Gemini")
+                        for k in significant_keywords:
+                            if k.lower() in text.lower():
+                                matches.append(f"{row['publish_time']} {title}: {content[:100]}...")
+                                break
+
+                if matches:
+                    # Dedup matches
+                    matches = list(dict.fromkeys(matches))
+                    results.append("【财联社全球电报】:\n" + "\n".join(matches[:5]))
+
+            # Also try stock_news_em if query contains a stock symbol-like pattern
+            # Only if it looks like a symbol e.g. "GOOG" or "00700"
+            # Extract potential symbol
+            potential_symbol = None
+            for k in keywords:
+                if k.isalnum() and (k.isupper() or k.isdigit()):
+                    potential_symbol = k
+                    break
+            
+            if potential_symbol:
+                try:
+                    # Try Eastmoney stock news
+                    df_stock = ak.stock_news_em(symbol=potential_symbol)
+                    if not df_stock.empty:
+                        stock_matches = []
+                        for _, row in df_stock.head(5).iterrows():
+                            title = row.get('新闻标题', '')
+                            date = row.get('发布时间', '')
+                            stock_matches.append(f"{date} {title}")
+                        if stock_matches:
+                             results.append(f"【个股资讯 ({potential_symbol})】:\n" + "\n".join(stock_matches))
+                except:
+                    pass
+                    
+        except Exception as e:
+            logger.warning(f"Akshare news search failed: {e}")
+
+        # 2. Secondary Source: Bocha AI (Official API)
+        # Always run if results are few, or if Akshare failed
+        if len(results) == 0:
             try:
                 import requests
+                import datetime
                 logger.info(f"Fallback to Bocha AI Search for '{query}'")
                 
                 url = "https://api.bochaai.com/v1/web-search"
@@ -55,10 +123,24 @@ class Tools:
                     "Authorization": "Bearer sk-996761b2cea840f7a68cf72840f1642c",
                     "Content-Type": "application/json"
                 }
-                # Minimal payload for basic subscription
+                
+                # Use 'freshness' parameter for better results
+                # Values: noLimit, oneDay, oneWeek, oneMonth, oneYear
+                # For monitoring, we prefer 'oneWeek' or 'oneDay'
+                # But for general queries, maybe 'oneMonth' or 'noLimit'
+                # Let's try 'oneMonth' to balance freshness and coverage.
+                # If the query explicitly asks for 'latest', use 'oneWeek'
+                
+                freshness = "oneMonth" 
+                if "latest" in query.lower() or "最新" in query:
+                    freshness = "oneWeek"
+                if "today" in query.lower() or "今日" in query:
+                    freshness = "oneDay"
+
                 payload = {
                     "query": query,
-                    "count": 5
+                    "count": 5,
+                    "freshness": freshness
                 }
                 
                 resp = requests.post(url, headers=headers, json=payload, timeout=10)
@@ -67,12 +149,15 @@ class Tools:
                     data = resp.json()
                     if data.get('code') == 200 and data.get('data'):
                         web_pages = data['data'].get('webPages', {}).get('value', [])
-                        for item in web_pages:
-                            # Use 'snippet' instead of 'summary'
-                            results.append({
-                                'title': item.get('name'),
-                                'body': item.get('snippet') or item.get('summary')
-                            })
+                        bocha_res = ""
+                        for i, item in enumerate(web_pages, 1):
+                            # Clean up snippet
+                            snippet = item.get('snippet', '') or item.get('summary', '')
+                            snippet = snippet.replace('\n', ' ').strip()
+                            date_pub = item.get('datePublished', '')[:10] # Get YYYY-MM-DD
+                            bocha_res += f"{i}. [{date_pub}] {item.get('name')}: {snippet[:200]}...\n"
+                        if bocha_res:
+                            results.append(f"【全网搜索结果 ({freshness})】:\n" + bocha_res)
                 else:
                     logger.warning(f"Bocha API error: {resp.status_code} - {resp.text}")
                     
@@ -80,12 +165,9 @@ class Tools:
                 logger.warning(f"Bocha AI search failed: {e}")
 
         if results:
-            summary = "【联网搜索结果】\n"
-            for i, r in enumerate(results, 1):
-                summary += f"{i}. {r.get('title')}: {r.get('body')}\n"
-            return summary
+            return "\n".join(results)
             
-        return "搜索服务暂时不可用（所有通道均无响应），请尝试简化关键词或稍后再试。"
+        return "搜索服务暂时不可用（Akshare/Bocha均无响应），请尝试简化关键词。"
 
     @staticmethod
     def database_search(query: str) -> str:
@@ -147,7 +229,6 @@ class ReactAgent:
         
         import datetime
         current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        current_year = datetime.datetime.now().year
         
         # System Prompt 注入工具描述
         system_prompt = f"""
@@ -156,7 +237,7 @@ class ReactAgent:
 
 【核心指令】
 1. **真实性优先**：回答任何市场/公司问题，必须先调用 `web_search` 或 `get_quote`。严禁使用你内部的过期知识（截止2024年）。
-2. **搜索增强**：使用 `web_search` 时，自动在关键词后追加 "{current_year}"、"最新"、"独角兽" 等词，以获取最新信息。
+2. **禁止编造**：如果 `web_search` 返回"暂无相关新闻"或空白，你必须明确告知用户"未找到相关最新信息"，**严禁**自行编造原因或数据。
 3. **数据融合与验证**：
    - **上市验证协议**：在报告中提到任何公司时，**必须**先尝试调用 `get_quote`。
    - 严禁仅凭记忆判断公司是否上市。如果 `get_quote` 返回有效价格，该公司即为**已上市**；只有当返回"未查询到"时，才可标注为"未上市"。
@@ -166,7 +247,7 @@ class ReactAgent:
    - 重点挖掘新晋独角兽，并**务必验证其最新融资或上市状态**。
 
 【可用工具】
-1. web_search: 联网搜索。指令格式: SEARCH: 关键词
+1. web_search: 联网搜索 (聚合 Akshare 实时电报 + 全网搜索)。指令格式: SEARCH: 关键词
 2. get_quote: 查行情。指令格式: QUOTE: 代码或名称
 3. database_search: 查数据库。指令格式: DB: 关键词
 
@@ -214,14 +295,8 @@ Final Answer: ...
                     return final_answer if final_answer else response
 
                 # 模糊匹配三种指令
-                # 1. SEARCH: ...
-                # 2. QUOTE: ...
-                # 3. DB: ...
-                
                 tool_executed = False
                 
-                # Regex for simplified commands
-                # Case insensitive, capture rest of line
                 search_match = re.search(r"SEARCH:\s*(.+)", response, re.IGNORECASE)
                 quote_match = re.search(r"QUOTE:\s*(.+)", response, re.IGNORECASE)
                 db_match = re.search(r"DB:\s*(.+)", response, re.IGNORECASE)
@@ -247,14 +322,6 @@ Final Answer: ...
                     messages.append({"role": "user", "content": f"Observation: {obs}"})
                     tool_executed = True
                 
-                # Fallback: Check for legacy Action format if fuzzy failed
-                if not tool_executed:
-                    action_match = re.search(r"Action:\s*([^\n]+)", response)
-                    input_match = re.search(r"Action Input:\s*(.+?)(?:\n|$)", response, re.DOTALL)
-                    if action_match and input_match:
-                        # ... (Existing legacy logic) ...
-                        pass # Skipping for brevity, relying on simplified prompts
-                        
                 if not tool_executed:
                     # 如果 LLM 啥都没调，强制它结束或者提示它
                     if current_step > 1:
@@ -262,10 +329,8 @@ Final Answer: ...
                     else:
                         # Step 1 没调工具？强制帮它搜一下
                         logger.info("Auto-Search Triggered")
-                        obs = self.tools["web_search"](user_input + " 2026")
+                        obs = self.tools["web_search"](user_input)
                         messages.append({"role": "user", "content": f"System Auto-Search Observation: {obs}"})
-
-            return "抱歉，我思考了太久，没有得出结论。"
 
             return "抱歉，我思考了太久，没有得出结论。"
             
