@@ -10,8 +10,10 @@ from datetime import datetime
 
 # Import modules (Lazy import inside functions to avoid circular deps if any)
 from modules.ingestion.sync_news import news_syncer
-from modules.ingestion.sync_reports import report_syncer
-# from modules.ingestion.sync_financial import financial_syncer # Can be heavy
+from modules.ingestion.sync_financial import financial_syncer
+from modules.ingestion.sync_profile import profile_syncer
+from modules.ingestion.sync_relations import relation_syncer
+from modules.analysis.heatmap import heatmap_service
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +69,32 @@ class TaskScheduler:
             replace_existing=True
         )
         
-        # 4. 财务数据/Profile 更新 (每天 02:00)
-        # self.scheduler.add_job(...)
+        # 4. CN/HK 热度榜单 (每天 18:00 A股、港股收盘后)
+        self.scheduler.add_job(
+            self._job_cn_hk_heatmap,
+            CronTrigger(hour=18, minute=0),
+            id="cn_hk_heatmap",
+            name="A股/港股热门榜单",
+            replace_existing=True
+        )
+
+        # 5. US 热度榜单 (每天 09:00 美股收盘后)
+        self.scheduler.add_job(
+            self._job_us_heatmap,
+            CronTrigger(hour=9, minute=0),
+            id="us_heatmap",
+            name="美股热门榜单",
+            replace_existing=True
+        )
+        
+        # 6. 基本面/财务/画像深度全量更新 (每天 02:00)
+        self.scheduler.add_job(
+            self._job_sync_fundamentals,
+            CronTrigger(hour=2, minute=0),
+            id="sync_fundamentals",
+            name="基本面及画像同步",
+            replace_existing=True
+        )
         
         logger.info(f"Registered {len(self.scheduler.get_jobs())} jobs.")
 
@@ -87,6 +113,51 @@ class TaskScheduler:
             report_syncer.sync_industry_reports()
         except Exception as e:
             logger.error(f"Job failed (Sync Reports): {e}")
+
+    def _job_cn_hk_heatmap(self):
+        """Job: 生成A股和港股热门榜单"""
+        logger.info("Job started: CN/HK Heat Map")
+        try:
+            heatmap_service.process_and_notify("CN")
+            heatmap_service.process_and_notify("HK")
+        except Exception as e:
+            logger.error(f"Job failed (CN/HK Heat Map): {e}")
+
+    def _job_us_heatmap(self):
+        """Job: 生成美股热门榜单"""
+        logger.info("Job started: US Heat Map")
+        try:
+            heatmap_service.process_and_notify("US")
+        except Exception as e:
+            logger.error(f"Job failed (US Heat Map): {e}")
+
+    def _job_sync_fundamentals(self):
+        """Job: 全市场基本面与分析更新 (深水区任务)"""
+        logger.info("Job started: Sync Fundamentals")
+        try:
+            # 1. 结构化：财务数据入 SQLite
+            for market in ["CN", "HK", "US"]:
+                financial_syncer.sync_financials(market=market)
+            
+            # 2. 非结构化：画像 Chunking 入 Chroma
+            for market in ["CN", "HK", "US"]:
+                profile_syncer.sync_profiles_batch(market=market, skip_existing=False)
+                
+            # 3. 供应链关系提取：由于 LLM 非常慢，这里演示取 A 股热门或者限制 limit=10
+            # 实际业务中应针对池子进行增量
+            from core.db import db_manager
+            from sqlmodel import select
+            from domain.meta import Asset
+            
+            with db_manager.meta_session() as session:
+                statement = select(Asset.symbol).where(Asset.market == "CN").limit(5)
+                symbols = list(session.exec(statement).all())
+                
+            for symbol in symbols:
+                relation_syncer.sync_relations_for_symbol(symbol)
+                
+        except Exception as e:
+            logger.error(f"Job failed (Sync Fundamentals): {e}")
 
 # 全局单例
 task_scheduler = TaskScheduler()

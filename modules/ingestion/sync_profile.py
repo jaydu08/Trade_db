@@ -8,6 +8,7 @@ import hashlib
 
 import pandas as pd
 from sqlmodel import select
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 from core.db import db_manager, get_collection
 from domain.meta import Asset, AssetProfile, DataSyncLog
@@ -219,20 +220,69 @@ class ProfileSyncer:
         market: str,
     ) -> None:
         """
-        将公司简介向量化存储到 ChromaDB
-        
-        创建多个 chunk:
-        - overview: 公司简介
-        - business: 主营业务
+        将公司简介切分并向量化存储到 ChromaDB
         """
         try:
-            # 每次获取新的 collection 实例（线程安全）
             from core.db import get_collection
             collection = get_collection('company_chunks')
             
             now = datetime.utcnow().isoformat()
             
+            # 删除该 symbol 历史的所有 chunks (保持数据库整洁)
+            try:
+                collection.delete(where={"symbol": symbol})
+                logger.debug(f"Deleted old chunks for {symbol}")
+            except Exception as e:
+                logger.debug(f"Delete old chunks failed (might be empty): {e}")
+
             chunks_to_add = []
+            
+            # 初始化文本切分器
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=500,
+                chunk_overlap=50,
+                separators=["\n\n", "\n", "。", "！", "？", "；", "，", " ", ""]
+            )
+            
+            # 公司简介切分
+            if company_profile and len(company_profile) > 10:
+                splits = text_splitter.split_text(company_profile)
+                for idx, text in enumerate(splits):
+                    chunks_to_add.append({
+                        "id": self._generate_doc_id(symbol, f"overview_p{idx}"),
+                        "document": f"{name}简介(部分{idx+1}/{len(splits)}): {text}",
+                        "metadata": {
+                            "symbol": symbol,
+                            "name": name,
+                            "market": market,
+                            "chunk_type": "overview",
+                            "source": "akshare",
+                            "confidence": 1.0,
+                            "doc_version": 1,
+                            "updated_at": now,
+                            "chunk_index": idx
+                        }
+                    })
+            
+            # 主营业务切分
+            if main_business and len(main_business) > 10:
+                splits = text_splitter.split_text(main_business)
+                for idx, text in enumerate(splits):
+                    chunks_to_add.append({
+                        "id": self._generate_doc_id(symbol, f"business_p{idx}"),
+                        "document": f"{name}主营业务(部分{idx+1}/{len(splits)}): {text}",
+                        "metadata": {
+                            "symbol": symbol,
+                            "name": name,
+                            "market": market,
+                            "chunk_type": "business",
+                            "source": "akshare",
+                            "confidence": 1.0,
+                            "doc_version": 1,
+                            "updated_at": now,
+                            "chunk_index": idx
+                        }
+                    })
             
             # 公司简介 chunk
             if company_profile and len(company_profile) > 10:
@@ -274,13 +324,6 @@ class ProfileSyncer:
                 documents = [c["document"] for c in chunks_to_add]
                 metadatas = [c["metadata"] for c in chunks_to_add]
                 
-                # 先删除旧的
-                try:
-                    collection.delete(ids=ids)
-                except Exception:
-                    pass
-                
-                # 添加新的
                 collection.add(
                     ids=ids,
                     documents=documents,

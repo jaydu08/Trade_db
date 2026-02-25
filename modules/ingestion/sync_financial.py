@@ -62,7 +62,7 @@ class FinancialSyncer:
             if not financial:
                 financial = AssetFinancial(
                     symbol=symbol,
-                    report_date=date.today(), # Using today as we are syncing realtime valuation
+                    report_date=date.today(), # Using today to mark last sync date
                     updated_at=datetime.utcnow().isoformat()
                 )
             
@@ -71,6 +71,13 @@ class FinancialSyncer:
             if "pb" in valuation_data: financial.pb = valuation_data["pb"]
             if "market_cap" in valuation_data: financial.market_cap = valuation_data["market_cap"]
             if "dv_ratio" in valuation_data: financial.dv_ratio = valuation_data["dv_ratio"]
+            if "total_revenue" in valuation_data: financial.total_revenue = valuation_data["total_revenue"]
+            if "net_profit" in valuation_data: financial.net_profit = valuation_data["net_profit"]
+            if "gross_profit_margin" in valuation_data: financial.gross_profit_margin = valuation_data["gross_profit_margin"]
+            if "net_profit_margin" in valuation_data: financial.net_profit_margin = valuation_data["net_profit_margin"]
+            if "roe" in valuation_data: financial.roe = valuation_data["roe"]
+            if "revenue_yoy" in valuation_data: financial.revenue_yoy = valuation_data["revenue_yoy"]
+            if "net_profit_yoy" in valuation_data: financial.net_profit_yoy = valuation_data["net_profit_yoy"]
             
             financial.updated_at = datetime.utcnow().isoformat()
             session.add(financial)
@@ -78,17 +85,13 @@ class FinancialSyncer:
 
     def sync_financials(self, limit: Optional[int] = None, market: str = "CN") -> dict:
         """
-        同步财务数据 (目前仅支持 A 股实时估值数据同步)
+        同步股票深度财务数据 (CN/HK/US)
         """
-        if market != "CN":
-            logger.warning(f"Financial sync for {market} not fully supported yet.")
-            return {"synced": 0, "errors": 0}
-
         sync_log_id = self._create_sync_log("asset_financial", "FULL")
         result = {"synced": 0, "errors": 0, "total": 0}
         
         try:
-            # 1. 获取 A 股所有股票
+            # 1. 获取目标市场所有股票
             with db_manager.meta_session() as session:
                 statement = select(Asset.symbol).where(Asset.market == market)
                 symbols = list(session.exec(statement).all())
@@ -97,45 +100,61 @@ class FinancialSyncer:
                 symbols = symbols[:limit]
             
             result["total"] = len(symbols)
-            logger.info(f"Syncing financials for {len(symbols)} stocks...")
+            logger.info(f"Syncing financials for {len(symbols)} {market} stocks...")
             
-            # 2. 批量获取实时行情数据作为基础估值 (PE/PB/市值)
-            # stock_zh_a_spot_em: 代码,名称,最新价,涨跌幅,涨跌额,成交量,成交额,振幅,最高,最低,今开,昨收,量比,换手率,市盈率-动态,市净率,总市值,流通市值,涨速,5分钟涨跌,60日涨跌幅,年初至今涨跌幅
-            logger.info("Fetching realtime quotes from AkShare...")
-            try:
-                spot_df = akshare_client.get_realtime_quotes()
-                logger.info(f"Got {len(spot_df)} records.")
-            except Exception as e:
-                logger.error(f"Failed to get realtime quotes: {e}")
-                spot_df = pd.DataFrame()
-
-            # 3. 批量更新
+            # 2. 爬取并解析
             count = 0
-            if not spot_df.empty:
-                # Convert symbols to set for fast lookup
-                target_symbols = set(symbols)
-                
-                for _, row in spot_df.iterrows():
-                    symbol = str(row["代码"])
-                    if symbol not in target_symbols:
-                        continue
-                        
-                    try:
-                        valuation_data = {
-                            "pe_ttm": self._safe_float(row.get("市盈率-动态")),
-                            "pb": self._safe_float(row.get("市净率")),
-                            "market_cap": self._safe_float(row.get("总市值")),
-                            # AkShare spot doesn't usually have dividend yield directly in this table
-                        }
-                        
+            for i, symbol in enumerate(symbols):
+                try:
+                    valuation_data = {}
+                    
+                    if market == "CN":
+                        df = akshare_client.get_financial_abstract_cn(symbol)
+                        if not df.empty:
+                            # 提取最新一期指标
+                            latest = df.iloc[0]
+                            valuation_data.update({
+                                "total_revenue": self._safe_float(latest.get("营业总收入(元)")),
+                                "net_profit": self._safe_float(latest.get("净利润(元)")),
+                                "roe": self._safe_float(latest.get("净资产收益率(%)")),
+                                "gross_profit_margin": self._safe_float(latest.get("销售毛利率(%)")),
+                                "revenue_yoy": self._safe_float(latest.get("营业总收入同比增长率(%)")),
+                                "net_profit_yoy": self._safe_float(latest.get("净利润同比增长率(%)")),
+                            })
+                            
+                    elif market == "HK":
+                        df = akshare_client.get_financial_hk(symbol)
+                        if not df.empty and len(df) > 0:
+                            latest = dict(zip(df['指标'], df[df.columns[1]])) # 第一列为最新周期
+                            valuation_data.update({
+                                "total_revenue": self._safe_float(latest.get("营业额")),
+                                "net_profit": self._safe_float(latest.get("归母净利润")),
+                                "roe": self._safe_float(latest.get("加权净资产收益率(%)")),
+                                "revenue_yoy": self._safe_float(latest.get("营业额同比增长率(%)")),
+                                "net_profit_yoy": self._safe_float(latest.get("净利润同比增长率(%)")),
+                            })
+
+                    elif market == "US":
+                        df = akshare_client.get_financial_us(symbol)
+                        if not df.empty and "收入" in df.columns:
+                            # 雪球美股指标较简单
+                            latest = df.iloc[0]
+                            valuation_data.update({
+                                "total_revenue": self._safe_float(latest.get("收入")),
+                                "net_profit": self._safe_float(latest.get("净利润")),
+                                "roe": self._safe_float(latest.get("ROE")),
+                            })
+                    
+                    if valuation_data:
                         self._sync_one_stock(symbol, valuation_data)
                         count += 1
-                        if count % 100 == 0:
-                            logger.info(f"Synced {count}/{len(symbols)} financials")
-                            
-                    except Exception as e:
-                        logger.error(f"Error processing {symbol}: {e}")
-                        result["errors"] += 1
+                        
+                    if (i + 1) % 50 == 0:
+                        logger.info(f"Progress: {i + 1}/{len(symbols)} ({market})")
+                        
+                except Exception as e:
+                    logger.error(f"Error processing {symbol}: {e}")
+                    result["errors"] += 1
 
             result["synced"] = count
             self._update_sync_log(sync_log_id, "SUCCESS", record_count=count)

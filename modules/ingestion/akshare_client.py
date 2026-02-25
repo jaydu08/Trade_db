@@ -261,6 +261,54 @@ class AkShareClient:
             return pd.DataFrame()
     
     # ================================================================
+    # 财务数据 (深度基本面)
+    # ================================================================
+    @staticmethod
+    @retry_on_error()
+    @cached("ak_financial_cn", ttl=86400)
+    def get_financial_abstract_cn(symbol: str) -> pd.DataFrame:
+        """
+        获取 A 股财务摘要 (同花顺)
+        包含 ROE, 毛利率, 净利润同比等核心指标
+        """
+        logger.info(f"Fetching financial abstract for CN: {symbol}")
+        try:
+            return ak.stock_financial_abstract_ths(symbol=symbol, indicator="按报告期")
+        except Exception as e:
+            logger.warning(f"Failed to get CN financial for {symbol}: {e}")
+            return pd.DataFrame()
+
+    @staticmethod
+    @retry_on_error()
+    @cached("ak_financial_hk", ttl=86400)
+    def get_financial_hk(symbol: str) -> pd.DataFrame:
+        """
+        获取港股财务报表 (东方财富)
+        """
+        logger.info(f"Fetching financial report for HK: {symbol}")
+        try:
+            return ak.stock_financial_hk_report_em(symbol=symbol)
+        except Exception as e:
+            logger.warning(f"Failed to get HK financial for {symbol}: {e}")
+            return pd.DataFrame()
+
+    @staticmethod
+    @retry_on_error()
+    @cached("ak_financial_us", ttl=86400)
+    def get_financial_us(symbol: str) -> pd.DataFrame:
+        """
+        获取美股财务指标 (雪球)
+        """
+        logger.info(f"Fetching financial report for US: {symbol}")
+        # 雪球格式去头
+        clean_symbol = symbol.split(".")[-1]
+        try:
+            return ak.stock_financial_us_xq(symbol=clean_symbol)
+        except Exception as e:
+            logger.warning(f"Failed to get US financial for {symbol}: {e}")
+            return pd.DataFrame()
+
+    # ================================================================
     # 实时行情 (东方财富源 - 极速版)
     # ================================================================
     @staticmethod

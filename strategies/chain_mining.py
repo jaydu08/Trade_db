@@ -13,7 +13,8 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 from core.llm import get_llm_client
-from core.db import db_manager
+from core.db import db_manager, get_collection
+from domain.meta import Concept, AssetConceptLink, Asset
 from domain.ledger import Signal
 from modules.ingestion.sync_profile import profile_syncer
 from modules.probing.market import market_prober
@@ -63,6 +64,7 @@ class ChainMiningStrategy:
     def __init__(self, strategy_name: str = "ChainMining_v1"):
         self.strategy_name = strategy_name
         self.llm = get_llm_client()
+        self.knowledge_col = get_collection("industry_knowledge")
     
     def decompose_chain(self, industry: str) -> ChainDecomposition:
         """
@@ -92,7 +94,27 @@ class ChainMiningStrategy:
 - 上游：光波导、Micro-LED、衍射光学元件
 - 中游：模组组装、光学设计、系统集成
 - 下游：品牌商、渠道商
+
+【参考知识库】
+以下是从本地行业知识库检索到的相关信息（如果有）：
+{knowledge_context}
 """
+        
+        # RAG: 检索本地行业知识
+        knowledge_context = "暂无直接相关的本地知识。"
+        try:
+            results = self.knowledge_col.query(
+                query_texts=[industry],
+                n_results=5
+            )
+            if results and results.get("documents") and results["documents"][0]:
+                docs = results["documents"][0]
+                knowledge_context = "\n".join([f"- {doc}" for doc in docs])
+                logger.info(f"Retrieved {len(docs)} knowledge chunks for RAG.")
+        except Exception as e:
+            logger.warning(f"Failed to query knowledge collection: {e}")
+
+        system_prompt = system_prompt.format(knowledge_context=knowledge_context)
         
         user_prompt = f"请拆解产业链：{industry}"
         
@@ -168,6 +190,51 @@ class ChainMiningStrategy:
         matches.sort(key=lambda x: x.match_score, reverse=True)
         
         logger.info(f"Mapped to {len(matches)} stocks")
+        return matches
+
+    def cross_validate_with_meta(
+        self,
+        industry: str,
+        matches: List[StockMatch],
+        bonus_score: float = 0.2
+    ) -> List[StockMatch]:
+        """
+        步骤2.5: 根据 Meta DB 中的 Concept 数据进行结构化校准
+        """
+        logger.info("Cross-validating stock matches with meta DB...")
+        
+        from sqlmodel import select
+        
+        symbols = [m.symbol for m in matches]
+        if not symbols:
+            return matches
+            
+        validated_symbols = set()
+        try:
+            with db_manager.meta_session() as session:
+                # 模糊查找相关概念板块
+                concept_stmt = select(Concept.code).where(Concept.name.like(f"%{industry}%"))
+                concept_codes = session.exec(concept_stmt).all()
+                
+                if concept_codes:
+                    # 查找哪些 symbol 在这些概念板块里
+                    link_stmt = select(AssetConceptLink.symbol).where(
+                        AssetConceptLink.concept_code.in_(concept_codes),
+                        AssetConceptLink.symbol.in_(symbols)
+                    )
+                    validated_symbols = set(session.exec(link_stmt).all())
+                    logger.info(f"Found {len(validated_symbols)} stocks overlapping with meta definitions.")
+        except Exception as e:
+            logger.warning(f"Failed to cross-validate with meta DB: {e}")
+            
+        # 修正打分
+        for match in matches:
+            if match.symbol in validated_symbols:
+                match.match_score = min(1.0, match.match_score + bonus_score)
+                match.match_reason += f" (结构化校验通过: 存在相关板块)"
+                
+        # 重新排序
+        matches.sort(key=lambda x: x.match_score, reverse=True)
         return matches
     
     def filter_by_market(
@@ -332,6 +399,9 @@ class ChainMiningStrategy:
             
             # 2. 映射到股票
             matches = self.map_to_stocks(chain, top_k=top_k)
+            
+            # 2.5 结构化校验
+            matches = self.cross_validate_with_meta(industry, matches)
             
             # 3. 行情过滤
             filtered_stocks = self.filter_by_market(matches, min_amount=min_amount)

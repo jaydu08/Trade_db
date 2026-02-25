@@ -8,6 +8,8 @@ from modules.monitor.repository import WatchlistRepository
 from modules.monitor.notifier import Notifier
 from modules.ingestion.akshare_client import akshare_client
 from core.llm import structured_output, simple_prompt
+from core.db import get_collection
+import hashlib
 # Import Tools to use the enhanced web_search
 from core.agent import Tools 
 
@@ -181,6 +183,48 @@ class MonitorService:
 
             # 3. Send Report
             Notifier.send_telegram(chat_id, analysis_text)
+            
+            # 4. Store Event in Vector DB
+            try:
+                collection = get_collection("market_events")
+                
+                # Use content hash as ID
+                doc_id = f"evt_{datetime.date.today()}_{hashlib.md5(analysis_text.encode()).hexdigest()[:8]}"
+                
+                # Determine impact based on direction
+                impact = "positive" if "涨" in direction else "negative"
+                
+                # Try to map confidence to a float score
+                score = 0.5
+                if "High" in result.confidence or "高" in result.confidence:
+                    score = 0.9
+                elif "Medium" in result.confidence or "中" in result.confidence:
+                    score = 0.6
+                elif "Low" in result.confidence or "低" in result.confidence:
+                    score = 0.3
+                    
+                meta = {
+                    "event_type": "market",
+                    "event_date": str(datetime.date.today()),
+                    "impact": impact,
+                    "impact_score": score,
+                    "source": "monitor_scan",
+                    "related_symbols": symbol, # Chroma meta doesn't support list directly, use comma separated string if multiple, here just one
+                    "doc_version": 1,
+                    "created_at": str(datetime.datetime.utcnow())
+                }
+                
+                # Create a comprehensive document text
+                doc_text = f"【异动归因】{name}({symbol}) {direction} {quote['pct_chg']}%。\n原因: {result.reason}\n摘要: {result.summary}"
+                
+                collection.add(
+                    ids=[doc_id],
+                    documents=[doc_text],
+                    metadatas=[meta]
+                )
+                logger.info(f"Successfully stored market event for {symbol} to vector DB.")
+            except Exception as e:
+                logger.error(f"Failed to store event to vector DB for {symbol}: {e}")
             
         except Exception as e:
             logger.error(f"Analysis failed for {symbol}: {e}")
