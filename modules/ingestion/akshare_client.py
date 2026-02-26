@@ -78,25 +78,61 @@ class AkShareClient:
 
     @staticmethod
     @retry_on_error()
+    def _fetch_hk_spot() -> pd.DataFrame:
+        logger.info("Fetching HK stock list from Eastmoney API...")
+        return ak.stock_hk_spot_em()
+
+    @staticmethod
     @cached("ak_stock_hk", ttl=3600)
     def get_stock_info_hk() -> pd.DataFrame:
-        logger.info("Fetching HK stock list...")
-        df = AkShareClient._safe_call(
-            ["stock_hk_spot_em", "stock_hk_spot"]
-        )
-        logger.info(f"Fetched {len(df)} HK stocks")
-        return df
+        import os
+        fallback_path = "data/cache/last_hk_spot.pkl"
+        os.makedirs(os.path.dirname(fallback_path), exist_ok=True)
+        
+        try:
+            df = AkShareClient._fetch_hk_spot()
+            logger.info(f"Fetched {len(df)} HK stocks from API")
+            if not df.empty:
+                df.to_pickle(fallback_path)
+            return df
+        except Exception as e:
+            logger.warning(f"Failed to fetch HK quotes from API: {e}. Trying local fallback...")
+            if os.path.exists(fallback_path):
+                df_fallback = pd.read_pickle(fallback_path)
+                logger.info(f"Loaded {len(df_fallback)} quotes from local fallback cache.")
+                return df_fallback
+            else:
+                logger.error("No local fallback cache available for HK.")
+                raise e
 
     @staticmethod
     @retry_on_error()
+    def _fetch_us_spot() -> pd.DataFrame:
+        logger.info("Fetching US stock list from Eastmoney API...")
+        return ak.stock_us_spot_em()
+
+    @staticmethod
     @cached("ak_stock_us", ttl=3600)
     def get_stock_info_us() -> pd.DataFrame:
-        logger.info("Fetching US stock list...")
-        df = AkShareClient._safe_call(
-            ["stock_us_spot_em", "stock_us_spot"]
-        )
-        logger.info(f"Fetched {len(df)} US stocks")
-        return df
+        import os
+        fallback_path = "data/cache/last_us_spot.pkl"
+        os.makedirs(os.path.dirname(fallback_path), exist_ok=True)
+        
+        try:
+            df = AkShareClient._fetch_us_spot()
+            logger.info(f"Fetched {len(df)} US stocks from API")
+            if not df.empty:
+                df.to_pickle(fallback_path)
+            return df
+        except Exception as e:
+            logger.warning(f"Failed to fetch US quotes from API: {e}. Trying local fallback...")
+            if os.path.exists(fallback_path):
+                df_fallback = pd.read_pickle(fallback_path)
+                logger.info(f"Loaded {len(df_fallback)} quotes from local fallback cache.")
+                return df_fallback
+            else:
+                logger.error("No local fallback cache available for US.")
+                raise e
     
     @staticmethod
     @retry_on_error()
@@ -424,18 +460,41 @@ class AkShareClient:
     # ================================================================
     @staticmethod
     @retry_on_error()
+    def _fetch_a_spot() -> pd.DataFrame:
+        logger.info("Fetching A-share realtime quotes from Eastmoney API...")
+        return ak.stock_zh_a_spot_em()
+
+    @staticmethod
     @cached("ak_spot", ttl=60)  # 缓存60秒
     def get_realtime_quotes() -> pd.DataFrame:
         """
-        获取 A 股实时行情
+        获取 A 股实时行情，带本地最后成功数据降级容灾机制。
         
         Returns:
             DataFrame with realtime quotes
         """
-        logger.info("Fetching A-share realtime quotes...")
-        df = ak.stock_zh_a_spot_em()
-        logger.info(f"Fetched {len(df)} realtime quotes")
-        return df
+        import os
+        fallback_path = "data/cache/last_a_spot.pkl"
+        
+        # 确保缓存目录存在
+        os.makedirs(os.path.dirname(fallback_path), exist_ok=True)
+        
+        try:
+            df = AkShareClient._fetch_a_spot()
+            logger.info(f"Fetched {len(df)} realtime quotes from API")
+            # 备份最后一重无错数据
+            if not df.empty:
+                df.to_pickle(fallback_path)
+            return df
+        except Exception as e:
+            logger.warning(f"Failed to fetch A-share quotes from API: {e}. Trying local fallback...")
+            if os.path.exists(fallback_path):
+                df_fallback = pd.read_pickle(fallback_path)
+                logger.info(f"Loaded {len(df_fallback)} quotes from local fallback cache.")
+                return df_fallback
+            else:
+                logger.error("No local fallback cache available.")
+                raise e
 
     @staticmethod
     def _safe_call(func_names: list[str], **kwargs) -> pd.DataFrame:

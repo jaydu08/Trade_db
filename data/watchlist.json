@@ -18,5 +18,45 @@
     "alert_threshold_pct": 0.1,
     "is_active": true,
     "chat_id": 5573627236
+  },
+  "NVDA": {
+    "symbol": "NVDA",
+    "market": "US",
+    "name": "NVDA",
+    "added_at": "2026-02-26 10:22:30.921820",
+    "last_alert_at": null,
+    "alert_threshold_pct": 0.1,
+    "is_active": true,
+    "chat_id": 6728885887
+  },
+  "02513": {
+    "symbol": "02513",
+    "market": "HK",
+    "name": "智谱",
+    "added_at": "2026-02-26 10:23:09.293113",
+    "last_alert_at": null,
+    "alert_threshold_pct": 0.1,
+    "is_active": true,
+    "chat_id": 6728885887
+  },
+  "600036": {
+    "symbol": "600036",
+    "market": "CN",
+    "name": "招商银行",
+    "added_at": "2026-02-26 10:24:03.956771",
+    "last_alert_at": null,
+    "alert_threshold_pct": 0.1,
+    "is_active": true,
+    "chat_id": 6728885887
+  },
+  "688256": {
+    "symbol": "688256",
+    "market": "CN",
+    "name": "寒武纪",
+    "added_at": "2026-02-26 23:05:06.301635",
+    "last_alert_at": null,
+    "alert_threshold_pct": 0.1,
+    "is_active": true,
+    "chat_id": 6728885887
   }
 }

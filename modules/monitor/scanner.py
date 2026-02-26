@@ -52,9 +52,39 @@ class MonitorService:
                 logger.error(f"Error scanning {symbol}: {e}")
 
     @staticmethod
+    def _is_market_open(market: str) -> bool:
+        """检查是否在盘中交易时间或盘后半小时内"""
+        now = datetime.datetime.now()
+        # 简单过滤周末
+        if now.weekday() >= 5:
+            return False
+            
+        time_str = now.strftime("%H:%M")
+        
+        if market == 'CN':
+            # A股: 09:30-11:30, 13:00-15:00. 放宽到 15:30 允许尾盘数据延迟
+            if ("09:30" <= time_str <= "11:35") or ("13:00" <= time_str <= "15:30"):
+                return True
+        elif market == 'HK':
+            # 港股: 09:30-12:00, 13:00-16:00. 放宽到 16:30
+            if ("09:30" <= time_str <= "12:05") or ("13:00" <= time_str <= "16:30"):
+                return True
+        elif market == 'US':
+            # 美股 (北京时间): 夏令时 21:30-04:00, 冬令时 22:30-05:00. 粗略放宽
+            # 晚上21:30 到次日凌晨 05:30
+            if time_str >= "21:30" or time_str <= "05:30":
+                return True
+                
+        return False
+
+    @staticmethod
     def _check_item(symbol: str, item: dict, repo: WatchlistRepository):
         market = item['market']
         
+        # 0. 检查是否在交易时段（防止晚上重启拉取收盘价报警）
+        if not MonitorService._is_market_open(market):
+            return
+            
         # 1. Get Quote
         quote = akshare_client.get_realtime_quote_eastmoney(symbol, market)
         if not quote:
@@ -114,46 +144,62 @@ class MonitorService:
     @staticmethod
     def _analyze_and_report(item: dict, quote: dict, direction: str):
         """
-        Deep analysis using LLM + Search
+        Deep analysis using LLM + Multi-Channel Search
         """
         symbol = item['symbol']
         name = item['name']
         chat_id = item.get('chat_id')
+        market = item['market']
         
         try:
-            # 1. Gather Info (Multi-source)
-            # Strategy: Search for specific stock news AND general market news if needed
+            # 1. Gather Info (Multi-source parallel search)
+            news_context = ""
             
-            # A. Specific News
-            # Construct a better query: "{Symbol} stock news" + "{Name} latest"
-            # Split keywords are handled by Tools.web_search now.
-            # We combine them to ensure at least one hits.
-            specific_query = f"{symbol} {name} stock news latest" 
-            news_context = Tools.web_search(specific_query)
+            # Construct comprehensive search queries based on market
+            if market == 'US':
+                q_specific = f"{symbol} {name} stock jump drop reason news latest"
+                q_market = f"US stock market tech sector news today"
+            else:
+                q_specific = f"{symbol} {name} 股价 异动原因 涨停 跌停 最新消息 最新公告"
+                q_market = f"A股 今日大盘 异动 板块 领涨 领跌"
+                
+            logger.info(f"Gathering multi-channel info for {symbol}...")
             
-            # B. Check if we got enough info. If "not found", try market context
-            if "暂无相关新闻" in news_context or len(news_context) < 50:
-                logger.info(f"Specific news empty for {symbol}, trying market context...")
-                market_query = "US stock market news today tech sector" if item['market'] == 'US' else "A股 市场 科技板块 今日"
-                market_news = Tools.web_search(market_query)
-                news_context += f"\n\n【市场背景】:\n{market_news}"
+            # Parallel search for both specific and market context
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as search_pool:
+                fut_specific = search_pool.submit(Tools.web_search, q_specific)
+                fut_market = search_pool.submit(Tools.web_search, q_market)
+                
+                specific_news = fut_specific.result()
+                market_news = fut_market.result()
+                
+            news_context = f"【个股专有资讯】:\n{specific_news}"
+            if len(specific_news) < 100 or "暂无相关新闻" in specific_news:
+                logger.info(f"Specific news weak for {symbol}, appending deep market context...")
+                news_context += f"\n\n【市场/大盘/板块背景】:\n{market_news}"
 
-            # 2. LLM Analysis (Structured)
+            # 2. LLM Analysis (Structured & Strict)
             system_prompt = (
-                "你是专业的金融分析师。请根据提供的新闻分析股价异动原因。\n"
-                "**核心原则**：\n"
-                "1. 优先寻找个股特定的驱动因素（财报、产品、并购）。\n"
-                "2. 如果没有个股新闻，但有市场大盘新闻（如纳指大涨），则归因为'跟随大盘波动'。\n"
-                "3. 如果完全找不到原因，请在 reason 字段中如实填写 '暂未找到明确驱动因素'，严禁编造。\n"
-                "4. 输出必须是严格的JSON格式。"
+                "你是一名顶尖的机构投研分析师。你的任务是根据提供的情报，为基金经理提供最精准、冷酷的股价异动归因。\n"
+                "**绝对禁令**：\n"
+                "1. 绝不允许使用任何客套话、总结性废话（如'综上所述'、'值得注意的是'、'股市有风险，投资需谨慎'）。\n"
+                "2. 绝不允许编造。如果情报中没有个股的原因，必须直言'缺乏个股独立催化，倾向于板块跟风或资金博弈'。\n"
+                "**归因逻辑**：\n"
+                "- 优先寻找量化财务、重大合同、大行评级、政策突发等一级催化剂。\n"
+                "- 其次寻找同板块龙头带动的跟随效应。\n"
+                "**输出风格**：\n"
+                "字数极简，一针见血，必须以专业的财经金融黑话（如：业绩超预期、情绪退潮、资金抱团、高切低）进行表述。\n"
+                "输出必须是严格的JSON格式。"
             )
             
             user_prompt = f"""
-            标的：{name} ({symbol})
-            状态：今日{direction} {quote['pct_chg']}%
+            标的：{name} ({symbol} - {market})
+            异动：今日{direction} {quote['pct_chg']}%
             
-            【新闻情报】
+            【检索到的高价值情报库】
             {news_context}
+            
+            请直接输出JSON（reason字段请用最精炼的1-2句话直击要害）。
             """
             
             try:
@@ -167,19 +213,18 @@ class MonitorService:
                 )
                 
                 analysis_text = (
-                    f"🧐 **智能归因报告**: {name}\n\n"
-                    f"💡 **核心原因**: {result.reason}\n"
-                    f"📊 **置信度**: {result.confidence}\n"
-                    f"📝 **摘要**: {result.summary}\n\n"
-                    f"🔗 **参考源**: {', '.join(result.sources[:3])}"
+                    f"🎯 **极简复盘**: {name} ({symbol})\n\n"
+                    f"⚡ **异动核心**: {result.reason}\n"
+                    f"📈 **置信度**: {result.confidence}\n"
+                    f"📝 **快照**: {result.summary}\n\n"
+                    f"🔗 **溯源**: {', '.join(result.sources[:2])}"
                 )
                 
             except Exception as llm_e:
-                logger.error(f"LLM Structured output failed, falling back to simple text: {llm_e}")
-                # Fallback to simple prompt
-                fallback_prompt = f"{user_prompt}\n请简要分析原因，不要废话。"
+                logger.error(f"LLM Structured output failed: {llm_e}")
+                fallback_prompt = f"{user_prompt}\n直接给出1句话原因，不要任何其他字。"
                 analysis_text = simple_prompt(fallback_prompt)
-                analysis_text = f"🧐 **智能归因**: {analysis_text}"
+                analysis_text = f"🎯 **直接归因**: {analysis_text}"
 
             # 3. Send Report
             Notifier.send_telegram(chat_id, analysis_text)

@@ -56,6 +56,7 @@ class MarketHeatMap:
         columns_map = {
             "代码": "symbol",
             "名称": "name",
+            "中文名称": "name",
             "最新价": "price",
             "涨跌幅": "pct_chg",
             "换手率": "turnover",
