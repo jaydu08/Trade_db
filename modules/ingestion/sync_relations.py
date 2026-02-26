@@ -6,7 +6,7 @@ from typing import List, Dict
 from sqlmodel import select
 from core.db import db_manager, get_collection
 from domain.meta import AssetProfile
-from core.llm import json_prompt
+from core.llm import simple_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,10 @@ class RelationSyncer:
         user_prompt = f"公司简介：\n{profile_text}"
         
         try:
-            resp = json_prompt(sys_prompt + "\n\n" + user_prompt)
+            resp = simple_prompt(sys_prompt + "\n\n" + user_prompt)
+            # Find JSON boundary if the model wrapped it
+            if "```json" in resp:
+                resp = resp.split("```json")[1].split("```")[0].strip()
             relations = json.loads(resp)
             if isinstance(relations, list):
                 return relations

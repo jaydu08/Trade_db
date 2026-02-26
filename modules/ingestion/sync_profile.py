@@ -8,7 +8,7 @@ import hashlib
 
 import pandas as pd
 from sqlmodel import select
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from core.db import db_manager, get_collection
 from domain.meta import Asset, AssetProfile, DataSyncLog
