@@ -32,7 +32,7 @@ class MonitorService:
     @staticmethod
     def scan_and_alert():
         """
-        Scan all watchlist items for anomalies.
+        Scan all watchlist items for anomalies using AsyncMarketProber.
         """
         logger.info("Scanning watchlist...")
         
@@ -42,76 +42,109 @@ class MonitorService:
         if not data:
             return
 
+        active_items = []
         for symbol, item in data.items():
-            if not item.get('is_active', True):
+            if item.get('is_active', True) and MonitorService._is_market_open(item['market']):
+                active_items.append(item)
+                
+        if not active_items:
+            logger.debug("No active items or markets closed.")
+            return
+
+        # Fetch quotes asynchronously
+        import asyncio
+        from modules.probing.async_prober import async_prober
+        
+        logger.info(f"Fetching quotes for {len(active_items)} watchlist items via async prober...")
+        try:
+            quotes_results = asyncio.run(async_prober.get_quotes_async(active_items))
+        except Exception as e:
+            logger.error(f"Failed to fetch quotes async: {e}")
+            return
+
+        for item in active_items:
+            symbol = item['symbol']
+            quote = quotes_results.get(symbol)
+            if not quote:
                 continue
+                
+            pct_chg = quote.get('pct_chg')
+            price = quote.get('price')
             
-            try:
-                MonitorService._check_item(symbol, item, repo)
-            except Exception as e:
-                logger.error(f"Error scanning {symbol}: {e}")
+            if pct_chg is None:
+                continue
+                
+            # Check Threshold
+            threshold = item.get('alert_threshold_pct', 5.0)
+            
+            if abs(pct_chg) >= threshold:
+                # Check Cooldown
+                today = str(datetime.date.today())
+                last_alert_str = item.get('last_alert_at')
+                last_alert = last_alert_str.split()[0] if last_alert_str else None
+                
+                if last_alert != today:
+                    # Persist Alert to DB
+                    MonitorService._persist_alert(item, quote)
+                    
+                    # Trigger Alert
+                    MonitorService.trigger_alert(item, quote)
+                    
+                    # Update State
+                    item['last_alert_at'] = str(datetime.datetime.now())
+                    repo.add_item(symbol, item)
 
     @staticmethod
     def _is_market_open(market: str) -> bool:
-        """检查是否在盘中交易时间或盘后半小时内"""
-        now = datetime.datetime.now()
-        # 简单过滤周末
-        if now.weekday() >= 5:
-            return False
-            
-        time_str = now.strftime("%H:%M")
+        """检查是否在盘中交易时间或盘后半小时内 (带时区感知)"""
+        import datetime
+        from zoneinfo import ZoneInfo
         
         if market == 'CN':
-            # A股: 09:30-11:30, 13:00-15:00. 放宽到 15:30 允许尾盘数据延迟
-            if ("09:30" <= time_str <= "11:35") or ("13:00" <= time_str <= "15:30"):
-                return True
+            tz = ZoneInfo('Asia/Shanghai')
+            now = datetime.datetime.now(tz)
+            if now.weekday() >= 5: return False
+            time_str = now.strftime("%H:%M")
+            return ("09:30" <= time_str <= "11:35") or ("13:00" <= time_str <= "15:30")
+            
         elif market == 'HK':
-            # 港股: 09:30-12:00, 13:00-16:00. 放宽到 16:30
-            if ("09:30" <= time_str <= "12:05") or ("13:00" <= time_str <= "16:30"):
-                return True
+            tz = ZoneInfo('Asia/Hong_Kong')
+            now = datetime.datetime.now(tz)
+            if now.weekday() >= 5: return False
+            time_str = now.strftime("%H:%M")
+            return ("09:30" <= time_str <= "12:05") or ("13:00" <= time_str <= "16:30")
+            
         elif market == 'US':
-            # 美股 (北京时间): 夏令时 21:30-04:00, 冬令时 22:30-05:00. 粗略放宽
-            # 晚上21:30 到次日凌晨 05:30
-            if time_str >= "21:30" or time_str <= "05:30":
-                return True
+            tz = ZoneInfo('America/New_York')
+            now = datetime.datetime.now(tz)
+            if now.weekday() >= 5: return False
+            time_str = now.strftime("%H:%M")
+            # 美东常规交易时间: 09:30 - 16:00, 算上盘后放宽到 16:30
+            return ("09:30" <= time_str <= "16:30")
                 
         return False
 
     @staticmethod
-    def _check_item(symbol: str, item: dict, repo: WatchlistRepository):
-        market = item['market']
+    def _persist_alert(item: dict, quote: dict):
+        """记录预警信息到数据库"""
+        from core.db import db_manager
+        from domain.ledger.analytics import WatchlistAlert
         
-        # 0. 检查是否在交易时段（防止晚上重启拉取收盘价报警）
-        if not MonitorService._is_market_open(market):
-            return
-            
-        # 1. Get Quote
-        quote = akshare_client.get_realtime_quote_eastmoney(symbol, market)
-        if not quote:
-            return
-            
-        pct_chg = quote.get('pct_chg')
-        price = quote.get('price')
-        
-        if pct_chg is None:
-            return
-            
-        # 2. Check Threshold
-        threshold = item.get('alert_threshold_pct', 5.0)
-        
-        if abs(pct_chg) >= threshold:
-            # 3. Check Cooldown
-            today = str(datetime.date.today())
-            last_alert_str = item.get('last_alert_at')
-            last_alert = last_alert_str.split()[0] if last_alert_str else None
-            
-            if last_alert != today:
-                # 4. Trigger Alert
-                MonitorService.trigger_alert(item, quote)
-                
-                # 5. Update State
-                item['last_alert_at'] = str(datetime.datetime.now())
-                repo.add_item(symbol, item)
+        try:
+            alert = WatchlistAlert(
+                symbol=item['symbol'],
+                name=item['name'],
+                market=item['market'],
+                alert_reason=f"涨跌幅异常: {quote['pct_chg']}% 达到阈值 {item.get('alert_threshold_pct', 5.0)}%",
+                price=quote['price'],
+                change_pct=quote['pct_chg'],
+                status="TRIGGERED"
+            )
+            with db_manager.ledger_session() as session:
+                session.add(alert)
+                logger.info(f"Persisted WatchlistAlert for {item['symbol']} to ledger DB.")
+        except Exception as e:
+            logger.error(f"Failed to persist WatchlistAlert: {e}")
 
     @staticmethod
     def trigger_alert(item: dict, quote: dict):
@@ -170,8 +203,13 @@ class MonitorService:
                 fut_specific = search_pool.submit(Tools.web_search, q_specific)
                 fut_market = search_pool.submit(Tools.web_search, q_market)
                 
-                specific_news = fut_specific.result()
-                market_news = fut_market.result()
+                try:
+                    specific_news = fut_specific.result(timeout=25)
+                    market_news = fut_market.result(timeout=25)
+                except concurrent.futures.TimeoutError:
+                    logger.error(f"Search timed out for {symbol}")
+                    specific_news = "搜索超时"
+                    market_news = "搜索超时"
                 
             news_context = f"【个股专有资讯】:\n{specific_news}"
             if len(specific_news) < 100 or "暂无相关新闻" in specific_news:

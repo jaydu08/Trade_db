@@ -5,6 +5,20 @@ import logging
 import time
 from typing import Optional, Callable, TypeVar
 from functools import wraps
+import requests
+
+# 全局 Patch requests 增加默认 timeout 和 User-Agent，防止连接挂死和触发爬虫拦截
+_original_request = requests.Session.request
+def _patched_request(self, method, url, **kwargs):
+    if 'timeout' not in kwargs:
+        kwargs['timeout'] = 15
+    if 'headers' not in kwargs:
+        kwargs['headers'] = {}
+    if 'User-Agent' not in kwargs['headers'] and 'user-agent' not in kwargs['headers']:
+        kwargs['headers']['User-Agent'] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    kwargs['headers']['Connection'] = 'close'
+    return _original_request(self, method, url, **kwargs)
+requests.Session.request = _patched_request
 
 import pandas as pd
 import akshare as ak
@@ -77,62 +91,98 @@ class AkShareClient:
         return df
 
     @staticmethod
-    @retry_on_error()
-    def _fetch_hk_spot() -> pd.DataFrame:
-        logger.info("Fetching HK stock list from Eastmoney API...")
-        return ak.stock_hk_spot_em()
+    def _fetch_bulk_sina(market: str) -> pd.DataFrame:
+        """从本地库读取股票列表，分批向新浪请求实时行情"""
+        import sqlite3
+        import requests
+        import concurrent.futures
+        
+        # 尝试从 meta.db 获取资产列表
+        try:
+            conn = sqlite3.connect("data/meta.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT symbol, name FROM asset WHERE market=?", (market,))
+            rows = cursor.fetchall()
+            conn.close()
+        except:
+            return pd.DataFrame()
+            
+        query_map = {}
+        for row in rows:
+            sym, name = row[0], row[1]
+            if market == "CN":
+                s = f"sh{sym}" if sym.startswith("6") else f"sz{sym}"
+            elif market == "HK":
+                s = f"hk{sym}"
+            elif market == "US":
+                clean_sym = sym.split(".")[-1]
+                s = f"gb_{clean_sym.lower().replace('.', '$')}"
+            query_map[s] = (sym, name)
+            
+        sina_symbols = list(query_map.keys())
+        batch_size = 400
+        batches = [sina_symbols[i:i+batch_size] for i in range(0, len(sina_symbols), batch_size)]
+        
+        results = []
+        def fetch_batch(batch):
+            try:
+                url = "http://hq.sinajs.cn/list=" + ",".join(batch)
+                resp = requests.get(url, headers={"Referer": "http://finance.sina.com.cn"}, timeout=10)
+                return resp.text.splitlines()
+            except: return []
+                
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            for text_lines in executor.map(fetch_batch, batches):
+                for line in text_lines:
+                    if '=""' in line or '="' not in line: continue
+                    try:
+                        parts = line.split('="')[1].split('";')[0].split(',')
+                        s_id = line.split('="')[0].split('hq_str_')[1]
+                        sym, name = query_map.get(s_id, ("", ""))
+                        if not sym: continue
+                        
+                        price, pct_chg, amount, turnover = 0.0, 0.0, 0.0, 0.0
+                        
+                        if market == "CN":
+                            if len(parts) < 32: continue
+                            prev = float(parts[2])
+                            price = float(parts[3])
+                            amount = float(parts[9])
+                            if prev > 0: pct_chg = round((price - prev) / prev * 100, 2)
+                        elif market == "HK":
+                            if len(parts) < 12: continue
+                            price = float(parts[6])
+                            pct_chg = float(parts[8])
+                            amount = float(parts[11])
+                        elif market == "US":
+                            if len(parts) < 11: continue
+                            price = float(parts[1])
+                            pct_chg = float(parts[2])
+                            amount = float(parts[10]) * price
+                            
+                        results.append({
+                            "代码": sym,
+                            "名称": name,
+                            "最新价": price,
+                            "涨跌幅": pct_chg,
+                            "成交额": amount,
+                            "换手率": turnover
+                        })
+                    except: continue
+                    
+        return pd.DataFrame(results)
 
     @staticmethod
     @cached("ak_stock_hk", ttl=3600)
     def get_stock_info_hk() -> pd.DataFrame:
-        import os
-        fallback_path = "data/cache/last_hk_spot.pkl"
-        os.makedirs(os.path.dirname(fallback_path), exist_ok=True)
-        
-        try:
-            df = AkShareClient._fetch_hk_spot()
-            logger.info(f"Fetched {len(df)} HK stocks from API")
-            if not df.empty:
-                df.to_pickle(fallback_path)
-            return df
-        except Exception as e:
-            logger.warning(f"Failed to fetch HK quotes from API: {e}. Trying local fallback...")
-            if os.path.exists(fallback_path):
-                df_fallback = pd.read_pickle(fallback_path)
-                logger.info(f"Loaded {len(df_fallback)} quotes from local fallback cache.")
-                return df_fallback
-            else:
-                logger.error("No local fallback cache available for HK.")
-                raise e
-
-    @staticmethod
-    @retry_on_error()
-    def _fetch_us_spot() -> pd.DataFrame:
-        logger.info("Fetching US stock list from Eastmoney API...")
-        return ak.stock_us_spot_em()
+        logger.info("Fetching HK stock list using Sina batch...")
+        return AkShareClient._fetch_bulk_sina("HK")
 
     @staticmethod
     @cached("ak_stock_us", ttl=3600)
     def get_stock_info_us() -> pd.DataFrame:
-        import os
-        fallback_path = "data/cache/last_us_spot.pkl"
-        os.makedirs(os.path.dirname(fallback_path), exist_ok=True)
-        
-        try:
-            df = AkShareClient._fetch_us_spot()
-            logger.info(f"Fetched {len(df)} US stocks from API")
-            if not df.empty:
-                df.to_pickle(fallback_path)
-            return df
-        except Exception as e:
-            logger.warning(f"Failed to fetch US quotes from API: {e}. Trying local fallback...")
-            if os.path.exists(fallback_path):
-                df_fallback = pd.read_pickle(fallback_path)
-                logger.info(f"Loaded {len(df_fallback)} quotes from local fallback cache.")
-                return df_fallback
-            else:
-                logger.error("No local fallback cache available for US.")
-                raise e
+        logger.info("Fetching US stock list using Sina batch...")
+        return AkShareClient._fetch_bulk_sina("US")
     
     @staticmethod
     @retry_on_error()
@@ -345,156 +395,192 @@ class AkShareClient:
             return pd.DataFrame()
 
     # ================================================================
-    # 实时行情 (东方财富源 - 极速版)
+    # 实时行情 (Sina HQ API 替代方案)
     # ================================================================
     @staticmethod
     def get_realtime_quote_eastmoney(symbol: str, market: str = "CN") -> dict:
         """
-        从东方财富获取实时行情 (更准确，无延时)
+        原为东方财富获取实时行情，由于IP被限，替换为新浪行情接口 (兼容原返回格式)。
         """
         import requests
-        import time
         
-        # 东方财富接口
-        # secid: 1.600519 (SH), 0.300251 (SZ), 116.00700 (HK), 105.NVDA (US)
-        # 这里的 secid 需要根据 symbol 动态生成
-        
-        secid = ""
+        # 构建 Sina symbol
+        sina_symbol = ""
         if market == "CN":
-            if symbol.startswith("6"): secid = f"1.{symbol}"
-            else: secid = f"0.{symbol}"
+            if symbol.startswith("6"): sina_symbol = f"sh{symbol}"
+            else: sina_symbol = f"sz{symbol}"
         elif market == "HK":
-            secid = f"116.{symbol}"
+            sina_symbol = f"hk{symbol}"
         elif market == "US":
-            # US 需要先查一下代码映射，或者盲猜
-            # 东财美股代码通常是 105.xxx, 106.xxx, 107.xxx
-            # 简单起见，我们先尝试 105 (纳斯达克) 和 106 (纽交所)
-            secid = f"105.{symbol.upper()}"
+            sina_symbol = f"gb_{symbol.lower().replace('.', '$')}"
             
-        url = "https://push2.eastmoney.com/api/qt/stock/get"
-        params = {
-            "secid": secid,
-            "ut": "fa5fd1943c7b386f172d6893dbfba10b",
-            "fields": "f43,f57,f58,f59,f107,f46,f60,f44,f45,f47,f48,f19,f17,f531,f15,f16,f113",
-            "invt": "2",
-            "_": int(time.time() * 1000)
-        }
+        url = f"http://hq.sinajs.cn/list={sina_symbol}"
+        headers = {"Referer": "http://finance.sina.com.cn"}
         
         try:
-            resp = requests.get(url, params=params, timeout=10)
-            data = resp.json()
+            resp = requests.get(url, headers=headers, timeout=10)
+            text = resp.text.strip()
+            if not text or "=\"\"" in text or "=\"\"," in text:
+                return {}
+                
+            parts = text.split("=\"")[1].split("\";")[0].split(",")
+            if len(parts) < 5: return {}
             
-            if data and data.get("data"):
-                d = data["data"]
-                # f43: price, f58: name, f170: change_pct (need check fields)
-                # Correct fields mapping:
-                # f43: 最新价
-                # f58: 名称
-                # f169: 涨跌额 (f169 not in fields list, let's use f170 for pct?)
-                # Actually eastmoney fields are tricky. Let's use a standard list.
-                # f43: price, f58: name, f170: pct_chg, f169: change
+            name, price, change, pct_chg, ts = "", 0.0, 0.0, 0.0, ""
+            
+            if market == "CN":
+                if len(parts) < 32: return {}
+                name = parts[0]
+                prev_close = float(parts[2])
+                price = float(parts[3])
+                if prev_close > 0:
+                    change = price - prev_close
+                    pct_chg = round((change / prev_close) * 100, 2)
+                ts = f"{parts[30]} {parts[31]}"
+            elif market == "HK":
+                if len(parts) < 19: return {}
+                name = parts[1]
+                price = float(parts[6])
+                change = float(parts[7])
+                pct_chg = float(parts[8])
+                ts = f"{parts[17]} {parts[18]}"
+            elif market == "US":
+                if len(parts) < 6: return {}
+                name = parts[0]
+                price = float(parts[1])
+                pct_chg = float(parts[2])
+                ts = parts[3]
+                change = float(parts[4])
                 
-                # Let's re-request with standard fields
-                params["fields"] = "f43,f58,f169,f170,f46,f60,f19,f17,f59,f86" 
-                # f86: update_time
-                resp = requests.get(url, params=params, timeout=10)
-                data = resp.json()
-                if not data or not data.get("data"):
-                    # Retry for US market if first fail
-                    if market == "US":
-                        params["secid"] = f"106.{symbol.upper()}"
-                        resp = requests.get(url, params=params, timeout=10)
-                        data = resp.json()
-                
-                if data and data.get("data"):
-                    d = data["data"]
-                    price = d.get("f43")
-                    if price == "-": return {} # Invalid
-                    
-                    # 价格修正逻辑
-                    final_price = float(price)
-                    pct_chg = float(d.get("f170") or 0)
-                    change = float(d.get("f169") or 0)
-                    
-                    if market == "CN":
-                        # A股通常是放大100倍
-                        if final_price > 1000: final_price = final_price / 100
-                        change = change / 100
-                        pct_chg = pct_chg / 100
-                    elif market == "HK":
-                        # 港股通常是放大1000倍
-                        if final_price > 1000: final_price = final_price / 1000
-                        # 港股涨跌幅通常不需要除，但如果是 414 这种整数，那就要除
-                        if abs(pct_chg) > 100: pct_chg = pct_chg / 100
-                        # change 也不确定，保守起见不乱动
-                    elif market == "US":
-                        # 美股情况复杂，东财可能返回放大100倍或1000倍的数值
-                        # 启发式：如果价格 > 5000 (BRK.A除外)，尝试缩小
-                        if final_price > 10000: 
-                            final_price = final_price / 1000 # 316140 -> 316.14
-                        elif final_price > 5000:
-                            final_price = final_price / 100
-                            
-                        # 涨跌幅：如果 > 50% (对于 GOOG 这种票)，肯定是放大了
-                        if abs(pct_chg) > 50: pct_chg = pct_chg / 100
-                        
-                        # 涨跌额同理
-                        if abs(change) > 50: change = change / 100
-                    
-                    return {
-                        "symbol": symbol,
-                        "name": d.get("f58"),
-                        "price": final_price,
-                        "change": change,
-                        "pct_chg": pct_chg,
-                        "timestamp": d.get("f86") 
-                    }
-                    
+            return {
+                "symbol": symbol,
+                "name": name,
+                "price": price,
+                "change": change,
+                "pct_chg": pct_chg,
+                "timestamp": ts
+            }
+            
         except Exception as e:
-            logger.warning(f"Eastmoney quote failed for {symbol}: {e}")
+            logger.warning(f"Sina quote failed for {symbol}: {e}")
             
         return {}
-
-    # ================================================================
-    # 实时行情 (AkShare)
-    # ================================================================
-    @staticmethod
-    @retry_on_error()
-    def _fetch_a_spot() -> pd.DataFrame:
-        logger.info("Fetching A-share realtime quotes from Eastmoney API...")
-        return ak.stock_zh_a_spot_em()
 
     @staticmethod
     @cached("ak_spot", ttl=60)  # 缓存60秒
     def get_realtime_quotes() -> pd.DataFrame:
         """
-        获取 A 股实时行情，带本地最后成功数据降级容灾机制。
-        
-        Returns:
-            DataFrame with realtime quotes
+        [DEPRECATED] 批量轮询已被弃用。
+        请针对少量自选池使用 AsyncMarketProber，对全市场榜单使用 get_daily_top_ranks()。
         """
-        import os
-        fallback_path = "data/cache/last_a_spot.pkl"
+        logger.warning("get_realtime_quotes() is deprecated due to high-frequency polling bans.")
+        return pd.DataFrame()
+
+    @staticmethod
+    def _distill_ranks(df: pd.DataFrame, top_n: int) -> pd.DataFrame:
+        """
+        本地精排算法 (Distillation Strategy)
+        在取得了全市场粗排数据后，结合量价数据的多个维度（如涨幅、换手率、成交额）
+        合成一个综合 Alpha Score，从而筛选出最具资金共识的标的。
+        """
+        if df.empty or len(df) <= top_n:
+            return df
+            
+        # 为了简单，采用标准化打分体系
+        # 提取候选池进行精排
+        distillation_pool = df.copy()
         
-        # 确保缓存目录存在
-        os.makedirs(os.path.dirname(fallback_path), exist_ok=True)
+        # 归一化处理 (Min-Max Scaling)
+        for col in ["change_pct", "turnover_rate", "amount"]:
+            if col in distillation_pool.columns:
+                min_val = distillation_pool[col].min()
+                max_val = distillation_pool[col].max()
+                if max_val > min_val:
+                    distillation_pool[f"{col}_norm"] = (distillation_pool[col] - min_val) / (max_val - min_val)
+                else:
+                    distillation_pool[f"{col}_norm"] = 0.0
+
+        # 精排打分公式 (可以根据需要调整因子权重)
+        # 这里给涨幅40%，换手率（活跃度）40%，成交额（流动性）20% 的权重
+        distillation_pool["alpha_score"] = (
+            distillation_pool.get("change_pct_norm", 0) * 0.4 +
+            distillation_pool.get("turnover_rate_norm", 0) * 0.4 +
+            distillation_pool.get("amount_norm", 0) * 0.2
+        )
+        
+        # 按照综合评分精排
+        distilled = distillation_pool.sort_values(by="alpha_score", ascending=False).head(top_n)
+        return distilled
+
+    @staticmethod
+    @retry_on_error()
+    @cached("daily_top_ranks", ttl=86400) # 一天只取一次全市场
+    def get_daily_top_ranks(market: str = "CN", rank_type: str = "change_pct", top_n: int = 10) -> pd.DataFrame:
+        """
+        获取每日全市场 Top 排行榜数据
+        
+        Args:
+            market: 市场类型 "CN", "HK", "US"
+            rank_type: 排行类型 "change_pct" (涨幅), "amount" (成交额), "turnover" (换手率)
+            top_n: 获取前 n 条
+            
+        Returns:
+            DataFrame 包含 symbol, name, price, change_pct, amount, turnover_rate
+        """
+        logger.info(f"Fetching daily top {top_n} {rank_type} for market: {market} using AKShare (single request)...")
         
         try:
-            df = AkShareClient._fetch_a_spot()
-            logger.info(f"Fetched {len(df)} realtime quotes from API")
-            # 备份最后一重无错数据
-            if not df.empty:
-                df.to_pickle(fallback_path)
-            return df
-        except Exception as e:
-            logger.warning(f"Failed to fetch A-share quotes from API: {e}. Trying local fallback...")
-            if os.path.exists(fallback_path):
-                df_fallback = pd.read_pickle(fallback_path)
-                logger.info(f"Loaded {len(df_fallback)} quotes from local fallback cache.")
-                return df_fallback
+            if market == "CN":
+                df = ak.stock_zh_a_spot_em()
+                symbol_col, name_col, price_col, pct_col, amt_col, turn_col = "代码", "名称", "最新价", "涨跌幅", "成交额", "换手率"
+            elif market == "HK":
+                df = ak.stock_hk_spot_em()
+                symbol_col, name_col, price_col, pct_col, amt_col, turn_col = "代码", "名称", "最新价", "涨跌幅", "成交额", "换手率"
+            elif market == "US":
+                df = ak.stock_us_spot_em()
+                symbol_col, name_col, price_col, pct_col, amt_col, turn_col = "代码", "名称", "最新价", "涨跌幅", "成交额", "换手率"
             else:
-                logger.error("No local fallback cache available.")
-                raise e
+                return pd.DataFrame()
+                
+            if df.empty:
+                return pd.DataFrame()
+                
+            # 清理数据类型
+            for col in [price_col, pct_col, amt_col, turn_col]:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+            
+            # 排序
+            if rank_type == "change_pct":
+                sort_col = pct_col
+            elif rank_type == "amount":
+                sort_col = amt_col
+            elif rank_type == "turnover":
+                sort_col = turn_col
+            else:
+                sort_col = pct_col
+                
+            # 首先进行粗排，截取前 300 名进入精排池
+            if sort_col in df.columns:
+                df = df.sort_values(by=sort_col, ascending=False).head(300)
+            
+            # 使用算法精排，选出最终的 Top N
+            df = AkShareClient._distill_ranks(df, top_n)
+            
+            # 标准化输出列
+            res = pd.DataFrame({
+                "symbol": df[symbol_col],
+                "name": df[name_col],
+                "price": df[price_col] if price_col in df.columns else 0.0,
+                "change_pct": df[pct_col] if pct_col in df.columns else 0.0,
+                "amount": df[amt_col] if amt_col in df.columns else 0.0,
+                "turnover_rate": df[turn_col] if turn_col in df.columns else 0.0,
+            })
+            return res
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch daily top ranks for {market}: {e}")
+            return pd.DataFrame()
 
     @staticmethod
     def _safe_call(func_names: list[str], **kwargs) -> pd.DataFrame:

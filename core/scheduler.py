@@ -78,10 +78,10 @@ class TaskScheduler:
             replace_existing=True
         )
 
-        # 5. US 热度榜单 (每天 09:00 美股收盘后)
+        # 5. US 热度榜单 (每天 10:00 美股收盘后)
         self.scheduler.add_job(
             self._job_us_heatmap,
-            CronTrigger(hour=9, minute=0),
+            CronTrigger(hour=10, minute=0),
             id="us_heatmap",
             name="美股热门榜单",
             replace_existing=True

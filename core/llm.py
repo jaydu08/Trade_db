@@ -55,6 +55,7 @@ class LLMClient:
             self.client = OpenAI(
                 api_key=self.api_key,
                 base_url=self.base_url,
+                timeout=30.0,
             )
             logger.info(f"LLM client initialized: {self.base_url} / {self.model}")
     

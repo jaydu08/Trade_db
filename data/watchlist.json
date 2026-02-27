@@ -4,7 +4,7 @@
     "market": "US",
     "name": "GOOG",
     "added_at": "2026-02-21 00:29:25.455153",
-    "last_alert_at": "2026-02-26 00:07:48.293604",
+    "last_alert_at": "2026-02-28 00:54:28.301711",
     "alert_threshold_pct": 0.1,
     "is_active": true,
     "chat_id": 5573627236
@@ -14,7 +14,7 @@
     "market": "US",
     "name": "CRCL",
     "added_at": "2026-02-21 00:29:04.923017",
-    "last_alert_at": null,
+    "last_alert_at": "2026-02-28 00:54:29.462719",
     "alert_threshold_pct": 0.1,
     "is_active": true,
     "chat_id": 5573627236
@@ -24,7 +24,7 @@
     "market": "US",
     "name": "NVDA",
     "added_at": "2026-02-26 10:22:30.921820",
-    "last_alert_at": null,
+    "last_alert_at": "2026-02-28 00:54:30.234785",
     "alert_threshold_pct": 0.1,
     "is_active": true,
     "chat_id": 6728885887
@@ -34,7 +34,7 @@
     "market": "HK",
     "name": "智谱",
     "added_at": "2026-02-26 10:23:09.293113",
-    "last_alert_at": null,
+    "last_alert_at": "2026-02-28 00:54:30.967591",
     "alert_threshold_pct": 0.1,
     "is_active": true,
     "chat_id": 6728885887
@@ -44,17 +44,27 @@
     "market": "CN",
     "name": "招商银行",
     "added_at": "2026-02-26 10:24:03.956771",
-    "last_alert_at": null,
+    "last_alert_at": "2026-02-28 00:54:31.697917",
     "alert_threshold_pct": 0.1,
     "is_active": true,
     "chat_id": 6728885887
   },
-  "688256": {
-    "symbol": "688256",
+  "600410": {
+    "symbol": "600410",
     "market": "CN",
-    "name": "寒武纪",
-    "added_at": "2026-02-26 23:05:06.301635",
-    "last_alert_at": null,
+    "name": "华胜天成",
+    "added_at": "2026-02-27 10:22:56.129617",
+    "last_alert_at": "2026-02-28 00:54:32.486966",
+    "alert_threshold_pct": 0.1,
+    "is_active": true,
+    "chat_id": 6728885887
+  },
+  "NFLX": {
+    "symbol": "NFLX",
+    "market": "US",
+    "name": "NFLX",
+    "added_at": "2026-02-27 22:40:52.280611",
+    "last_alert_at": "2026-02-28 00:54:33.267227",
     "alert_threshold_pct": 0.1,
     "is_active": true,
     "chat_id": 6728885887
