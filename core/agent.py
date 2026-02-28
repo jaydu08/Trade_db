@@ -164,6 +164,36 @@ class Tools:
             except Exception as e:
                 logger.warning(f"Bocha AI search failed: {e}")
 
+        # 2.5 Secondary Source: Google News RSS (Very robust for global markets)
+        try:
+            import urllib.request
+            import xml.etree.ElementTree as ET
+            import urllib.parse
+            
+            logger.info(f"Trying Google News RSS for '{query}'")
+            # If query contains English (like US stocks), use English EN, otherwise CN
+            if re.search(r'[a-zA-Z]{3,}', query) and not re.search(r'[\u4e00-\u9fa5]', query):
+                query_encoded = urllib.parse.quote(f"{query} when:7d")
+                url = f"https://news.google.com/rss/search?q={query_encoded}&hl=en-US&gl=US&ceid=US:en"
+            else:
+                query_encoded = urllib.parse.quote(f"{query} when:7d")
+                url = f"https://news.google.com/rss/search?q={query_encoded}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+                
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            r = urllib.request.urlopen(req, timeout=10)
+            root = ET.fromstring(r.read())
+            
+            rss_matches = []
+            for item in root.findall('.//item')[:5]:
+                title = item.find('title').text
+                pubDate = item.find('pubDate').text
+                rss_matches.append(f"[{pubDate}] {title}")
+                
+            if rss_matches:
+                results.append("【Google News 聚合】:\n" + "\n".join(rss_matches))
+        except Exception as e:
+            logger.warning(f"Google News RSS search failed: {e}")
+
         if results:
             return "\n".join(results)
             

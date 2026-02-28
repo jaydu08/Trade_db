@@ -189,12 +189,16 @@ class MonitorService:
             news_context = ""
             
             # Construct comprehensive search queries based on market
+            # Avoid too many keywords which confuse search engines like Bocha or Google
             if market == 'US':
-                q_specific = f"{symbol} {name} stock jump drop reason news latest"
-                q_market = f"US stock market tech sector news today"
+                q_specific = f"{symbol} stock news why down up today"
+                q_market = f"US stock market today main drivers tech news"
+            elif market == 'HK':
+                q_specific = f"{symbol} {name} 港股 股价 异动原因 暴涨 暴跌 财报"
+                q_market = f"港股 恒生科技 恒指 今日异动 大盘分析"
             else:
-                q_specific = f"{symbol} {name} 股价 异动原因 涨停 跌停 最新消息 最新公告"
-                q_market = f"A股 今日大盘 异动 板块 领涨 领跌"
+                q_specific = f"{symbol} {name} 股票 为什么 涨停 跌停 异动 最新公告"
+                q_market = f"A股 沪指 创业板 今日异动 板块 领涨"
                 
             logger.info(f"Gathering multi-channel info for {symbol}...")
             

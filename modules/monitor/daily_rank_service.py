@@ -32,6 +32,10 @@ class DailyRankService:
         
         with db_manager.ledger_session() as session:
             for market in markets:
+                if not DailyRankService._should_sync_today(market):
+                    logger.info(f"Skipping {market} daily rank sync: Not a valid reporting day (Weekend).")
+                    continue
+                    
                 for rank_type in rank_types:
                     # 检查今天是否已经同步过
                     existing = session.exec(
@@ -97,6 +101,28 @@ class DailyRankService:
             # 提交事务
             session.commit()
             logger.info(f"All requested daily ranks synced successfully for {today}.")
+
+    @staticmethod
+    def _should_sync_today(market: str) -> bool:
+        """
+        判断北京时间今天是否应该拉取该市场的榜单。
+        CN/HK: 交易日为周一至周五，通常在北京时间傍晚拉取，所以北京时间的周六、周日跳过。
+        US: 交易日为美东周一至周五，对应北京时间的周二至周六凌晨/早上拉取，所以北京时间的周日、周一跳过。
+        """
+        import datetime
+        from zoneinfo import ZoneInfo
+        
+        now = datetime.datetime.now(ZoneInfo('Asia/Shanghai'))
+        weekday = now.weekday() # 0=Mon, ..., 5=Sat, 6=Sun
+        
+        if market in ['CN', 'HK']:
+            if weekday >= 5: # Sat, Sun
+                return False
+        elif market == 'US':
+            if weekday in [6, 0]: # Sun, Mon
+                return False
+                
+        return True
 
 # 全局实例
 daily_rank_service = DailyRankService()
