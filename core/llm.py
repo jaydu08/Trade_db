@@ -52,10 +52,11 @@ class LLMClient:
             logger.warning("OPENAI_API_KEY not set. LLM features will not work.")
             self.client = None
         else:
+            import httpx
             self.client = OpenAI(
                 api_key=self.api_key,
                 base_url=self.base_url,
-                timeout=30.0,
+                timeout=httpx.Timeout(120.0, read=120.0, connect=30.0),
             )
             logger.info(f"LLM client initialized: {self.base_url} / {self.model}")
     

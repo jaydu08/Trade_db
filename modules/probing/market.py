@@ -94,30 +94,12 @@ class MarketProber:
             {symbol: quote_dict} 字典
         """
         try:
-            # 获取全市场行情
-            df = akshare_client.get_realtime_quotes()
-            
-            # 过滤目标股票
             result = {}
             for symbol in symbols:
-                row = df[df["代码"] == symbol]
-                if not row.empty:
-                    quote = row.iloc[0]
-                    result[symbol] = {
-                        "symbol": symbol,
-                        "name": quote.get("名称", ""),
-                        "price": float(quote.get("最新价", 0)),
-                        "change_pct": float(quote.get("涨跌幅", 0)),
-                        "change_amount": float(quote.get("涨跌额", 0)),
-                        "volume": float(quote.get("成交量", 0)),
-                        "amount": float(quote.get("成交额", 0)),
-                        "turnover_rate": float(quote.get("换手率", 0)),
-                        "high": float(quote.get("最高", 0)),
-                        "low": float(quote.get("最低", 0)),
-                        "open": float(quote.get("今开", 0)),
-                        "prev_close": float(quote.get("昨收", 0)),
-                        "timestamp": datetime.now(),
-                    }
+                # Fallback to individual quote fetching to avoid full-market polling bans
+                quote = self.get_realtime_quote(symbol, use_cache=True)
+                if quote:
+                    result[symbol] = quote
             
             return result
         

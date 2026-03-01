@@ -19,185 +19,9 @@ from modules.ingestion.caixin_client import caixin_client
 class Tools:
     @staticmethod
     def web_search(query: str) -> str:
-        """联网搜索，用于获取未知概念或最新信息 (Akshare News + Caixin + Bocha AI)"""
-        logger.info(f"Tool: Searching web for '{query}'")
-        
-        results = []
-        
-        # 0. Try Caixin Search (High Quality, Low Latency)
-        # Use simple heuristic to use Caixin: if it's macro or A-share related, or generic query
-        # But Caixin is good for general financial news.
-        try:
-            # Check if we should use Caixin (maybe limit to Chinese queries or specific keywords?)
-            # For now, let's try it for all queries as a high-quality source.
-            # We need to set a date range to get recent news, e.g., last 30 days.
-            import datetime
-            end_date = datetime.datetime.now().strftime("%Y-%m-%d")
-            start_date = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
-            
-            caixin_res = caixin_client.search(query, start_date=start_date, end_date=end_date)
-            if caixin_res and len(caixin_res) > 50 and "Error" not in caixin_res:
-                 results.append("【财新智能搜索】:\n" + caixin_res[:2000]) # Limit length
-        except Exception as e:
-            logger.warning(f"Caixin search failed: {e}")
-
-        # Split query into keywords for better matching
-        # e.g. "GOOG stock news" -> ["GOOG", "stock", "news"]
-        keywords = query.split()
-        
-        # 1. Primary Source: Akshare Global News (Real-time, Reliable)
-        try:
-            import akshare as ak
-            
-            # Use global news telegraph
-            # This is very fast and contains latest macro/tech news
-            # Use the new safe wrapper in akshare_client
-            df = akshare_client.get_stock_info_global_cls()
-            if not df.empty:
-                matches = []
-                for _, row in df.iterrows():
-                    title = str(row.get('title', ''))
-                    content = str(row.get('content', ''))
-                    text = f"{title} {content}"
-                    
-                    # Improved Matching Logic:
-                    # 1. Direct case-insensitive match of full query
-                    if query.lower() in text.lower():
-                        matches.append(f"{row['publish_time']} {title}: {content[:100]}...")
-                        continue
-                        
-                    # 2. Match ANY major keyword (if query is long)
-                    # Exclude common stop words for matching
-                    stop_words = {'news', 'stock', 'price', 'share', 'market', 'today', 'latest', 'breaking', '原因', '股价', '异动', '最新', '消息'}
-                    significant_keywords = [k for k in keywords if k.lower() not in stop_words and len(k) > 2]
-                    
-                    if significant_keywords:
-                        # If ANY significant keyword is found (e.g. "GOOG" or "Gemini")
-                        for k in significant_keywords:
-                            if k.lower() in text.lower():
-                                matches.append(f"{row['publish_time']} {title}: {content[:100]}...")
-                                break
-
-                if matches:
-                    # Dedup matches
-                    matches = list(dict.fromkeys(matches))
-                    results.append("【财联社全球电报】:\n" + "\n".join(matches[:5]))
-
-            # Also try stock_news_em if query contains a stock symbol-like pattern
-            # Only if it looks like a symbol e.g. "GOOG" or "00700"
-            # Extract potential symbol
-            potential_symbol = None
-            for k in keywords:
-                if k.isalnum() and (k.isupper() or k.isdigit()):
-                    potential_symbol = k
-                    break
-            
-            if potential_symbol:
-                try:
-                    # Try Eastmoney stock news
-                    df_stock = ak.stock_news_em(symbol=potential_symbol)
-                    if not df_stock.empty:
-                        stock_matches = []
-                        for _, row in df_stock.head(5).iterrows():
-                            title = row.get('新闻标题', '')
-                            date = row.get('发布时间', '')
-                            stock_matches.append(f"{date} {title}")
-                        if stock_matches:
-                             results.append(f"【个股资讯 ({potential_symbol})】:\n" + "\n".join(stock_matches))
-                except:
-                    pass
-                    
-        except Exception as e:
-            logger.warning(f"Akshare news search failed: {e}")
-
-        # 2. Secondary Source: Bocha AI (Official API)
-        # Always run if results are few, or if Akshare failed
-        if len(results) == 0:
-            try:
-                import requests
-                import datetime
-                logger.info(f"Fallback to Bocha AI Search for '{query}'")
-                
-                url = "https://api.bochaai.com/v1/web-search"
-                headers = {
-                    "Authorization": "Bearer sk-996761b2cea840f7a68cf72840f1642c",
-                    "Content-Type": "application/json"
-                }
-                
-                # Use 'freshness' parameter for better results
-                # Values: noLimit, oneDay, oneWeek, oneMonth, oneYear
-                # For monitoring, we prefer 'oneWeek' or 'oneDay'
-                # But for general queries, maybe 'oneMonth' or 'noLimit'
-                # Let's try 'oneMonth' to balance freshness and coverage.
-                # If the query explicitly asks for 'latest', use 'oneWeek'
-                
-                freshness = "oneMonth" 
-                if "latest" in query.lower() or "最新" in query:
-                    freshness = "oneWeek"
-                if "today" in query.lower() or "今日" in query:
-                    freshness = "oneDay"
-
-                payload = {
-                    "query": query,
-                    "count": 5,
-                    "freshness": freshness
-                }
-                
-                resp = requests.post(url, headers=headers, json=payload, timeout=10)
-                
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if data.get('code') == 200 and data.get('data'):
-                        web_pages = data['data'].get('webPages', {}).get('value', [])
-                        bocha_res = ""
-                        for i, item in enumerate(web_pages, 1):
-                            # Clean up snippet
-                            snippet = item.get('snippet', '') or item.get('summary', '')
-                            snippet = snippet.replace('\n', ' ').strip()
-                            date_pub = item.get('datePublished', '')[:10] # Get YYYY-MM-DD
-                            bocha_res += f"{i}. [{date_pub}] {item.get('name')}: {snippet[:200]}...\n"
-                        if bocha_res:
-                            results.append(f"【全网搜索结果 ({freshness})】:\n" + bocha_res)
-                else:
-                    logger.warning(f"Bocha API error: {resp.status_code} - {resp.text}")
-                    
-            except Exception as e:
-                logger.warning(f"Bocha AI search failed: {e}")
-
-        # 2.5 Secondary Source: Google News RSS (Very robust for global markets)
-        try:
-            import urllib.request
-            import xml.etree.ElementTree as ET
-            import urllib.parse
-            
-            logger.info(f"Trying Google News RSS for '{query}'")
-            # If query contains English (like US stocks), use English EN, otherwise CN
-            if re.search(r'[a-zA-Z]{3,}', query) and not re.search(r'[\u4e00-\u9fa5]', query):
-                query_encoded = urllib.parse.quote(f"{query} when:7d")
-                url = f"https://news.google.com/rss/search?q={query_encoded}&hl=en-US&gl=US&ceid=US:en"
-            else:
-                query_encoded = urllib.parse.quote(f"{query} when:7d")
-                url = f"https://news.google.com/rss/search?q={query_encoded}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
-                
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            r = urllib.request.urlopen(req, timeout=10)
-            root = ET.fromstring(r.read())
-            
-            rss_matches = []
-            for item in root.findall('.//item')[:5]:
-                title = item.find('title').text
-                pubDate = item.find('pubDate').text
-                rss_matches.append(f"[{pubDate}] {title}")
-                
-            if rss_matches:
-                results.append("【Google News 聚合】:\n" + "\n".join(rss_matches))
-        except Exception as e:
-            logger.warning(f"Google News RSS search failed: {e}")
-
-        if results:
-            return "\n".join(results)
-            
-        return "搜索服务暂时不可用（Akshare/Bocha均无响应），请尝试简化关键词。"
+        """联网搜索，整合多数据源 (SearXNG, Tavily, Bocha, Caixin等)"""
+        from modules.ingestion.data_factory import data_manager
+        return data_manager.search(query)
 
     @staticmethod
     def database_search(query: str) -> str:
@@ -218,21 +42,18 @@ class Tools:
 
     @staticmethod
     def get_quote(symbol: str) -> str:
-        """获取实时行情 (A股/港股/美股)"""
-        # Try to guess market
+        """获取实时行情 (A股/港股/美股) - 聚合多数据源"""
         market = "CN"
         if len(symbol) == 5: market = "HK"
         elif symbol.isalpha(): market = "US"
         
-        # Use Akshare Eastmoney Interface directly for speed
-        try:
-            data = akshare_client.get_realtime_quote_eastmoney(symbol, market)
-            if data:
-                return f"【实时行情 {symbol}】\n现价: {data.get('price')}\n涨跌: {data.get('change', 'N/A')}\n时间: {data.get('timestamp')}"
-            else:
-                return f"未查询到 {symbol} 的实时行情。"
-        except Exception as e:
-            return f"查询失败: {e}"
+        from modules.ingestion.data_factory import data_manager
+        
+        res = data_manager.get_quote(symbol, market)
+        if res:
+            return f"【实时行情 {symbol} (Via {res.get('provider')})】\n现价: {res.get('price')}\n涨跌: {res.get('change', 'N/A')}\n幅度: {res.get('pct_chg', 'N/A')}%\n时间: {res.get('timestamp')}"
+            
+        return f"所有数据源均未能获取到 {symbol} 的实时行情。"
 
 # ============================================================
 # ReAct Agent (Manual Loop)

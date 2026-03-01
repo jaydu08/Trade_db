@@ -29,6 +29,9 @@ class MonitorService:
     Anomaly Monitor Service (Refactored)
     """
     
+    # 异动判定阈值 (%)
+    THRESHOLD_PCT = 3.0
+    
     @staticmethod
     def scan_and_alert():
         """

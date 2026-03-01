@@ -142,7 +142,7 @@ class ChainMiningStrategy:
         top_k: int = 5,
     ) -> List[StockMatch]:
         """
-        步骤2: 向量检索映射到股票
+        步骤2: 向量检索映射 + 全网新闻校验 (双轨制)
         
         Args:
             chain: 产业链拆解结果
@@ -151,14 +151,17 @@ class ChainMiningStrategy:
         Returns:
             股票匹配列表
         """
-        logger.info("Mapping chain nodes to stocks...")
+        logger.info("Mapping chain nodes to stocks via Local DB and Live Web Search...")
+        from modules.ingestion.data_factory import data_manager
+        from core.llm import simple_prompt
+        import re
         
         matches: List[StockMatch] = []
         seen_symbols = set()
         
         for node in chain.nodes:
+            # --- Path A: Local ChromaDB Vector Search ---
             for keyword in node.keywords:
-                # 向量检索
                 search_results = profile_syncer.search_companies(
                     query=keyword,
                     n_results=top_k,
@@ -173,24 +176,55 @@ class ChainMiningStrategy:
                     if not symbol or symbol in seen_symbols:
                         continue
                     
-                    # 计算匹配度（距离越小越好）
                     match_score = max(0, 1 - distance)
                     
                     matches.append(StockMatch(
                         symbol=symbol,
                         name=name,
                         match_score=match_score,
-                        match_reason=f"匹配关键词: {keyword}",
+                        match_reason=f"[本地知识库] 匹配关键词: {keyword}",
                         node_position=node.position,
                     ))
-                    
                     seen_symbols.add(symbol)
+            
+            # --- Path B: Live Web Search targeted discovery ---
+            # Construct query to find leading companies for this node's keywords
+            kw_str = " ".join(node.keywords)
+            live_query = f"{chain.industry} {node.position} {kw_str} 龙头企业 核心股票名单"
+            live_news = data_manager.search(live_query, limit_per_source=3)
+            
+            # Use LLM to extract stock symbols from the live news
+            extraction_prompt = f"""
+            以下是关于 "{chain.industry}" 产业链 {node.position} 环节 ({kw_str}) 的最新全网新闻搜索结果。
+            请从中提取出被明确提及为受益股、龙头股的上市公司股票代码（只返回代码列表，逗号分隔，不要前缀和多余文字，例如: 600519.SH, AAPL, 00700.HK）。
+            如果新闻中没有明确指出股票代码，但提到了公司名称，请尽你所能推断其合法股票代码。如果完全没有，返回 'NONE'。
+            
+            新闻内容:
+            {live_news}
+            """
+            
+            extracted_symbols_raw = simple_prompt(prompt=extraction_prompt, temperature=0.1)
+            
+            if extracted_symbols_raw and "NONE" not in extracted_symbols_raw.upper():
+                # Naive regex to clean up potential formatting and extract potential symbols
+                found_symbols = re.findall(r'[A-Za-z0-9]+\.[A-Za-z]+|[A-Za-z]+|\d{5,6}', extracted_symbols_raw)
+                for sym in found_symbols:
+                    sym = sym.strip()
+                    if sym and sym not in seen_symbols and len(sym) >= 2:
+                        # Append live matched stock. Note: "name" is generic here since we only have the symbol.
+                        matches.append(StockMatch(
+                            symbol=sym,
+                            name="Live Search Match", 
+                            match_score=0.85, # Assign high confidence for live market consensus
+                            match_reason=f"[实时全网搜索] 由于 {kw_str} 被媒体集中报道为龙头/受益标的。",
+                            node_position=node.position
+                        ))
+                        seen_symbols.add(sym)
         
-        # 按匹配度排序
         matches.sort(key=lambda x: x.match_score, reverse=True)
-        
-        logger.info(f"Mapped to {len(matches)} stocks")
+        logger.info(f"Mapped to {len(matches)} stocks (Local + Live)")
         return matches
+
 
     def cross_validate_with_meta(
         self,

@@ -65,16 +65,35 @@ class TaskScheduler:
             MonitorService.scan_and_alert,
             IntervalTrigger(minutes=1),
             id="monitor_scan",
-            name="异动监控",
+            name="股票异动监控",
             replace_existing=True
         )
         
-        # 4. CN/HK 热度榜单 (每天 18:00 A股、港股收盘后)
+        # 3.5 大宗商品监控 (每 5 分钟)
+        from modules.monitor.commodity_scanner import CommodityScanner
         self.scheduler.add_job(
-            self._job_cn_hk_heatmap,
-            CronTrigger(hour=18, minute=0),
-            id="cn_hk_heatmap",
-            name="A股/港股热门榜单",
+            CommodityScanner.scan_and_alert,
+            IntervalTrigger(minutes=5),
+            id="commodity_scan",
+            name="大宗商品异动监控",
+            replace_existing=True
+        )
+        
+        # 4. CN 热度榜单 (每天 15:30 A股收盘后半小时)
+        self.scheduler.add_job(
+            self._job_cn_heatmap,
+            CronTrigger(hour=15, minute=30),
+            id="cn_heatmap",
+            name="A股热门榜单",
+            replace_existing=True
+        )
+
+        # 4.1 HK 热度榜单 (每天 16:30 港股收盘后半小时)
+        self.scheduler.add_job(
+            self._job_hk_heatmap,
+            CronTrigger(hour=16, minute=30),
+            id="hk_heatmap",
+            name="港股热门榜单",
             replace_existing=True
         )
 
@@ -114,14 +133,21 @@ class TaskScheduler:
         except Exception as e:
             logger.error(f"Job failed (Sync Reports): {e}")
 
-    def _job_cn_hk_heatmap(self):
-        """Job: 生成A股和港股热门榜单"""
-        logger.info("Job started: CN/HK Heat Map")
+    def _job_cn_heatmap(self):
+        """Job: 生成A股热门榜单"""
+        logger.info("Job started: CN Heat Map")
         try:
             heatmap_service.process_and_notify("CN")
+        except Exception as e:
+            logger.error(f"Job failed (CN Heat Map): {e}")
+
+    def _job_hk_heatmap(self):
+        """Job: 生成港股热门榜单"""
+        logger.info("Job started: HK Heat Map")
+        try:
             heatmap_service.process_and_notify("HK")
         except Exception as e:
-            logger.error(f"Job failed (CN/HK Heat Map): {e}")
+            logger.error(f"Job failed (HK Heat Map): {e}")
 
     def _job_us_heatmap(self):
         """Job: 生成美股热门榜单"""
