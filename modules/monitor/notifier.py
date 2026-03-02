@@ -1,4 +1,5 @@
 import logging
+import time
 import requests
 import os
 import threading
@@ -14,9 +15,10 @@ class Notifier:
     """
     
     @staticmethod
-    def send_telegram(chat_id: int, message: str):
+    def send_telegram(chat_id: int, message: str, max_retries: int = 3):
         """
         Send a message to a specific chat_id using synchronous requests.
+        Retries up to max_retries times with exponential backoff on failure.
         """
         if not chat_id:
             logger.warning("No chat_id provided for notification.")
@@ -34,16 +36,27 @@ class Notifier:
             "parse_mode": "Markdown"
         }
         
-        try:
-            # Use requests with timeout
-            resp = requests.post(url, json=payload, timeout=10)
-            if resp.status_code != 200:
-                logger.error(f"Telegram API Error: {resp.status_code} - {resp.text}")
-            else:
-                # logger.info(f"Notification sent to {chat_id}")
-                pass
-        except Exception as e:
-            logger.error(f"Failed to send telegram message: {e}")
+        for attempt in range(max_retries):
+            try:
+                resp = requests.post(url, json=payload, timeout=10)
+                if resp.status_code == 200:
+                    logger.info(f"Notification sent to {chat_id} (attempt {attempt + 1})")
+                    return
+                else:
+                    logger.warning(
+                        f"Telegram API Error (attempt {attempt + 1}/{max_retries}): "
+                        f"{resp.status_code} - {resp.text}"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to send telegram message (attempt {attempt + 1}/{max_retries}): {e}")
+            
+            # Exponential backoff: 2s, 4s, 8s
+            if attempt < max_retries - 1:
+                wait = 2 ** (attempt + 1)
+                logger.info(f"Retrying in {wait}s...")
+                time.sleep(wait)
+        
+        logger.error(f"Failed to send telegram message to {chat_id} after {max_retries} attempts.")
 
     @staticmethod
     def broadcast(message: str):

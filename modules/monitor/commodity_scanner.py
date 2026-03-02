@@ -142,7 +142,7 @@ class CommodityScanner:
             f"**现价**: {price}\n"
             f"⏳ 正在启动全网归因与双轨产业链寻找映射标的..."
         )
-        Notifier.send_telegram(None, alert_msg)
+        Notifier.broadcast(alert_msg)
         
         # Phase 2: Async Deep Analysis
         from modules.monitor.scanner import analysis_executor
@@ -226,8 +226,8 @@ class CommodityScanner:
                 f"🎬 **主理人建议**: {trading_idea.action}"
             )
             
-            Notifier.send_telegram(None, report)
+            Notifier.broadcast(report)
             
         except Exception as e:
             logger.error(f"Commodity deep mapping failed for {name}: {e}")
-            Notifier.send_telegram(None, f"❌ {name} 大宗商品深度归因失败: {e}")
+            Notifier.broadcast(f"❌ {name} 大宗商品深度归因失败: {e}")

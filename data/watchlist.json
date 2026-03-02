@@ -4,8 +4,8 @@
     "market": "US",
     "name": "GOOG",
     "added_at": "2026-02-21 00:29:25.455153",
-    "last_alert_at": "2026-02-28 00:54:28.301711",
-    "alert_threshold_pct": 0.1,
+    "last_alert_at": "2026-03-03 00:00:57.125931",
+    "alert_threshold_pct": 3,
     "is_active": true,
     "chat_id": 5573627236
   },
@@ -14,8 +14,8 @@
     "market": "US",
     "name": "CRCL",
     "added_at": "2026-02-21 00:29:04.923017",
-    "last_alert_at": "2026-02-28 00:54:29.462719",
-    "alert_threshold_pct": 0.1,
+    "last_alert_at": "2026-03-03 00:00:58.183546",
+    "alert_threshold_pct": 3,
     "is_active": true,
     "chat_id": 5573627236
   },
@@ -24,8 +24,8 @@
     "market": "US",
     "name": "NVDA",
     "added_at": "2026-02-26 10:22:30.921820",
-    "last_alert_at": "2026-02-28 00:54:30.234785",
-    "alert_threshold_pct": 0.1,
+    "last_alert_at": "2026-03-03 00:00:58.919277",
+    "alert_threshold_pct": 3,
     "is_active": true,
     "chat_id": 6728885887
   },
@@ -34,8 +34,8 @@
     "market": "HK",
     "name": "智谱",
     "added_at": "2026-02-26 10:23:09.293113",
-    "last_alert_at": "2026-02-28 00:54:30.967591",
-    "alert_threshold_pct": 0.1,
+    "last_alert_at": "2026-03-02 09:42:56.920844",
+    "alert_threshold_pct": 3,
     "is_active": true,
     "chat_id": 6728885887
   },
@@ -44,8 +44,8 @@
     "market": "CN",
     "name": "招商银行",
     "added_at": "2026-02-26 10:24:03.956771",
-    "last_alert_at": "2026-02-28 00:54:31.697917",
-    "alert_threshold_pct": 0.1,
+    "last_alert_at": "2026-03-02 09:30:57.026507",
+    "alert_threshold_pct": 3,
     "is_active": true,
     "chat_id": 6728885887
   },
@@ -54,8 +54,8 @@
     "market": "CN",
     "name": "华胜天成",
     "added_at": "2026-02-27 10:22:56.129617",
-    "last_alert_at": "2026-02-28 00:54:32.486966",
-    "alert_threshold_pct": 0.1,
+    "last_alert_at": "2026-03-02 09:30:57.750219",
+    "alert_threshold_pct": 3,
     "is_active": true,
     "chat_id": 6728885887
   },
@@ -64,8 +64,8 @@
     "market": "US",
     "name": "NFLX",
     "added_at": "2026-02-27 22:40:52.280611",
-    "last_alert_at": "2026-02-28 00:54:33.267227",
-    "alert_threshold_pct": 0.1,
+    "last_alert_at": "2026-03-03 00:00:59.647244",
+    "alert_threshold_pct": 3,
     "is_active": true,
     "chat_id": 6728885887
   }

@@ -133,7 +133,9 @@ class MarketHeatMap:
         df = pd.DataFrame()
         try:
             if market == 'CN':
-                df = akshare_client.get_realtime_quotes()
+                # 直接使用东方财富A股实时行情接口（原 get_realtime_quotes 已废弃，始终返回空）
+                import akshare as ak
+                df = ak.stock_zh_a_spot_em()
             elif market == 'HK':
                 df = akshare_client.get_stock_info_hk()
             elif market == 'US':

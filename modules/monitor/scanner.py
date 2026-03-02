@@ -152,29 +152,11 @@ class MonitorService:
     @staticmethod
     def trigger_alert(item: dict, quote: dict):
         """
-        Two-phase alert system:
-        1. Immediate price alert.
-        2. Async deep analysis.
+        Single-message alert: wait for LLM analysis in thread pool, then send one
+        complete consolidated message with price info + attribution.
         """
-        symbol = item['symbol']
-        name = item['name']
-        pct = quote['pct_chg']
-        price = quote['price']
-        chat_id = item.get('chat_id')
-        
-        direction = "📈 暴涨" if pct > 0 else "📉 暴跌"
-        
-        # Phase 1: Immediate Notification
-        short_msg = (
-            f"🚨 **{direction}预警**\n"
-            f"**标的**: {name} ({symbol})\n"
-            f"**幅度**: {pct}%\n"
-            f"**现价**: {price}\n"
-            f"⏳ 正在进行智能归因分析..."
-        )
-        Notifier.send_telegram(chat_id, short_msg)
-        
-        # Phase 2: Async Analysis
+        direction = "📈 暴涨" if quote['pct_chg'] > 0 else "📉 暴跌"
+        # Submit to thread pool and send consolidated message when ready
         analysis_executor.submit(MonitorService._analyze_and_report, item, quote, direction)
 
     @staticmethod
@@ -186,6 +168,8 @@ class MonitorService:
         name = item['name']
         chat_id = item.get('chat_id')
         market = item['market']
+        pct = quote['pct_chg']
+        price = quote['price']
         
         try:
             # 1. Gather Info (Multi-source parallel search)
@@ -257,21 +241,28 @@ class MonitorService:
                     response_model=AnalysisResult
                 )
                 
+                # 组装完整单条消息（价格信息 + 归因）
                 analysis_text = (
-                    f"🎯 **极简复盘**: {name} ({symbol})\n\n"
-                    f"⚡ **异动核心**: {result.reason}\n"
+                    f"🚨 **{direction}预警** | {name} ({symbol})\n"
+                    f"💰 **现价**: {price}  **幅度**: {pct}%\n"
+                    f"─────────────────\n"
+                    f"⚡ **核心归因**: {result.reason}\n"
                     f"📈 **置信度**: {result.confidence}\n"
-                    f"📝 **快照**: {result.summary}\n\n"
-                    f"🔗 **溯源**: {', '.join(result.sources[:2])}"
+                    f"📝 **摘要**: {result.summary}"
                 )
                 
             except Exception as llm_e:
                 logger.error(f"LLM Structured output failed: {llm_e}")
                 fallback_prompt = f"{user_prompt}\n直接给出1句话原因，不要任何其他字。"
-                analysis_text = simple_prompt(fallback_prompt)
-                analysis_text = f"🎯 **直接归因**: {analysis_text}"
+                reason_text = simple_prompt(fallback_prompt)
+                analysis_text = (
+                    f"🚨 **{direction}预警** | {name} ({symbol})\n"
+                    f"💰 **现价**: {price}  **幅度**: {pct}%\n"
+                    f"─────────────────\n"
+                    f"⚡ **核心归因**: {reason_text.strip()}"
+                )
 
-            # 3. Send Report
+            # 3. Send single consolidated report
             Notifier.send_telegram(chat_id, analysis_text)
             
             # 4. Store Event in Vector DB
@@ -284,14 +275,18 @@ class MonitorService:
                 # Determine impact based on direction
                 impact = "positive" if "涨" in direction else "negative"
                 
-                # Try to map confidence to a float score
+                # Confidence score: only available when structured LLM succeeded
                 score = 0.5
-                if "High" in result.confidence or "高" in result.confidence:
-                    score = 0.9
-                elif "Medium" in result.confidence or "中" in result.confidence:
-                    score = 0.6
-                elif "Low" in result.confidence or "低" in result.confidence:
-                    score = 0.3
+                try:
+                    conf = result.confidence
+                    if "High" in conf or "高" in conf:
+                        score = 0.9
+                    elif "Medium" in conf or "中" in conf:
+                        score = 0.6
+                    elif "Low" in conf or "低" in conf:
+                        score = 0.3
+                except Exception:
+                    pass
                     
                 meta = {
                     "event_type": "market",
@@ -299,13 +294,13 @@ class MonitorService:
                     "impact": impact,
                     "impact_score": score,
                     "source": "monitor_scan",
-                    "related_symbols": symbol, # Chroma meta doesn't support list directly, use comma separated string if multiple, here just one
+                    "related_symbols": symbol,
                     "doc_version": 1,
                     "created_at": str(datetime.datetime.utcnow())
                 }
                 
-                # Create a comprehensive document text
-                doc_text = f"【异动归因】{name}({symbol}) {direction} {quote['pct_chg']}%。\n原因: {result.reason}\n摘要: {result.summary}"
+                # Use full analysis_text as the vector document
+                doc_text = f"【异动归因】{name}({symbol}) {direction} {pct}%。\n{analysis_text}"
                 
                 collection.add(
                     ids=[doc_id],
