@@ -71,16 +71,14 @@ class MonitorService:
             if not quote:
                 continue
                 
-            pct_chg = quote.get('pct_chg')
-            price = quote.get('price')
-            
-            if pct_chg is None:
+            # 仅推送正向涨幅（只监控上涨异动）
+            if pct_chg is None or pct_chg <= 0:
                 continue
                 
             # Check Threshold
             threshold = item.get('alert_threshold_pct', 5.0)
             
-            if abs(pct_chg) >= threshold:
+            if pct_chg >= threshold:
                 # Check Cooldown
                 today = str(datetime.date.today())
                 last_alert_str = item.get('last_alert_at')
@@ -138,10 +136,10 @@ class MonitorService:
                 symbol=item['symbol'],
                 name=item['name'],
                 market=item['market'],
-                alert_reason=f"涨跌幅异常: {quote['pct_chg']}% 达到阈值 {item.get('alert_threshold_pct', 5.0)}%",
+                alert_reason=f"异动预警: 涨幅 {quote['pct_chg']}%，触发阈值 {item.get('alert_threshold_pct', 5.0)}%",
                 price=quote['price'],
                 change_pct=quote['pct_chg'],
-                status="TRIGGERED"
+                status="已触发"
             )
             with db_manager.ledger_session() as session:
                 session.add(alert)

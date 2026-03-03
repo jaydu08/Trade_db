@@ -34,7 +34,7 @@
     "market": "HK",
     "name": "智谱",
     "added_at": "2026-02-26 10:23:09.293113",
-    "last_alert_at": "2026-03-02 09:42:56.920844",
+    "last_alert_at": "2026-03-03 09:41:49.987544",
     "alert_threshold_pct": 3,
     "is_active": true,
     "chat_id": 6728885887
@@ -54,7 +54,7 @@
     "market": "CN",
     "name": "华胜天成",
     "added_at": "2026-02-27 10:22:56.129617",
-    "last_alert_at": "2026-03-02 09:30:57.750219",
+    "last_alert_at": "2026-03-03 09:31:49.982948",
     "alert_threshold_pct": 3,
     "is_active": true,
     "chat_id": 6728885887

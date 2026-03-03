@@ -1,9 +1,11 @@
 """
 Commodity Scanner
 负责监控大宗商品异动，映射关联股票，并生成交易思路。
+所有推送内容均为中文，仅推送正向涨幅，每个品种24小时内只推送一次。
 """
 import logging
 import datetime
+import threading
 import concurrent.futures
 from typing import List, Dict, Any
 from pydantic import BaseModel, Field
@@ -18,25 +20,31 @@ logger = logging.getLogger(__name__)
 
 # LLM 解析结构模型
 class CommodityAttribution(BaseModel):
-    catalyst: str = Field(description="The core reason for the commodity price surge (e.g., Supply chain disruption, Macro policy). Max 2 sentences.")
-    confidence: str = Field(description="Confidence level: High, Medium, Low.")
+    catalyst: str = Field(description="商品价格异动的核心催化剂（中文，最多2句话）。")
+    confidence: str = Field(description="置信度：高、中、低。")
 
 class TradingIdea(BaseModel):
-    logic: str = Field(description="The trading logic connecting the commodity surge to equities. Max 3 sentences.")
-    target_tickers: List[str] = Field(description="List of specific stock symbols/tickers (A-share, HK, US) most likely to benefit/suffer.")
-    action: str = Field(description="Specific actionable idea (e.g., Go long upstream miners, short downstream manufacturers).")
+    logic: str = Field(description="将商品涨价与权益市场联动的交易逻辑（中文，最多3句话）。")
+    target_tickers: List[str] = Field(description="最可能受益的具体股票代码列表（A股/港股/美股）。")
+    action: str = Field(description="具体可操作的交易思路（中文）。")
 
 class CommodityScanner:
     """
     大宗商品异动监控器
     """
-    # 缓存动态获取的主力合约池
+    # 类级别 24h 去重字典：{symbol: last_alert_datetime}
+    _alert_history: Dict[str, datetime.datetime] = {}
+    _alert_history_lock = threading.Lock()
+    
+    # 主力合约池缓存（按天刷新）
     _cached_pool: Dict[str, str] = {}
     _pool_last_update: datetime.date = None
     
-    # 触发阈值 (%)
+    # 触发阈值（仅正向涨幅）
     THRESHOLD_PCT = 2.0
-    
+    # 24小时冷却时间
+    COOLDOWN_HOURS = 24
+
     @classmethod
     def _get_active_commodities(cls) -> Dict[str, str]:
         """动态获取当前全市场主力合约列表，按天缓存"""
@@ -45,39 +53,52 @@ class CommodityScanner:
             return cls._cached_pool
             
         try:
-            # 获取新浪全市场主力连续合约
             df_main = ak.futures_display_main_sina()
             if not df_main.empty:
                 pool = {}
                 for _, row in df_main.iterrows():
                     sym = str(row['symbol'])
-                    name = str(row['name']).replace('连续', '') # 清洗后缀
-                    # 过滤掉一些非主流或不活跃的品种，为了演示我们尽量保留大部分有交易量的
+                    name = str(row['name']).replace('连续', '')
                     if len(sym) >= 2:
                         pool[sym] = name
                 
                 cls._cached_pool = pool
                 cls._pool_last_update = today
-                logger.info(f"Dynamically loaded {len(pool)} active main commodity contracts.")
+                logger.info(f"已加载 {len(pool)} 个大宗商品主力合约。")
                 return pool
         except Exception as e:
-            logger.error(f"Failed to fetch active commodities dynamically: {e}")
+            logger.error(f"获取主力合约列表失败: {e}")
             
-        return cls._cached_pool # default to whatever is cached if failed
-    
+        return cls._cached_pool
+
+    @classmethod
+    def _is_cooldown_active(cls, symbol: str) -> bool:
+        """检查该品种是否在24小时冷却期内"""
+        with cls._alert_history_lock:
+            last = cls._alert_history.get(symbol)
+            if last is None:
+                return False
+            elapsed = (datetime.datetime.now() - last).total_seconds() / 3600
+            return elapsed < cls.COOLDOWN_HOURS
+
+    @classmethod
+    def _mark_alerted(cls, symbol: str):
+        """记录该品种的最近推送时间"""
+        with cls._alert_history_lock:
+            cls._alert_history[symbol] = datetime.datetime.now()
+
     @staticmethod
     def scan_and_alert():
-        logger.info("Starting Commodity Anomaly Scan...")
+        logger.info("开始大宗商品异动扫描...")
         
         try:
             pool = CommodityScanner._get_active_commodities()
             if not pool:
-                logger.warning("No commodities to scan (pool is empty).")
+                logger.warning("商品合约池为空，跳过扫描。")
                 return
             
-            logger.info(f"Scanning {len(pool)} commodity contracts...")
+            logger.info(f"扫描 {len(pool)} 个大宗商品合约...")
             
-            # 逐个查询（新浪接口批量参数不稳定，逐个更可靠）
             import pandas as pd
             all_dfs = []
             
@@ -87,15 +108,14 @@ class CommodityScanner:
                     if not df.empty:
                         all_dfs.append(df)
                 except Exception:
-                    # 某些合约（如股指期货）新浪不支持，静默跳过
                     pass
             
             if not all_dfs:
-                logger.warning("Commodity scan returned empty data across all symbols.")
+                logger.warning("所有合约行情数据均为空。")
                 return
                 
             df_all = pd.concat(all_dfs, ignore_index=True)
-            logger.info(f"Fetched {len(df_all)} commodity rows total.")
+            logger.info(f"已获取 {len(df_all)} 条大宗商品行情。")
             
             triggered = 0
             for _, row in df_all.iterrows():
@@ -115,7 +135,7 @@ class CommodityScanner:
                 if price <= 0:
                     continue
                 
-                # 计算涨跌幅：用昨结算价作为基准（最准确）
+                # 计算涨跌幅（基于昨结算价）
                 pct_chg = 0.0
                 ref_price = 0.0
                 for ref_col in ['last_settle_price', 'last_close', 'settle', 'pre_settle']:
@@ -129,7 +149,6 @@ class CommodityScanner:
                 if ref_price > 0:
                     pct_chg = round((price - ref_price) / ref_price * 100, 2)
                 else:
-                    # 如果接口直接给了涨跌幅字段就优先使用
                     for pct_col in ['change_percent', 'pct_chg', '涨跌幅', 'change_pct']:
                         if pct_col in row and row[pct_col] not in (None, ''):
                             try:
@@ -137,51 +156,49 @@ class CommodityScanner:
                                 break
                             except (ValueError, TypeError):
                                 pass
-                    
-                if abs(pct_chg) >= CommodityScanner.THRESHOLD_PCT:
-                    direction = "暴涨" if pct_chg > 0 else "暴跌"
-                    logger.info(f"Commodity Alert Triggered: {name} ({symbol}) {direction} {pct_chg}% (price={price}, ref={ref_price})")
-                    triggered += 1
-                    CommodityScanner._process_anomaly(name, symbol, pct_chg, direction, price)
+                
+                # 仅推送正向涨幅
+                if pct_chg < CommodityScanner.THRESHOLD_PCT:
+                    continue
+                
+                # 24小时去重
+                if CommodityScanner._is_cooldown_active(symbol):
+                    logger.debug(f"{name}({symbol}) 处于24h冷却期，跳过推送。")
+                    continue
+                
+                logger.info(f"大宗商品异动触发: {name}({symbol}) 上涨 {pct_chg}% (现价={price}, 参考={ref_price})")
+                triggered += 1
+                CommodityScanner._mark_alerted(symbol)
+                
+                # 异步执行深度归因+产业链分析（合并为单条推送）
+                from modules.monitor.scanner import analysis_executor
+                analysis_executor.submit(
+                    CommodityScanner._analyze_and_push,
+                    name, symbol, pct_chg, price
+                )
             
-            logger.info(f"Commodity scan complete. {triggered} alert(s) triggered.")
+            logger.info(f"大宗商品异动扫描完成，共触发 {triggered} 个异动预警。")
                     
         except Exception as e:
-            logger.error(f"Commodity scan failed: {e}", exc_info=True)
-
+            logger.error(f"大宗商品扫描失败: {e}", exc_info=True)
 
     @staticmethod
-    def _process_anomaly(name: str, symbol: str, pct_chg: float, direction: str, price: float):
+    def _analyze_and_push(name: str, symbol: str, pct_chg: float, price: float):
         """
-        处理单点异动：新闻聚合 -> 双轨映射 -> 交易思路合成
+        完成深度归因+产业链映射，合并为单条中文消息推送。
+        不发第一条预告消息，归因完成后一次性推送完整报告。
         """
-        # Phase 1: Notify initial alert
-        alert_msg = (
-            f"⚠️ **大宗商品异动预警**\n"
-            f"**品种**: {name} ({symbol})\n"
-            f"**幅度**: {direction} {pct_chg}%\n"
-            f"**现价**: {price}\n"
-            f"⏳ 正在启动全网归因与双轨产业链寻找映射标的..."
-        )
-        Notifier.broadcast(alert_msg)
-        
-        # Phase 2: Async Deep Analysis
-        from modules.monitor.scanner import analysis_executor
-        analysis_executor.submit(
-            CommodityScanner._analyze_and_map, 
-            name, pct_chg, direction
-        )
-        
-    @staticmethod
-    def _analyze_and_map(name: str, pct_chg: float, direction: str):
         try:
-            # 1. 资讯聚合 (使用新的 DataManager)
-            query = f"{name} 大宗商品 期货 {direction} 原因 最新分析"
+            # 1. 资讯聚合
+            query = f"{name} 大宗商品 期货 涨价 原因 最新分析"
             news_context = data_manager.search(query)
             
-            # 2. LLM 初步归因
-            sys_prompt_attr = "你是一位大宗商品宏观分析师。根据提供的资讯，判断商品异动的核心催化剂。"
-            user_prompt_attr = f"品种: {name} {direction} {pct_chg}%\n资讯:\n{news_context}"
+            # 2. LLM 归因分析
+            sys_prompt_attr = (
+                "你是一位专业的大宗商品宏观分析师。"
+                "根据提供的资讯，用中文判断商品异动的核心催化剂，输出JSON格式。"
+            )
+            user_prompt_attr = f"品种: {name} 今日上涨 {pct_chg}%\n资讯:\n{news_context}"
             
             attribution: CommodityAttribution = structured_output(
                 messages=[
@@ -191,45 +208,47 @@ class CommodityScanner:
                 response_model=CommodityAttribution
             )
             
-            # 3. Two-Pronged Mapping (双轨映射)
+            # 3. 双轨产业链映射
             
-            # Path A: Local DB Search (Chroma)
+            # 路径A：本地 ChromaDB 静态产业链
             local_mapping_context = ""
             try:
-                # Assuming profile_search or generic DB search exists
                 from core.agent import Tools
                 local_mapping_context = Tools.database_search(name)
             except Exception as e:
-                logger.warning(f"Local ChromaDB mapping failed: {e}")
-                local_mapping_context = "本地知识库检索失败或无关联数据。"
-                
-            # Path B: Live LLM Targeted Web Search
-            # LLM generates a targeted search query for stocks based on the catalyst
+                logger.warning(f"本地产业链检索失败: {e}")
+                local_mapping_context = "本地知识库无关联数据。"
+            
+            # 路径B：LLM生成精准搜索词 + 实时全网搜索
             live_search_query = simple_prompt(
-                prompt=f"大宗商品 {name} 因 '{attribution.catalyst}' 大涨。请生成一个精确的 Google 搜索词，用来寻找 A股、港股或美股中最受益的具体上市公司名单（只需返回搜索词本身，不要加引号或多余文字）：",
+                prompt=(
+                    f"大宗商品 {name} 因 「{attribution.catalyst}」 上涨。"
+                    f"请生成一个精确的中文搜索词，用来在A股、港股、美股中寻找最受益的具体上市公司。"
+                    f"只返回搜索词本身，不要任何解释。"
+                ),
                 temperature=0.3
             ).strip()
             
             live_mapping_context = data_manager.search(live_search_query)
             
-            # 4. Synthesize Trading Idea
+            # 4. 合成交易思路
             sys_prompt_idea = (
-                "你是一个顶尖的量化对冲基金经理，精通大宗周期与权益市场的联动。\n"
-                "综合『本地静态产业链』与『全网实时搜索结果』，给出一套可直接交易的股票标的列表。\n"
-                "必须输出具体的股票Ticker(如 601899.SH，OXY)。如果找不到明确股票，请在逻辑里说明。"
+                "你是顶尖量化基金经理，精通大宗商品与权益市场联动。"
+                "综合静态产业链和实时舆情，给出可直接操作的股票标的。"
+                "必须使用中文，标的代码格式如：600519.SH、00700.HK、AAPL。"
+                "如找不到明确标的，在逻辑中说明原因。"
+                "输出JSON格式。"
             )
-            
             user_prompt_idea = f"""
-            事件: {name} {direction} {pct_chg}%
-            核心原因: {attribution.catalyst}
-            
-            【Path A: 本地静态产业链映射】: 
-            {local_mapping_context}
-            
-            【Path B: 全网最新受益股舆情】 (来自查询 '{live_search_query}'): 
-            {live_mapping_context}
-            """
-            
+事件：{name} 今日上涨 {pct_chg}%
+核心原因：{attribution.catalyst}
+
+【静态产业链映射】：
+{local_mapping_context}
+
+【实时受益股（搜索词：{live_search_query}）】：
+{live_mapping_context}
+"""
             trading_idea: TradingIdea = structured_output(
                 messages=[
                     {"role": "system", "content": sys_prompt_idea},
@@ -238,17 +257,27 @@ class CommodityScanner:
                 response_model=TradingIdea
             )
             
-            # 5. Format and Send Final Report
+            # 5. 组装成单条完整中文消息
+            tickers_str = "、".join(trading_idea.target_tickers) if trading_idea.target_tickers else "暂无明确标的"
             report = (
-                f"⛓️‍💥 **大宗商品映射策略: {name}**\n\n"
-                f"🔥 **催化剂 (置信度:{attribution.confidence})**:\n{attribution.catalyst}\n\n"
-                f"🧠 **交易逻辑**:\n{trading_idea.logic}\n\n"
-                f"🎯 **标的池** (交叉验证): \n`" + "`, `".join(trading_idea.target_tickers) + "`\n\n"
-                f"🎬 **主理人建议**: {trading_idea.action}"
+                f"🔥 **大宗商品异动** | {name}\n"
+                f"💰 现价 {price}  上涨 **{pct_chg}%**\n"
+                f"─────────────────\n"
+                f"⚡ **归因**（置信度：{attribution.confidence}）\n"
+                f"{attribution.catalyst}\n\n"
+                f"🔗 **交易逻辑**\n"
+                f"{trading_idea.logic}\n\n"
+                f"🎯 **受益标的**\n"
+                f"{tickers_str}\n\n"
+                f"📌 **操作建议**：{trading_idea.action}"
             )
             
             Notifier.broadcast(report)
+            logger.info(f"{name} 大宗商品分析推送完成。")
             
         except Exception as e:
-            logger.error(f"Commodity deep mapping failed for {name}: {e}")
-            Notifier.broadcast(f"❌ {name} 大宗商品深度归因失败: {e}")
+            logger.error(f"{name} 大宗商品深度归因失败: {e}")
+            Notifier.broadcast(
+                f"⚠️ **大宗商品异动** | {name} 上涨 {pct_chg}%（现价 {price}）\n"
+                f"❌ 深度分析失败，请手动关注。"
+            )

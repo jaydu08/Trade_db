@@ -60,6 +60,9 @@ class DailyRankService:
                         
                     ranks = []
                     for _, row in df.iterrows():
+                        # 仅保留正涨幅数据
+                        if float(row["change_pct"]) <= 0:
+                            continue
                         r = DailyRank(
                             date=today,
                             market=market,
@@ -74,29 +77,30 @@ class DailyRankService:
                         ranks.append(r)
                         
                     session.add_all(ranks)
-                    logger.info(f"[OK] Synced {len(ranks)} records to DailyRank: {market} - {rank_type}")
+                    logger.info(f"[OK] 已写入 {len(ranks)} 条数据到每日榜单: {market} - {rank_type}")
                     
                     # 触发 AI 归因 (抽取 Top 3)
                     try:
                         from modules.monitor.scanner import MonitorService, analysis_executor
+                        from modules.monitor.notifier import Notifier
                         if ranks:
+                            market_cn = {'CN': 'A股', 'HK': '港股', 'US': '美股'}.get(market, market)
                             top_focus = sorted(ranks, key=lambda x: x.change_pct, reverse=True)[:3]
                             for focus_r in top_focus:
                                 item_mock = {
                                     'symbol': focus_r.symbol,
                                     'name': focus_r.name,
-                                    'chat_id': None,  # System level log
+                                    'chat_id': None,
                                     'market': focus_r.market
                                 }
                                 quote_mock = {
                                     'pct_chg': focus_r.change_pct,
                                     'price': focus_r.price
                                 }
-                                direction = f"🏆 榜单登顶 ({focus_r.rank_type})"
-                                # 放进分析器进行多线程深度挖掘
+                                direction = f"🏆 {market_cn}每日涨幅榜 Top标的"
                                 analysis_executor.submit(MonitorService._analyze_and_report, item_mock, quote_mock, direction)
                     except Exception as e:
-                        logger.error(f"Failed to submit daily rank AI analysis: {e}")
+                        logger.error(f"每日榜单 AI 归因提交失败: {e}")
                     
             # 提交事务
             session.commit()
