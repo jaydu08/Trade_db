@@ -115,6 +115,27 @@ class TaskScheduler:
             replace_existing=True
         )
         
+        # 7. 7日监控战报 (每周五 18:00)
+        from modules.monitor.performance_report import PerformanceReportService
+        self.scheduler.add_job(
+            PerformanceReportService.generate_and_push_report,
+            CronTrigger(day_of_week='fri', hour=18, minute=0),
+            args=[7],
+            id="report_7d",
+            name="7日表现战报",
+            replace_existing=True
+        )
+        
+        # 8. 30日监控战报 (每月最后一天 18:30)
+        self.scheduler.add_job(
+            PerformanceReportService.generate_and_push_report,
+            CronTrigger(day='last', hour=18, minute=30),
+            args=[30],
+            id="report_30d",
+            name="30日表现战报",
+            replace_existing=True
+        )
+        
         logger.info(f"Registered {len(self.scheduler.get_jobs())} jobs.")
 
     def _job_sync_news(self):
