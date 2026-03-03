@@ -74,60 +74,81 @@ class CommodityScanner:
             if not pool:
                 logger.warning("No commodities to scan (pool is empty).")
                 return
-                
-            # 分批查询，因为新浪接口一次性查询太多可能报错
-            symbols = list(pool.keys())
-            batch_size = 30
             
+            logger.info(f"Scanning {len(pool)} commodity contracts...")
+            
+            # 逐个查询（新浪接口批量参数不稳定，逐个更可靠）
+            import pandas as pd
             all_dfs = []
-            for i in range(0, len(symbols), batch_size):
-                batch_syms = symbols[i:i+batch_size]
+            
+            for sym in list(pool.keys()):
                 try:
-                    df = ak.futures_zh_spot(
-                        symbol=",".join(batch_syms), 
-                        market="CF"
-                    )
+                    df = ak.futures_zh_spot(symbol=sym, market="CF")
                     if not df.empty:
                         all_dfs.append(df)
-                except Exception as e:
-                    logger.debug(f"Batch fetch failed ({e}), falling back to individual symbol fetching.")
-                    for sym in batch_syms:
-                        try:
-                            single_df = ak.futures_zh_spot(symbol=sym, market="CF")
-                            if not single_df.empty:
-                                all_dfs.append(single_df)
-                        except Exception:
-                            # 忽略不支持的某些特殊合约（如股指期货）
-                            pass
+                except Exception:
+                    # 某些合约（如股指期货）新浪不支持，静默跳过
+                    pass
             
             if not all_dfs:
-                logger.warning("Commodity scan returned empty data across all batches.")
+                logger.warning("Commodity scan returned empty data across all symbols.")
                 return
                 
-            import pandas as pd
             df_all = pd.concat(all_dfs, ignore_index=True)
+            logger.info(f"Fetched {len(df_all)} commodity rows total.")
             
+            triggered = 0
             for _, row in df_all.iterrows():
-                symbol = row['symbol']
+                symbol = str(row.get('symbol', ''))
                 name = pool.get(symbol, symbol)
-                price = float(row.get('current_price', 0))
-                # 涨跌幅有时不同接口列名不同，假设这里有 change_pct
-                # 新浪现货通常有 'change_percent'
+                
+                # 当前价
+                price = 0.0
+                for price_col in ['current_price', 'last', 'close', '最新价']:
+                    if price_col in row and row[price_col] not in (None, '', 0):
+                        try:
+                            price = float(row[price_col])
+                            break
+                        except (ValueError, TypeError):
+                            pass
+                
+                if price <= 0:
+                    continue
+                
+                # 计算涨跌幅：用昨结算价作为基准（最准确）
                 pct_chg = 0.0
-                if 'change_percent' in row:
-                    pct_chg = float(row['change_percent'])
-                elif '涨跌幅' in row:
-                    pct_chg = float(row['涨跌幅'])
+                ref_price = 0.0
+                for ref_col in ['last_settle_price', 'last_close', 'settle', 'pre_settle']:
+                    if ref_col in row and row[ref_col] not in (None, '', 0):
+                        try:
+                            ref_price = float(row[ref_col])
+                            break
+                        except (ValueError, TypeError):
+                            pass
+                
+                if ref_price > 0:
+                    pct_chg = round((price - ref_price) / ref_price * 100, 2)
+                else:
+                    # 如果接口直接给了涨跌幅字段就优先使用
+                    for pct_col in ['change_percent', 'pct_chg', '涨跌幅', 'change_pct']:
+                        if pct_col in row and row[pct_col] not in (None, ''):
+                            try:
+                                pct_chg = float(row[pct_col])
+                                break
+                            except (ValueError, TypeError):
+                                pass
                     
                 if abs(pct_chg) >= CommodityScanner.THRESHOLD_PCT:
                     direction = "暴涨" if pct_chg > 0 else "暴跌"
-                    logger.info(f"Commodity Alert Triggered: {name} ({symbol}) {direction} {pct_chg}%")
-                    
-                    # 触发深度归因与映射
+                    logger.info(f"Commodity Alert Triggered: {name} ({symbol}) {direction} {pct_chg}% (price={price}, ref={ref_price})")
+                    triggered += 1
                     CommodityScanner._process_anomaly(name, symbol, pct_chg, direction, price)
+            
+            logger.info(f"Commodity scan complete. {triggered} alert(s) triggered.")
                     
         except Exception as e:
-            logger.error(f"Commodity scan failed: {e}")
+            logger.error(f"Commodity scan failed: {e}", exc_info=True)
+
 
     @staticmethod
     def _process_anomaly(name: str, symbol: str, pct_chg: float, direction: str, price: float):

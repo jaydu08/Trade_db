@@ -527,11 +527,12 @@ class AkShareClient:
         Returns:
             DataFrame 包含 symbol, name, price, change_pct, amount, turnover_rate
         """
-        logger.info(f"Fetching daily top {top_n} {rank_type} for market: {market} using AKShare (single request)...")
+        logger.info(f"Fetching daily top {top_n} {rank_type} for market: {market}...")
         
         try:
             if market == "CN":
-                df = ak.stock_zh_a_spot_em()
+                # 东方财富接口在当前服务器被封(RemoteDisconnected)，改用新浪批量接口
+                df = AkShareClient._fetch_bulk_sina("CN")
                 symbol_col, name_col, price_col, pct_col, amt_col, turn_col = "代码", "名称", "最新价", "涨跌幅", "成交额", "换手率"
             elif market == "HK":
                 df = ak.stock_hk_spot_em()
