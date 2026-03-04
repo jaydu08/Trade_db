@@ -2,6 +2,7 @@
 Commodity Scanner
 负责监控大宗商品异动，映射关联股票，并生成交易思路。
 所有推送内容均为中文，仅推送正向涨幅，每个品种24小时内只推送一次。
+优化：引入LLM提取同类项进行合并群发，移除冗长的交易逻辑，股票推荐只用中文名。
 """
 import logging
 import datetime
@@ -11,22 +12,22 @@ from typing import List, Dict, Any
 from pydantic import BaseModel, Field
 
 from modules.ingestion.data_factory import data_manager
-from core.llm import structured_output, simple_prompt
+from core.llm import structured_output
 from core.db import get_collection
 from modules.monitor.notifier import Notifier
 import akshare as ak
 
 logger = logging.getLogger(__name__)
 
-# LLM 解析结构模型
-class CommodityAttribution(BaseModel):
-    catalyst: str = Field(description="商品价格异动的核心催化剂（中文，最多2句话）。")
-    confidence: str = Field(description="置信度：高、中、低。")
+# LLM 解析结构模型: 同类项合并推送版
+class CommodityGroup(BaseModel):
+    theme_name: str = Field(description="这组大宗商品涨价的共同主题或所属板块（例如：能源化工类、有色金属类等）。")
+    included_commodities: List[str] = Field(description="属于该主题的商品名称列表。")
+    catalyst: str = Field(description="该类商品价格异动的核心催化剂（中文，最多2句话）。")
+    beneficiary_stocks: List[str] = Field(description="最可能受益的具体股票中文名称列表（无需代码，只需中文名称，例如：中国石油、紫金矿业）。")
 
-class TradingIdea(BaseModel):
-    logic: str = Field(description="将商品涨价与权益市场联动的交易逻辑（中文，最多3句话）。")
-    target_tickers: List[str] = Field(description="最可能受益的具体股票代码列表（A股/港股/美股）。")
-    action: str = Field(description="具体可操作的交易思路（中文）。")
+class GroupedAnalysis(BaseModel):
+    groups: List[CommodityGroup] = Field(description="提炼出的同类项分组列表。如果是单一商品，本身构成一个分组。")
 
 class CommodityScanner:
     """
@@ -40,8 +41,8 @@ class CommodityScanner:
     _cached_pool: Dict[str, str] = {}
     _pool_last_update: datetime.date = None
     
-    # 触发阈值（仅正向涨幅）
-    THRESHOLD_PCT = 2.0
+    # 触发阈值（仅正向涨幅）。已按用户需求上调至 5.0%
+    THRESHOLD_PCT = 5.0
     # 24小时冷却时间
     COOLDOWN_HOURS = 24
 
@@ -117,7 +118,8 @@ class CommodityScanner:
             df_all = pd.concat(all_dfs, ignore_index=True)
             logger.info(f"已获取 {len(df_all)} 条大宗商品行情。")
             
-            triggered = 0
+            triggered_items = []
+            
             for _, row in df_all.iterrows():
                 symbol = str(row.get('symbol', ''))
                 name = pool.get(symbol, symbol)
@@ -167,117 +169,90 @@ class CommodityScanner:
                     continue
                 
                 logger.info(f"大宗商品异动触发: {name}({symbol}) 上涨 {pct_chg}% (现价={price}, 参考={ref_price})")
-                triggered += 1
                 CommodityScanner._mark_alerted(symbol)
                 
-                # 异步执行深度归因+产业链分析（合并为单条推送）
+                triggered_items.append({
+                    "name": name,
+                    "symbol": symbol,
+                    "pct_chg": pct_chg,
+                    "price": price
+                })
+            
+            if triggered_items:
+                logger.info(f"本次扫描共有 {len(triggered_items)} 个商品触发异动，开始合并分析...")
                 from modules.monitor.scanner import analysis_executor
                 analysis_executor.submit(
-                    CommodityScanner._analyze_and_push,
-                    name, symbol, pct_chg, price
+                    CommodityScanner._analyze_and_push_grouped,
+                    triggered_items
                 )
-            
-            logger.info(f"大宗商品异动扫描完成，共触发 {triggered} 个异动预警。")
+            else:
+                logger.info("大宗商品异动扫描完成，无新增预警。")
                     
         except Exception as e:
             logger.error(f"大宗商品扫描失败: {e}", exc_info=True)
 
     @staticmethod
-    def _analyze_and_push(name: str, symbol: str, pct_chg: float, price: float):
+    def _analyze_and_push_grouped(items: List[Dict[str, Any]]):
         """
-        完成深度归因+产业链映射，合并为单条中文消息推送。
-        不发第一条预告消息，归因完成后一次性推送完整报告。
+        对一批刚刚触发的大宗商品进行同类项合并和归因，
+        精简输出：移除交易逻辑和操作建议，股票标的改用中文名。
         """
         try:
+            items_desc = ", ".join([f"{i['name']}(上涨 {i['pct_chg']}%)" for i in items])
+            logger.info(f"正在对以下商品进行组团归因分析: {items_desc}")
+            
             # 1. 资讯聚合
-            query = f"{name} 大宗商品 期货 涨价 原因 最新分析"
+            query = f"{items_desc} 大宗商品 期货 涨价 原因 最新分析 股市受益标的"
             news_context = data_manager.search(query)
             
-            # 2. LLM 归因分析
-            sys_prompt_attr = (
-                "你是一位专业的大宗商品宏观分析师。"
-                "根据提供的资讯，用中文判断商品异动的核心催化剂，输出JSON格式。"
+            # 2. LLM 分组及精简提取
+            sys_prompt = (
+                "你是一位专业的大宗商品宏观分析师与股票策略师。"
+                "请将提供的若干个发生异动上涨的大宗商品进行同类项合并（将其归入一到多个逻辑关联的主题），"
+                "并根据资讯提炼核心催化剂，最后找出A股和港股中对应的最受益股票（只输出股票的中文简称，比如: 紫金矿业、中国石油）。"
+                "要求高度精简，直接切入核心，不需要输出操作建议或交易思路字段。"
             )
-            user_prompt_attr = f"品种: {name} 今日上涨 {pct_chg}%\n资讯:\n{news_context}"
+            user_prompt = f"本次监控到触发异动上涨的商品及幅度: {items_desc}\n\n相关全网实时资讯:\n{news_context}"
             
-            attribution: CommodityAttribution = structured_output(
+            analysis: GroupedAnalysis = structured_output(
                 messages=[
-                    {"role": "system", "content": sys_prompt_attr},
-                    {"role": "user", "content": user_prompt_attr}
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt}
                 ],
-                response_model=CommodityAttribution
+                response_model=GroupedAnalysis
             )
             
-            # 3. 双轨产业链映射
+            # 3. 组装最终战报
+            report_lines = [f"🔥 **大宗商品异动 (合并版)**"]
             
-            # 路径A：本地 ChromaDB 静态产业链
-            local_mapping_context = ""
-            try:
-                from core.agent import Tools
-                local_mapping_context = Tools.database_search(name)
-            except Exception as e:
-                logger.warning(f"本地产业链检索失败: {e}")
-                local_mapping_context = "本地知识库无关联数据。"
-            
-            # 路径B：LLM生成精准搜索词 + 实时全网搜索
-            live_search_query = simple_prompt(
-                prompt=(
-                    f"大宗商品 {name} 因 「{attribution.catalyst}」 上涨。"
-                    f"请生成一个精确的中文搜索词，用来在A股、港股、美股中寻找最受益的具体上市公司。"
-                    f"只返回搜索词本身，不要任何解释。"
-                ),
-                temperature=0.3
-            ).strip()
-            
-            live_mapping_context = data_manager.search(live_search_query)
-            
-            # 4. 合成交易思路
-            sys_prompt_idea = (
-                "你是顶尖量化基金经理，精通大宗商品与权益市场联动。"
-                "综合静态产业链和实时舆情，给出可直接操作的股票标的。"
-                "必须使用中文，标的代码格式如：600519.SH、00700.HK、AAPL。"
-                "如找不到明确标的，在逻辑中说明原因。"
-                "输出JSON格式。"
-            )
-            user_prompt_idea = f"""
-事件：{name} 今日上涨 {pct_chg}%
-核心原因：{attribution.catalyst}
-
-【静态产业链映射】：
-{local_mapping_context}
-
-【实时受益股（搜索词：{live_search_query}）】：
-{live_mapping_context}
-"""
-            trading_idea: TradingIdea = structured_output(
-                messages=[
-                    {"role": "system", "content": sys_prompt_idea},
-                    {"role": "user", "content": user_prompt_idea}
-                ],
-                response_model=TradingIdea
-            )
-            
-            # 5. 组装成单条完整中文消息
-            tickers_str = "、".join(trading_idea.target_tickers) if trading_idea.target_tickers else "暂无明确标的"
-            report = (
-                f"🔥 **大宗商品异动** | {name}\n"
-                f"💰 现价 {price}  上涨 **{pct_chg}%**\n"
-                f"─────────────────\n"
-                f"⚡ **归因**（置信度：{attribution.confidence}）\n"
-                f"{attribution.catalyst}\n\n"
-                f"🔗 **交易逻辑**\n"
-                f"{trading_idea.logic}\n\n"
-                f"🎯 **受益标的**\n"
-                f"{tickers_str}\n\n"
-                f"📌 **操作建议**：{trading_idea.action}"
-            )
-            
+            for grp in analysis.groups:
+                report_lines.append(f"\n🏷️ **板块**: {grp.theme_name}")
+                
+                # 匹配现价和涨幅，容错处理（LLM有可能没填对原名）
+                details = []
+                for inc_name in grp.included_commodities:
+                    # 尝试找出对应的原item
+                    match = next((x for x in items if inc_name in x['name'] or x['name'] in inc_name), None)
+                    if match:
+                        details.append(f"• {match['name']} (现价: {match['price']}, `+{match['pct_chg']}%`)")
+                    else:
+                        details.append(f"• {inc_name}")
+                        
+                report_lines.append("\n".join(details))
+                report_lines.append(f"\n⚡ **核心催化剂**: {grp.catalyst}")
+                
+                stocks_str = "、".join(grp.beneficiary_stocks) if grp.beneficiary_stocks else "暂无明确标的"
+                report_lines.append(f"🎯 **受益标的**: {stocks_str}")
+                report_lines.append("─────────────────")
+                
+            report = "\n".join(report_lines).strip("\n─")
             Notifier.broadcast(report)
-            logger.info(f"{name} 大宗商品分析推送完成。")
+            logger.info("大宗商品合并分析推送完成。")
             
         except Exception as e:
-            logger.error(f"{name} 大宗商品深度归因失败: {e}")
+            logger.error(f"大宗商品深度归因合并失败: {e}", exc_info=True)
+            # 降级方案：直接推出名称和涨幅
+            fallback_msg = "\n".join([f"• {i['name']} 上涨 {i['pct_chg']}% (现价: {i['price']})" for i in items])
             Notifier.broadcast(
-                f"⚠️ **大宗商品异动** | {name} 上涨 {pct_chg}%（现价 {price}）\n"
-                f"❌ 深度分析失败，请手动关注。"
+                f"⚠️ **大宗商品异动**\n{fallback_msg}\n\n❌ 智能合并分析失败，请手动关注。"
             )

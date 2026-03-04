@@ -86,42 +86,81 @@ class MarketHeatMap:
         filtered = renamed_df[renamed_df["amount"] >= min_amount].copy()
         
         if market == 'CN':
-            # 基础门槛：只看涨幅 >= 3% 的
-            filtered = filtered[filtered["pct_chg"] >= 3.0].copy()
-            
-            # 判断板块涨跌幅限制
-            # 沪深主板: 10%, 创业板(30开头)/科创板(68开头): 20%, 北交所(8或4开头): 30%
+            # ────────────────────────────────────────────────────────────────
+            # A股热榜算法：百分位排名归一化综合评分
+            #
+            # 最低门槛：涨幅 >= 5%（过滤北方国际之类平庸涨幅股）
+            # 对于不同板块归一化涨幅：
+            #   主板 → 除以10, 创业板/科创 → 除以20, 北交所 → 除以30
+            # 评分 = 涨幅百分位(0.5) + 成交额百分位(0.3) + 换手率百分位(0.2)
+            # 百分位归一化让三个指标量纲统一，避免成交额绝对值数量级碾压涨幅
+            # ────────────────────────────────────────────────────────────────
+
+            # 各板块涨停限制（用于归一化涨幅）
             limits = pd.Series(10.0, index=filtered.index)
-            limits[filtered['symbol'].str.startswith(('30', '68'))] = 20.0
+            limits[filtered['symbol'].str.startswith(('30', '688'))] = 20.0
             limits[filtered['symbol'].str.startswith(('8', '4'))] = 30.0
-            
-            # 过滤一字板 (缩量涨停)
-            # 根据各自的涨停限制计算是否为一字板 (接近涨停且换手极低)
-            is_yizi = (filtered["pct_chg"] >= (limits - 0.2)) & (filtered["turnover"] < 1.0)
-            
-            # 归一化涨跌幅：让 10% 的主板涨停 和 20% 的创业板涨停 在完全相同的起跑线比较
-            normalized_pct = filtered["pct_chg"] / limits
-            
-            # 我们给一字板直接大降权，把它挤出榜单
-            # 核心算法：异动分数 = 归一化涨幅 * log(成交额/千万) * 换手率
-            filtered["heat_score"] = np.where(
-                is_yizi,
-                0, 
-                normalized_pct * np.log1p(filtered["amount"] / 10000000) * filtered["turnover"]
+
+            # 最低涨幅门槛 5%（防止平庸股入榜）
+            filtered = filtered[filtered["pct_chg"] >= 5.0].copy()
+            limits = limits.loc[filtered.index]
+
+            if filtered.empty:
+                # 弱市降级：放宽到 >= 3%
+                logger.warning("CN: 涨幅>=5%无满足条件股票，降级展示>=3%涨幅股票")
+                filtered = renamed_df[
+                    (renamed_df["amount"] >= min_amount) & (renamed_df["pct_chg"] >= 3.0)
+                ].copy()
+                limits = pd.Series(10.0, index=filtered.index)
+                limits[filtered['symbol'].str.startswith(('30', '688'))] = 20.0
+                limits[filtered['symbol'].str.startswith(('8', '4'))] = 30.0
+
+            filtered = filtered[filtered["amount"] >= min_amount].copy()
+            limits = limits.loc[filtered.index]
+
+            if filtered.empty:
+                logger.warning("CN: 最终候选池为空，跳过热榜")
+                return []
+
+            # 归一化涨幅（把主板10%涨停 与 创业板20%涨停 等价视为1.0）
+            normalized_pct = (filtered["pct_chg"] / limits).clip(0, 1.2)
+
+            # 百分位排名（pct_rank → 0~1，越大越靠前）
+            rank_pct     = normalized_pct.rank(pct=True)
+            rank_amount  = filtered["amount"].rank(pct=True)
+            has_turnover = filtered["turnover"].sum() > 0
+            rank_turnover = filtered["turnover"].rank(pct=True) if has_turnover else pd.Series(0.5, index=filtered.index)
+
+            # 综合评分：涨幅50% + 成交额30% + 换手20%
+            filtered = filtered.copy()
+            filtered["heat_score"] = (
+                rank_pct     * 0.50 +
+                rank_amount  * 0.30 +
+                rank_turnover * 0.20
+            )
+
+            sorted_df = filtered.sort_values(by="heat_score", ascending=False)
+            logger.info(f"CN热榜: 候选 {len(filtered)} 只，最高涨幅 {filtered['pct_chg'].max():.2f}%, 最低 {filtered['pct_chg'].min():.2f}%")
+        else:
+            # HK / US：同样改用百分位归一化
+            filtered = filtered[filtered["pct_chg"] >= 5.0].copy()
+
+            if filtered.empty:
+                return []
+
+            rank_pct    = filtered["pct_chg"].rank(pct=True)
+            rank_amount = filtered["amount"].rank(pct=True)
+            has_turnover = filtered["turnover"].sum() > 0
+            rank_turnover = filtered["turnover"].rank(pct=True) if has_turnover else pd.Series(0.5, index=filtered.index)
+
+            filtered = filtered.copy()
+            filtered["heat_score"] = (
+                rank_pct    * 0.50 +
+                rank_amount * 0.30 +
+                rank_turnover * 0.20
             )
             sorted_df = filtered.sort_values(by="heat_score", ascending=False)
-        else:
-            # HK / US
-            filtered = filtered[filtered["pct_chg"] >= 5.0].copy()
-            
-            # 如果没有换手率，只看涨幅和成交额的乘数
-            if filtered["turnover"].sum() == 0:
-                filtered["heat_score"] = filtered["pct_chg"] * np.log1p(filtered["amount"] / 1000000)
-            else:
-                filtered["heat_score"] = filtered["pct_chg"] * np.log1p(filtered["amount"] / 1000000) * filtered["turnover"]
-                
-            sorted_df = filtered.sort_values(by="heat_score", ascending=False)
-            
+
         top_stocks = sorted_df.head(top_n).to_dict(orient="records")
         return top_stocks
 
