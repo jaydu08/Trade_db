@@ -161,6 +161,32 @@ class MarketHeatMap:
             )
             sorted_df = filtered.sort_values(by="heat_score", ascending=False)
 
+            # 美股特定：去除权证类 + 同底层杠杆ETF去重（留成交额最大的一个）
+            if market == 'US':
+                import re as _re
+                def _us_key(row):
+                    name = str(row.get('name', ''))
+                    sym  = str(row.get('symbol', '')).split('.')[-1]
+                    # 权证/Rights → 完全排除（返回 None）
+                    if _re.search(r'(?i)\b(wt|warrant|rights|rts|units?)\b', name):
+                        return None
+                    # 杠杆ETF：提取底层ticker归为同组
+                    m = _re.search(r'\d[\d.]*[Xx]\s+(?:Long\s+|Short\s+)?([A-Z]{2,6})', name)
+                    if m:
+                        return 'LETF_' + m.group(1)
+                    m2 = _re.search(r'(?:T-Rex|Defiance|ProShares|GraniteShares|Direxion)\s+.*?([A-Z]{2,6})(?:\s|$)', name)
+                    if m2:
+                        return 'LETF_' + m2.group(1)
+                    return sym  # 普通股不合并
+
+                sorted_df = sorted_df.copy()
+                sorted_df['_key'] = sorted_df.apply(_us_key, axis=1)
+                sorted_df = (
+                    sorted_df[sorted_df['_key'].notna()]      # 去除权证
+                    .drop_duplicates(subset=['_key'])          # 杠杆ETF只留成交额最大
+                    .drop(columns=['_key'])
+                )
+
         top_stocks = sorted_df.head(top_n).to_dict(orient="records")
         return top_stocks
 
@@ -184,15 +210,25 @@ class MarketHeatMap:
             logger.error(f"Failed to fetch market data for {market}: {e}")
             return
             
-        # 2. 生成榜单
-        # HK 和 US 市场的名义成交额计价单位不同，适当调整 min_amount
-        min_amt = 50000000 
+        # 2. 生成榜单配置
+        min_amt = 50_000_000   # CN/HK: 5000万人民币
         n = 10
-        if market == 'US': 
-            min_amt = 10000000 # 美元
+        cn_total_amount = 0.0
+
+        if market == 'CN':
+            # 全市场成交额（过滤前对原始数据求和，保留真实总量）
+            try:
+                cn_total_amount = pd.to_numeric(
+                    df['成交额'], errors='coerce'
+                ).fillna(0).sum()
+            except Exception:
+                cn_total_amount = 0.0
+        elif market == 'US':
+            # 提高至2亿美元作为市值代理，过滤粉单/微市值OTC股
+            min_amt = 200_000_000
         elif market == 'HK':
             n = 5
-        
+
         top_stocks = self._generate_heatmap(df, market, top_n=n, min_amount=min_amt)
         
         if not top_stocks:
@@ -223,8 +259,15 @@ class MarketHeatMap:
 
         # 4. 组装消息并发送
         market_names = {'CN': 'A股', 'HK': '港股', 'US': '美股'}
-        msg_lines = [f"🔥 **{market_names.get(market, market)} 盘后热门榜单 (Top 10)**"]
-        msg_lines.append(f"📅 日期: {datetime.date.today()}\n")
+        msg_lines = [f"🔥 **{market_names.get(market, market)} 盘后热门榜单 (Top {len(results)})**"]
+        msg_lines.append(f"📅 日期: {datetime.date.today()}")
+
+        # A股附带全市场成交额
+        if market == 'CN' and cn_total_amount > 0:
+            vol_str = f"{cn_total_amount/1e8:.0f} 亿" if cn_total_amount < 1e12 else f"{cn_total_amount/1e12:.2f} 万亿"
+            msg_lines.append(f"📊 全市场成交额: **{vol_str}**")
+
+        msg_lines.append("")
         
         for i, stock in enumerate(results, 1):
             name = stock['name']
