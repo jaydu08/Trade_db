@@ -148,6 +148,9 @@ class MarketHeatMap:
             if filtered.empty:
                 return []
 
+            # (已移除) 旧版通过价格和成交额代理市值的硬性过滤
+            # 现在改为两段式：先取 Top 50，再调用 Finnhub API 判断真实市值 >= 100M
+
             rank_pct    = filtered["pct_chg"].rank(pct=True)
             rank_amount = filtered["amount"].rank(pct=True)
             has_turnover = filtered["turnover"].sum() > 0
@@ -187,8 +190,35 @@ class MarketHeatMap:
                     .drop(columns=['_key'])
                 )
 
-        top_stocks = sorted_df.head(top_n).to_dict(orient="records")
-        return top_stocks
+        # 先取初筛 Top 50（多取一些供下游过滤）
+        candidates = sorted_df.head(50).to_dict(orient="records")
+        
+        if market == 'US':
+            import os, requests, concurrent.futures
+            finnhub_key = os.getenv("FINNHUB_API_KEY", "")
+            if finnhub_key:
+                def _check_cap(stk):
+                    sym = stk.get('symbol', '').split('.')[-1]
+                    try:
+                        u = f"https://finnhub.io/api/v1/stock/profile2?symbol={sym}&token={finnhub_key}"
+                        r = requests.get(u, timeout=2)
+                        data = r.json()
+                        cap = data.get('marketCapitalization', 0)
+                        # Finnhub 市值单位是百万美元 (Million USD)
+                        if cap >= 100:
+                            return stk
+                        return None
+                    except Exception as e:
+                        logger.warning(f"Finnhub API error for {sym}: {e}")
+                        return stk # 网络报错时谨慎放行
+                        
+                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+                    res = list(ex.map(_check_cap, candidates))
+                    
+                valid_stocks = [s for s in res if s is not None]
+                return valid_stocks[:top_n]
+                
+        return candidates[:top_n]
 
     def process_and_notify(self, market: str):
         """主入口：获取数据、计算热榜、获取归因、发送通知"""
@@ -224,8 +254,8 @@ class MarketHeatMap:
             except Exception:
                 cn_total_amount = 0.0
         elif market == 'US':
-            # 提高至2亿美元作为市值代理，过滤粉单/微市值OTC股
-            min_amt = 200_000_000
+            # 回调至 2000万美元（配合 Finnhub 接口做 1亿美金市值精确过滤）
+            min_amt = 20_000_000
         elif market == 'HK':
             n = 5
 
