@@ -21,49 +21,36 @@ class PerformanceReportService:
     @staticmethod
     def _get_pushed_stocks(days: int) -> Dict[str, Dict]:
         """
-        获取过去 days 天内系统推送过的标的。
-        返回字典: {symbol: {'name': name, 'market': market, 'push_price': price, 'push_date': date}}
-        如果同一标的被推送多次，保留最早一次的推送价格和时间作为基准。
+        获取过去 days 天内热榜推送过的标的。
+        仅使用 DailyRank 表（盘后计算的正确收盘价）作为基准价。
+        WatchlistAlert 不纳入（它在非市场时间也会触发，价格不可靠）。
         """
-        target_datetime = datetime.datetime.now() - datetime.timedelta(days=days)
-        target_date = target_datetime.date()
-        
+        target_date = (datetime.datetime.now() - datetime.timedelta(days=days)).date()
         stocks = {}
-        
-        with db_manager.ledger_session() as session:
-            # 1. 查询 WatchlistAlert
-            alerts = session.exec(
-                select(WatchlistAlert).where(WatchlistAlert.timestamp >= target_datetime)
-            ).all()
-            for a in alerts:
-                sym = a.symbol
-                if sym not in stocks or a.timestamp < stocks[sym]['push_date']:
-                    stocks[sym] = {
-                        'name': a.name,
-                        'market': a.market,
-                        'push_price': a.price,
-                        'push_date': a.timestamp
-                    }
-            
-            # 2. 查询 DailyRank (只计入涨跌幅榜的推送标的)
+
+        from sqlmodel import Session
+        engine = db_manager.ledger_engine
+        with Session(engine) as session:
             ranks = session.exec(
                 select(DailyRank).where(
                     DailyRank.date >= target_date,
                     DailyRank.rank_type == 'change_pct'
                 )
             ).all()
-            for r in ranks:
-                sym = r.symbol
-                # 转换 date 为 datetime 方便比较
-                dt_val = datetime.datetime.combine(r.date, datetime.time())
-                if sym not in stocks or dt_val < stocks[sym]['push_date']:
-                    stocks[sym] = {
-                        'name': r.name,
-                        'market': r.market,
-                        'push_price': r.price,
-                        'push_date': dt_val
-                    }
-                    
+            rank_data = [(r.symbol, r.name, r.market, r.price, r.date) for r in ranks]
+
+        for sym, name, market, price, date in rank_data:
+            if not sym or not price or price <= 0:
+                continue
+            dt_val = datetime.datetime.combine(date, datetime.time())
+            if sym not in stocks or dt_val < stocks[sym]['push_date']:
+                stocks[sym] = {
+                    'name': name,
+                    'market': market,
+                    'push_price': price,
+                    'push_date': dt_val
+                }
+
         return stocks
 
     @staticmethod
@@ -82,28 +69,40 @@ class PerformanceReportService:
             except Exception as e:
                 logger.error(f"Failed to fetch CN prices for report: {e}")
                 
-        # HK 市场
+        # HK 市场（统一代码格式：'700'/'00700' → 5位含前导零匹配）
         if symbols_by_market.get('HK'):
             try:
                 df_hk = akshare_client.get_stock_info_hk()
+                hk_lookup = {}
                 for _, row in df_hk.iterrows():
-                    sym = str(row['代码'])
-                    if sym in symbols_by_market['HK']:
-                        prices[sym] = float(row.get('最新价', 0))
+                    raw = str(row['代码'])
+                    normalized = raw.lstrip('0').zfill(5)
+                    try:
+                        hk_lookup[normalized] = float(row.get('最新价', 0))
+                    except (ValueError, TypeError):
+                        pass
+                for sym in symbols_by_market['HK']:
+                    key = sym.lstrip('0').zfill(5)
+                    if key in hk_lookup and hk_lookup[key] > 0:
+                        prices[sym] = hk_lookup[key]
             except Exception as e:
                 logger.error(f"Failed to fetch HK prices for report: {e}")
-                
-        # US 市场
+
+        # US 市场（Sina格式 '105.NVDA' → 取 ticker 部分匹配 DB 中的 'NVDA'）
         if symbols_by_market.get('US'):
             try:
-                df_us = akshare_client.get_stock_info_us()
+                df_us = AkShareClient._fetch_bulk_sina('US')
                 for _, row in df_us.iterrows():
-                    sym = str(row['代码'])
-                    if sym in symbols_by_market['US']:
-                        prices[sym] = float(row.get('最新价', 0))
+                    raw_sym = str(row.get('代码', ''))
+                    ticker = raw_sym.split('.')[-1]
+                    if ticker in symbols_by_market['US']:
+                        try:
+                            prices[ticker] = float(row.get('最新价', 0))
+                        except (ValueError, TypeError):
+                            pass
             except Exception as e:
                 logger.error(f"Failed to fetch US prices for report: {e}")
-                
+
         return prices
 
     @staticmethod
