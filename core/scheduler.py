@@ -79,28 +79,28 @@ class TaskScheduler:
             replace_existing=True
         )
         
-        # 4. CN 热度榜单 (每天 15:30 A股收盘后半小时)
+        # 4. CN 热度榜单 (工作日 15:30 A股收盘后半小时)
         self.scheduler.add_job(
             self._job_cn_heatmap,
-            CronTrigger(hour=15, minute=30),
+            CronTrigger(day_of_week='mon-fri', hour=15, minute=30),
             id="cn_heatmap",
             name="A股热门榜单",
             replace_existing=True
         )
 
-        # 4.1 HK 热度榜单 (每天 16:30 港股收盘后半小时)
+        # 4.1 HK 热度榜单 (工作日 16:30 港股收盘后半小时)
         self.scheduler.add_job(
             self._job_hk_heatmap,
-            CronTrigger(hour=16, minute=30),
+            CronTrigger(day_of_week='mon-fri', hour=16, minute=30),
             id="hk_heatmap",
             name="港股热门榜单",
             replace_existing=True
         )
 
-        # 5. US 热度榜单 (每天 10:00 美股收盘后)
+        # 5. US 热度榜单 (周二至周六 10:00，对应美股周一到周五收盘后)
         self.scheduler.add_job(
             self._job_us_heatmap,
-            CronTrigger(hour=10, minute=0),
+            CronTrigger(day_of_week='tue-sat', hour=10, minute=0),
             id="us_heatmap",
             name="美股热门榜单",
             replace_existing=True
