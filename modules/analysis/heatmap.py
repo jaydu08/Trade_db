@@ -123,7 +123,13 @@ class MarketHeatMap:
                 return []
 
             # 归一化涨幅（把主板10%涨停 与 创业板20%涨停 等价视为1.0）
-            normalized_pct = (filtered["pct_chg"] / limits).clip(0, 1.2)
+            normalized_pct = (filtered["pct_chg"] / limits)
+            # 抹平涨停板之间的微小差价 (例如 19.98%, 19.99%, 10.03%)
+            # 将接近甚至略微超过涨停价 (0.96~1.05倍) 的标的，归一化强度全部强制锁定为 1.0
+            # 这样它们的 rank_pct 得分完全一致，最终的龙虎榜排序决定权将完美交还给 成交额 和 换手率
+            mask = (normalized_pct >= 0.96) & (normalized_pct <= 1.05)
+            normalized_pct.loc[mask] = 1.0
+            normalized_pct = normalized_pct.clip(0, 1.2)
 
             # 百分位排名（pct_rank → 0~1，越大越靠前）
             rank_pct     = normalized_pct.rank(pct=True)
