@@ -69,11 +69,11 @@ class TaskScheduler:
             replace_existing=True
         )
         
-        # 3.5 大宗商品每日龙虎榜战报 (工作日 18:00)
+        # 3.5 大宗商品每日龙虎榜战报 (周二至周六 08:00，涵盖前一日日盘及夜盘)
         from modules.monitor.commodity_scanner import CommodityScanner
         self.scheduler.add_job(
             CommodityScanner.generate_daily_report,
-            CronTrigger(day_of_week='mon-fri', hour=18, minute=0),
+            CronTrigger(day_of_week='tue-sat', hour=8, minute=0),
             id="commodity_scan",
             name="大宗商品每日战报",
             replace_existing=True
@@ -97,10 +97,10 @@ class TaskScheduler:
             replace_existing=True
         )
 
-        # 5. US 热度榜单 (周二至周六 10:00，对应美股周一到周五收盘后)
+        # 5. US 热度榜单 (周二至周六 08:00，对应美股周一到周五收盘后)
         self.scheduler.add_job(
             self._job_us_heatmap,
-            CronTrigger(day_of_week='tue-sat', hour=10, minute=0),
+            CronTrigger(day_of_week='tue-sat', hour=8, minute=0),
             id="us_heatmap",
             name="美股热门榜单",
             replace_existing=True
