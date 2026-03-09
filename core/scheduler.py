@@ -69,13 +69,13 @@ class TaskScheduler:
             replace_existing=True
         )
         
-        # 3.5 大宗商品监控 (每 5 分钟)
+        # 3.5 大宗商品每日龙虎榜战报 (工作日 18:00)
         from modules.monitor.commodity_scanner import CommodityScanner
         self.scheduler.add_job(
-            CommodityScanner.scan_and_alert,
-            IntervalTrigger(minutes=5),
+            CommodityScanner.generate_daily_report,
+            CronTrigger(day_of_week='mon-fri', hour=18, minute=0),
             id="commodity_scan",
-            name="大宗商品异动监控",
+            name="大宗商品每日战报",
             replace_existing=True
         )
         

@@ -66,6 +66,8 @@ class MonitorService:
             return
 
         for item in active_items:
+            symbol = item["symbol"]
+        for item in active_items:
             symbol = item['symbol']
             quote = quotes_results.get(symbol)
             if not quote:

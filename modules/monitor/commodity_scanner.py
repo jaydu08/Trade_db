@@ -19,107 +19,94 @@ import akshare as ak
 
 logger = logging.getLogger(__name__)
 
-# LLM 解析结构模型: 同类项合并推送版
-class CommodityGroup(BaseModel):
-    theme_name: str = Field(description="这组大宗商品涨价的共同主题或所属板块（例如：能源化工类、有色金属类等）。")
-    included_commodities: List[str] = Field(description="属于该主题的商品名称列表。")
-    catalyst: str = Field(description="该类商品价格异动的核心催化剂（中文，最多2句话）。")
-    beneficiary_stocks: List[str] = Field(description="最可能受益的具体股票中文名称列表（无需代码，只需中文名称，例如：中国石油、紫金矿业）。")
+# 固定的五大板块映射关系
+CATEGORY_MAP = {
+    "贵金属及有色": ["黄金", "白银", "铜", "铝", "锌", "铅", "镍", "锡", "氧化铝", "工业硅", "国际铜", "铸造铝合金", "铂", "钯"],
+    "黑色系及建材": ["螺纹钢", "铁矿石", "焦炭", "焦煤", "玻璃", "纯碱", "尿素", "硅铁", "锰硅", "不锈钢", "热轧卷板", "热卷"],
+    "能源化工": ["原油", "上海原油", "燃料油", "低硫燃料油", "PTA", "乙二醇", "甲醇", "聚丙烯", "塑料", "PVC", "苯乙烯", "液化石油气", "LPG", "纯苯", "烧碱", "对二甲苯", "瓶片", "丙烯", "天然橡胶", "20号胶", "丁二烯橡胶", "沥青", "纸浆"],
+    "农畜产品": ["豆粕", "豆油", "豆一", "豆二", "大豆", "玉米", "生猪", "原木", "淀粉", "鸡蛋", "菜油", "菜籽", "菜粕", "强麦", "粳稻", "白糖", "棉花", "棉纱", "早籼稻", "晚籼稻", "苹果", "红枣", "花生"],
+    "航运及特殊": ["集运指数(欧线)", "集运指数", "碳酸锂", "多晶硅"] # 未识别的新品种也会落入此分类
+}
 
-class GroupedAnalysis(BaseModel):
-    groups: List[CommodityGroup] = Field(description="提炼出的同类项分组列表。如果是单一商品，本身构成一个分组。")
+# 纯金融衍生品，直接过滤不看
+FINANCIAL_FUTURES = ["沪深300指数期货", "5年期国债期货", "上证50指数期货", "中证500指数期货", "2年期国债期货", "中证指数期货", "10年期国债期货", "30年期国债期货"]
+
+# LLM 解析结构模型: 针对固定板块的归因
+class SectorAnalysis(BaseModel):
+    theme_name: str = Field(description="板块名称（与输入的板块名称严格一致）")
+    catalyst: str = Field(description="结合今日资讯，概括该板块内领涨商品集体异动的核心逻辑及催化剂（中文，高度精简，最多2句话）。")
+    beneficiary_stocks: List[str] = Field(description="A股和港股中该板块对应的最核心受益股票（只输出股票中文简称，不要任何代码，如：紫金矿业、中国海油，最多3只）。")
+
+class DailyCommodityAnalysis(BaseModel):
+    sectors: List[SectorAnalysis] = Field(description="各个板块的深度归因列表")
 
 class CommodityScanner:
     """
-    大宗商品异动监控器
+    大宗商品每日战报生成器
+    每天盘后截取全市场表现，固定分发至 5 个大类，取各自 Top 3 领涨品种。
     """
-    # 类级别 24h 去重字典：{symbol: last_alert_datetime}
-    _alert_history: Dict[str, datetime.datetime] = {}
-    _alert_history_lock = threading.Lock()
     
-    # 主力合约池缓存（按天刷新）
-    _cached_pool: Dict[str, str] = {}
-    _pool_last_update: datetime.date = None
-    
-    # 触发阈值（仅正向涨幅）。已按用户需求上调至 5.0%
-    THRESHOLD_PCT = 5.0
-    # 24小时冷却时间
-    COOLDOWN_HOURS = 24
-
     @classmethod
-    def _get_active_commodities(cls) -> Dict[str, str]:
-        """动态获取当前全市场主力合约列表，按天缓存"""
-        today = datetime.date.today()
-        if cls._pool_last_update == today and cls._cached_pool:
-            return cls._cached_pool
-            
-        try:
-            df_main = ak.futures_display_main_sina()
-            if not df_main.empty:
-                pool = {}
-                for _, row in df_main.iterrows():
-                    sym = str(row['symbol'])
-                    name = str(row['name']).replace('连续', '')
-                    if len(sym) >= 2:
-                        pool[sym] = name
-                
-                cls._cached_pool = pool
-                cls._pool_last_update = today
-                logger.info(f"已加载 {len(pool)} 个大宗商品主力合约。")
-                return pool
-        except Exception as e:
-            logger.error(f"获取主力合约列表失败: {e}")
-            
-        return cls._cached_pool
-
-    @classmethod
-    def _is_cooldown_active(cls, symbol: str) -> bool:
-        """检查该品种是否在24小时冷却期内"""
-        with cls._alert_history_lock:
-            last = cls._alert_history.get(symbol)
-            if last is None:
-                return False
-            elapsed = (datetime.datetime.now() - last).total_seconds() / 3600
-            return elapsed < cls.COOLDOWN_HOURS
-
-    @classmethod
-    def _mark_alerted(cls, symbol: str):
-        """记录该品种的最近推送时间"""
-        with cls._alert_history_lock:
-            cls._alert_history[symbol] = datetime.datetime.now()
+    def _determine_category(cls, name: str) -> str:
+        """根据商品名称确定所属板块，匹配不到的兜底到'航运及特殊'"""
+        for cat, items in CATEGORY_MAP.items():
+            for item in items:
+                if item in name or name in item:
+                    return cat
+        return "航运及特殊"
 
     @staticmethod
-    def scan_and_alert():
-        logger.info("开始大宗商品异动扫描...")
+    def generate_daily_report():
+        logger.info("开始生成大宗商品每日截面战报...")
         
         try:
-            pool = CommodityScanner._get_active_commodities()
-            if not pool:
-                logger.warning("商品合约池为空，跳过扫描。")
+            # 1. 获取全市场主力合约列表
+            df_main = ak.futures_display_main_sina()
+            if df_main.empty:
+                logger.warning("未能获取主力合约列表。")
                 return
-            
-            logger.info(f"扫描 {len(pool)} 个大宗商品合约...")
-            
+
+            pool = {}
+            for _, row in df_main.iterrows():
+                sym = str(row.get('symbol', ''))
+                name = str(row.get('name', '')).replace('连续', '')
+                if len(sym) >= 2 and not any(fin in name for fin in FINANCIAL_FUTURES):
+                    pool[sym] = name
+
+            logger.info(f"已加载 {len(pool)} 个大事实物商品主力合约。")
+
+            # 2. 获取每个合约的收盘行情
+            # 采用并推获取当前全市场截面，使用 ak.futures_zh_spot
             import pandas as pd
-            all_dfs = []
+            import time
             
-            for sym in list(pool.keys()):
+            def _fetch_spot(sym):
                 try:
+                    # 避免过快请求被新浪拦截
+                    time.sleep(0.2)
                     df = ak.futures_zh_spot(symbol=sym, market="CF")
                     if not df.empty:
-                        all_dfs.append(df)
-                except Exception:
+                        return df
+                except:
                     pass
+                return None
+
+            logger.info("正在分批拉取各合约行情数据...")
+            # 降低并发数，防止被封 IP 导致进程挂起
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                results = list(executor.map(_fetch_spot, pool.keys()))
             
-            if not all_dfs:
+            valid_dfs = [df for df in results if df is not None]
+            if not valid_dfs:
                 logger.warning("所有合约行情数据均为空。")
                 return
                 
-            df_all = pd.concat(all_dfs, ignore_index=True)
-            logger.info(f"已获取 {len(df_all)} 条大宗商品行情。")
-            
-            triggered_items = []
-            
+            df_all = pd.concat(valid_dfs, ignore_index=True)
+            logger.info(f"成功获取 {len(df_all)} 条行情。")
+
+            # 3. 数据规整与分路存放
+            market_data = {cat: [] for cat in CATEGORY_MAP.keys()}
+
             for _, row in df_all.iterrows():
                 symbol = str(row.get('symbol', ''))
                 name = pool.get(symbol, symbol)
@@ -137,7 +124,7 @@ class CommodityScanner:
                 if price <= 0:
                     continue
                 
-                # 计算涨跌幅（基于昨结算价）
+                # 计算涨跌幅
                 pct_chg = 0.0
                 ref_price = 0.0
                 for ref_col in ['last_settle_price', 'last_close', 'settle', 'pre_settle']:
@@ -159,100 +146,101 @@ class CommodityScanner:
                             except (ValueError, TypeError):
                                 pass
                 
-                # 仅推送正向涨幅
-                if pct_chg < CommodityScanner.THRESHOLD_PCT:
-                    continue
-                
-                # 24小时去重
-                if CommodityScanner._is_cooldown_active(symbol):
-                    logger.debug(f"{name}({symbol}) 处于24h冷却期，跳过推送。")
-                    continue
-                
-                logger.info(f"大宗商品异动触发: {name}({symbol}) 上涨 {pct_chg}% (现价={price}, 参考={ref_price})")
-                CommodityScanner._mark_alerted(symbol)
-                
-                triggered_items.append({
+                # 确定归属篮子
+                cat = CommodityScanner._determine_category(name)
+                market_data[cat].append({
                     "name": name,
                     "symbol": symbol,
-                    "pct_chg": pct_chg,
-                    "price": price
+                    "price": price,
+                    "pct_chg": pct_chg
                 })
-            
-            if triggered_items:
-                logger.info(f"本次扫描共有 {len(triggered_items)} 个商品触发异动，开始合并分析...")
-                from modules.monitor.scanner import analysis_executor
-                analysis_executor.submit(
-                    CommodityScanner._analyze_and_push_grouped,
-                    triggered_items
-                )
-            else:
-                logger.info("大宗商品异动扫描完成，无新增预警。")
-                    
-        except Exception as e:
-            logger.error(f"大宗商品扫描失败: {e}", exc_info=True)
 
-    @staticmethod
-    def _analyze_and_push_grouped(items: List[Dict[str, Any]]):
-        """
-        对一批刚刚触发的大宗商品进行同类项合并和归因，
-        精简输出：移除交易逻辑和操作建议，股票标的改用中文名。
-        """
-        try:
-            items_desc = ", ".join([f"{i['name']}(上涨 {i['pct_chg']}%)" for i in items])
-            logger.info(f"正在对以下商品进行组团归因分析: {items_desc}")
+            # 4. 各板块 Top 3 提取
+            top_commodities_by_sector = {}
+            flat_top_items = []
             
-            # 1. 资讯聚合
-            query = f"{items_desc} 大宗商品 期货 涨价 原因 最新分析 股市受益标的"
+            for cat, items in market_data.items():
+                # 按涨幅降序，只保留正向涨幅
+                positive_items = [i for i in items if i['pct_chg'] > 0]
+                sorted_items = sorted(positive_items, key=lambda x: x['pct_chg'], reverse=True)
+                top_3 = sorted_items[:3]
+                
+                if top_3:
+                    top_commodities_by_sector[cat] = top_3
+                    flat_top_items.extend([f"{cat}-{i['name']}(+{i['pct_chg']}%)" for i in top_3])
+
+            if not top_commodities_by_sector:
+                logger.info("今日大宗市场全系走跌，无正向异动可推。")
+                return
+
+            logger.info("各板块 Top 3 抽取完毕，开始 LLM 归因...")
+            
+            # 5. LLM 面向固定板块归因分析
+            items_desc = ", ".join(flat_top_items)
+            query = f"{items_desc} 期货 涨价 原因 宏观分析 股市关联"
             news_context = data_manager.search(query)
             
-            # 2. LLM 分组及精简提取
             sys_prompt = (
-                "你是一位专业的大宗商品宏观分析师与股票策略师。"
-                "请将提供的若干个发生异动上涨的大宗商品进行同类项合并（将其归入一到多个逻辑关联的主题），"
-                "并根据资讯提炼核心催化剂，最后找出A股和港股中对应的最受益股票（只输出股票的中文简称，比如: 紫金矿业、中国石油）。"
-                "要求高度精简，直接切入核心，不需要输出操作建议或交易思路字段。"
+                "你是一位顶级的大宗商品宏观分析师。系统已从全市场几百个期货合约中，按 5 大基准板块提取了今日领涨的 Top 3 品种。"
+                "请结合传入的即时新闻资讯，对目前发生上涨的板块分别给出极其精简的【宏观催化剂】（如：因红海停发导致运费暴涨），"
+                "并指出A股/港股中该板块对应的核心【受益标的】。"
             )
-            user_prompt = f"本次监控到触发异动上涨的商品及幅度: {items_desc}\n\n相关全网实时资讯:\n{news_context}"
+            user_prompt = f"今日领涨板块及品种:\n{items_desc}\n\n相关全网实时资讯:\n{news_context}"
+
+            try:
+                analysis: DailyCommodityAnalysis = structured_output(
+                    messages=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    response_model=DailyCommodityAnalysis
+                )
+                analysis_dict = {a.theme_name: a for a in analysis.sectors}
+            except Exception as e:
+                logger.error(f"大宗商品 LLM 归因失败: {e}")
+                analysis_dict = {}
+
+            # 6. 组装每日战报
+            today_str = datetime.datetime.now().strftime('%Y-%m-%d')
+            report_lines = [f"🔥 **TradeDB 大宗商品市场复盘 (Top 3 领涨榜单)**\n📅 {today_str}\n"]
             
-            analysis: GroupedAnalysis = structured_output(
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                response_model=GroupedAnalysis
-            )
-            
-            # 3. 组装最终战报
-            report_lines = [f"🔥 **大宗商品异动 (合并版)**"]
-            
-            for grp in analysis.groups:
-                report_lines.append(f"\n🏷️ **板块**: {grp.theme_name}")
+            emoji_map = {
+                "贵金属及有色": "🟡",
+                "黑色系及建材": "⚫",
+                "能源化工": "🛢️",
+                "农畜产品": "🟢",
+                "航运及特殊": "🚢"
+            }
+
+            for cat in CATEGORY_MAP.keys():
+                items = top_commodities_by_sector.get(cat)
+                if not items:
+                    continue
+                    
+                icon = emoji_map.get(cat, "🔹")
+                report_lines.append(f"{icon} **【{cat}】**")
                 
-                # 匹配现价和涨幅，容错处理（LLM有可能没填对原名）
-                details = []
-                for inc_name in grp.included_commodities:
-                    # 尝试找出对应的原item
-                    match = next((x for x in items if inc_name in x['name'] or x['name'] in inc_name), None)
-                    if match:
-                        details.append(f"• {match['name']} (现价: {match['price']}, `+{match['pct_chg']}%`)")
-                    else:
-                        details.append(f"• {inc_name}")
-                        
-                report_lines.append("\n".join(details))
-                report_lines.append(f"\n⚡ **核心催化剂**: {grp.catalyst}")
+                items_str = " | ".join([f"{i['name']}: `+{i['pct_chg']}%`" for i in items])
+                report_lines.append(items_str)
                 
-                stocks_str = "、".join(grp.beneficiary_stocks) if grp.beneficiary_stocks else "暂无明确标的"
-                report_lines.append(f"🎯 **受益标的**: {stocks_str}")
-                report_lines.append("─────────────────")
+                sector_info = analysis_dict.get(cat)
+                if sector_info:
+                    report_lines.append(f"⚡ **催化剂**: {sector_info.catalyst}")
+                    stocks_str = "、".join(sector_info.beneficiary_stocks) if sector_info.beneficiary_stocks else "暂无"
+                    report_lines.append(f"🎯 **受益标的**: {stocks_str}")
+                else:
+                    report_lines.append("⚡ **催化剂**: (AI分板解析受限)")
+                    
+                report_lines.append("") # 空行分隔
                 
-            report = "\n".join(report_lines).strip("\n─")
+            report = "\n".join(report_lines).strip()
             Notifier.broadcast(report)
-            logger.info("大宗商品合并分析推送完成。")
-            
+            logger.info("大宗商品每日战报推送完成。")
+
         except Exception as e:
-            logger.error(f"大宗商品深度归因合并失败: {e}", exc_info=True)
-            # 降级方案：直接推出名称和涨幅
-            fallback_msg = "\n".join([f"• {i['name']} 上涨 {i['pct_chg']}% (现价: {i['price']})" for i in items])
-            Notifier.broadcast(
-                f"⚠️ **大宗商品异动**\n{fallback_msg}\n\n❌ 智能合并分析失败，请手动关注。"
-            )
+            logger.error(f"大宗战报生成失败: {e}", exc_info=True)
+
+    # 兼容老的单例启动接口，防止其他地方调用报错
+    @staticmethod
+    def scan_and_alert():
+        CommodityScanner.generate_daily_report()
