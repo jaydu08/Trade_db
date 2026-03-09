@@ -220,7 +220,7 @@ class CommodityScanner:
                 icon = emoji_map.get(cat, "🔹")
                 report_lines.append(f"{icon} **【{cat}】**")
                 
-                items_str = " | ".join([f"{i['name']}: `+{i['pct_chg']}%`" for i in items])
+                items_str = " | ".join([f"{i['name']}({i['symbol']}) {i['price']} `+{i['pct_chg']}%`" for i in items])
                 report_lines.append(items_str)
                 
                 sector_info = analysis_dict.get(cat)
