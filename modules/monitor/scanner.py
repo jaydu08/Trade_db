@@ -66,13 +66,13 @@ class MonitorService:
             return
 
         for item in active_items:
-            symbol = item["symbol"]
-        for item in active_items:
             symbol = item['symbol']
             quote = quotes_results.get(symbol)
             if not quote:
                 continue
                 
+            pct_chg = quote.get('pct_chg')
+            
             # 仅推送正向涨幅（只监控上涨异动）
             if pct_chg is None or pct_chg <= 0:
                 continue
