@@ -81,8 +81,13 @@ class MonitorService:
             threshold = item.get('alert_threshold_pct', 5.0)
             
             if pct_chg >= threshold:
-                # Check Cooldown
-                today = str(datetime.date.today())
+                # Check Cooldown — 使用各市场本地时区的"今天"，防止北京时间跨日导致美股被误封
+                market = item.get('market', 'CN')
+                import pytz
+                tz_map = {'CN': 'Asia/Shanghai', 'HK': 'Asia/Hong_Kong', 'US': 'America/New_York'}
+                tz = pytz.timezone(tz_map.get(market, 'Asia/Shanghai'))
+                today = str(datetime.datetime.now(tz).date())
+                
                 last_alert_str = item.get('last_alert_at')
                 last_alert = last_alert_str.split()[0] if last_alert_str else None
                 
