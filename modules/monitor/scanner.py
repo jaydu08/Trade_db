@@ -176,6 +176,16 @@ class MonitorService:
         pct = quote['pct_chg']
         price = quote['price']
         
+        # 如果 watchlist 中存的 chat_id 不存在，回退到 TELEGRAM_ADMIN_ID（群组）
+        if not chat_id:
+            import os
+            chat_id = os.getenv("TELEGRAM_ADMIN_ID") or os.getenv("ALLOWED_USER_IDS", "").split(",")[0]
+            try:
+                chat_id = int(chat_id)
+            except (ValueError, TypeError):
+                logger.error("No valid chat_id available for alert. Skipping.")
+                return
+        
         try:
             # 1. Gather Info (Multi-source parallel search)
             news_context = ""
