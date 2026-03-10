@@ -213,8 +213,10 @@ ak.futures_display_main_sina()（拉取全市场约 80+ 个实物主力合约）
 |---|---|
 | `/add 代码或名称` | 添加自选股监控（自动识别A股/港股/美股） |
 | `/list` | 查看当前监控列表 |
-| `/remove 代码` | 移除监控标的 |
-| 任意文本 | 触发 AI 投研问答（ReAct Agent） |
+| `/del 代码` | 移除监控标的 |
+| `/quote 代码` | 实时行情查询 |
+| `/chain 产业名` | 产业链深度挖掘 (已过滤 AI 推理过程) |
+| 任意文本 | 触发 AI 投研问答（被@或群内直接提及即可） |
 
 ---
 
@@ -245,8 +247,9 @@ OPENAI_MODEL=gpt-4o-mini
 
 # Telegram Bot（必填）
 TELEGRAM_BOT_TOKEN=...
-TELEGRAM_ADMIN_ID=...          # 管理员 Telegram User ID（接收广播）
-ALLOWED_USER_IDS=...           # 允许使用Bot的用户ID，逗号分隔
+TELEGRAM_ADMIN_ID=...          # 接收广播推送的群组ID或个人ID (建议填入群组以实现群发)
+ALLOWED_USER_IDS=...           # 允许私聊使用的个人ID，逗号分隔
+ALLOWED_GROUP_IDS=...          # 允许该群组成员全体使用的群组ID，逗号分隔
 
 # 搜索（至少配置一个，否则LLM归因无新闻来源）
 BOCHA_API_KEY=...
