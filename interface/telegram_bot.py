@@ -154,6 +154,10 @@ class TelegramBot:
         self.app.add_handler(CommandHandler("quote", self.cmd_quote))
         self.app.add_handler(CommandHandler("chain", self.cmd_chain))
         self.app.add_handler(CommandHandler("monitor", self.cmd_monitor))
+        # 群组直接可用的快捷指令（斠山指令，不依赖隱私模式）
+        self.app.add_handler(CommandHandler("add", self.cmd_add))
+        self.app.add_handler(CommandHandler("del", self.cmd_del))
+        self.app.add_handler(CommandHandler("list", self.cmd_list))
         self.app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self.handle_message))
 
     async def cmd_monitor(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -221,12 +225,49 @@ class TelegramBot:
         if not await self._check_auth(update): return
         text = (
             "<b>可用指令</b>:\n"
-            "• /quote 600519 (查询茅台)\n"
-            "• /quote 00700 (查询腾讯)\n"
-            "• /chain AI算力 (分析产业链)\n"
+            "• /add 腾讯  (添加自选股监控)\n"
+            "• /del 00700  (移除自选股监控)\n"
+            "• /list  (查看当前监控列表)\n"
+            "• /quote 600519 (查询茅台行情)\n"
+            "• /chain AI算力 (产业链深度分析)\n"
             "• 直接发送问题: '最近光模块有什么利好？'"
         )
         await update.message.reply_text(text, parse_mode="HTML")
+
+    # ──────────────────────────────────────────────────────
+    # 群组快捷指令：/add  /del  /list
+    # ──────────────────────────────────────────────────────
+
+    async def cmd_add(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/add 股票名称 - 添加监控（群组可用）"""
+        if not await self._check_auth(update): return
+        if not context.args:
+            await update.message.reply_text("用法: /add 腾讯  或  /add 00700")
+            return
+        query = " ".join(context.args)
+        await update.message.reply_text(f"🔍 正在识别: {query}...")
+        from modules.monitor.manager import MonitorManager
+        chat_id = update.effective_chat.id
+        msg = await asyncio.to_thread(MonitorManager.add_stock, query, chat_id)
+        await update.message.reply_text(msg)
+
+    async def cmd_del(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/del 代码 - 移除监控（群组可用）"""
+        if not await self._check_auth(update): return
+        if not context.args:
+            await update.message.reply_text("用法: /del 00700")
+            return
+        symbol = context.args[0]
+        from modules.monitor.manager import MonitorManager
+        msg = await asyncio.to_thread(MonitorManager.remove_stock, symbol)
+        await update.message.reply_text(msg)
+
+    async def cmd_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/list - 查看监控列表（群组可用）"""
+        if not await self._check_auth(update): return
+        from modules.monitor.manager import MonitorManager
+        msg = await asyncio.to_thread(MonitorManager.list_stocks)
+        await update.message.reply_text(msg, parse_mode="Markdown")
 
     async def cmd_quote(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """查询行情 (Agent 版)"""
