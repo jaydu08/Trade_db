@@ -93,28 +93,28 @@ class CommodityScanner:
 
             logger.info("正在分批拉取各合约行情数据...")
             # 降低并发数，防止被封 IP 导致进程挂起
+            symbols = list(pool.keys())
             with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-                results = list(executor.map(_fetch_spot, pool.keys()))
+                spot_dfs = list(executor.map(_fetch_spot, symbols))
             
-            valid_dfs = [df for df in results if df is not None]
-            if not valid_dfs:
+            # 保留 (sym, df) 配对关系，确保 symbol 代码始终来自原始 pool
+            valid_pairs = [(sym, df) for sym, df in zip(symbols, spot_dfs) if df is not None]
+            if not valid_pairs:
                 logger.warning("所有合约行情数据均为空。")
                 return
-                
-            df_all = pd.concat(valid_dfs, ignore_index=True)
-            logger.info(f"成功获取 {len(df_all)} 条行情。")
+            logger.info(f"成功获取 {len(valid_pairs)} 个合约的行情。")
 
             # 3. 数据规整与分路存放
             market_data = {cat: [] for cat in CATEGORY_MAP.keys()}
 
-            for _, row in df_all.iterrows():
-                symbol = str(row.get('symbol', ''))
-                name = pool.get(symbol, symbol)
+            for sym, df_spot in valid_pairs:
+                name = pool.get(sym, sym)  # 从主力合约列表取中文名
+                row = df_spot.iloc[0]      # futures_zh_spot 每个代码返回一行
                 
                 # 当前价
                 price = 0.0
                 for price_col in ['current_price', 'last', 'close', '最新价']:
-                    if price_col in row and row[price_col] not in (None, '', 0):
+                    if price_col in row.index and row[price_col] not in (None, '', 0):
                         try:
                             price = float(row[price_col])
                             break
@@ -128,7 +128,7 @@ class CommodityScanner:
                 pct_chg = 0.0
                 ref_price = 0.0
                 for ref_col in ['last_settle_price', 'last_close', 'settle', 'pre_settle']:
-                    if ref_col in row and row[ref_col] not in (None, '', 0):
+                    if ref_col in row.index and row[ref_col] not in (None, '', 0):
                         try:
                             ref_price = float(row[ref_col])
                             break
@@ -139,18 +139,18 @@ class CommodityScanner:
                     pct_chg = round((price - ref_price) / ref_price * 100, 2)
                 else:
                     for pct_col in ['change_percent', 'pct_chg', '涨跌幅', 'change_pct']:
-                        if pct_col in row and row[pct_col] not in (None, ''):
+                        if pct_col in row.index and row[pct_col] not in (None, ''):
                             try:
                                 pct_chg = float(row[pct_col])
                                 break
                             except (ValueError, TypeError):
                                 pass
                 
-                # 确定归属篮子
+                # 确定归属篹子
                 cat = CommodityScanner._determine_category(name)
                 market_data[cat].append({
                     "name": name,
-                    "symbol": symbol,
+                    "symbol": sym,   # 使用源头的期货代码，不是 df 内的列
                     "price": price,
                     "pct_chg": pct_chg
                 })
@@ -160,8 +160,8 @@ class CommodityScanner:
             flat_top_items = []
             
             for cat, items in market_data.items():
-                # 按涨幅降序，只保留正向涨幅
-                positive_items = [i for i in items if i['pct_chg'] > 0]
+                # 按涨幅降序，只保留涨幅 > 5%（过滤小幅波动）
+                positive_items = [i for i in items if i['pct_chg'] > 5.0]
                 sorted_items = sorted(positive_items, key=lambda x: x['pct_chg'], reverse=True)
                 top_3 = sorted_items[:3]
                 

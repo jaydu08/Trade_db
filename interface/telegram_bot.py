@@ -81,15 +81,27 @@ class TelegramBot:
     """
     Telegram Bot 服务
     """
-    def __init__(self, token: str, allowed_users: List[int] = None):
+    def __init__(self, token: str, allowed_users: List[int] = None, allowed_groups: List[int] = None):
         global bot_instance
         self.token = token
         self.allowed_users = allowed_users or []
+        self.allowed_groups = allowed_groups or []  # 允许群组ID，群内所有成员均可使用
         self.app = ApplicationBuilder().token(token).build()
-        # self.llm = get_llm_client() # Replaced by Agent
         
         self._register_handlers()
         bot_instance = self
+
+    @staticmethod
+    def _strip_thought(text: str) -> str:
+        """过滤 ReAct Agent 内部的 Thought/Observation 推理链，只保留干净的输出"""
+        clean_lines = []
+        skip_prefixes = ("Thought:", "Observation:", "Question:", "SEARCH:", "QUOTE:", "DB:")
+        for line in text.split('\n'):
+            stripped = line.strip()
+            if any(stripped.startswith(p) for p in skip_prefixes):
+                continue
+            clean_lines.append(line)
+        return '\n'.join(clean_lines).strip()
 
     @staticmethod
     async def send_alert(message: str):
@@ -117,7 +129,7 @@ class TelegramBot:
         self.app.run_polling()
 
     async def _check_auth(self, update: Update) -> bool:
-        """鉴权"""
+        """鉴权：允许名单用户 + 允许群组的所有成员"""
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         
@@ -125,6 +137,11 @@ class TelegramBot:
         global LAST_CHAT_ID
         LAST_CHAT_ID = chat_id
 
+        # 群组白名单：群内所有成员均可使用，无需单独授权
+        if self.allowed_groups and chat_id in self.allowed_groups:
+            return True
+
+        # 私聊：仍走个人 ID 白名单
         if self.allowed_users and user_id not in self.allowed_users:
             await update.message.reply_text(f"⛔️ Access Denied (ID: {user_id})")
             return False
@@ -247,19 +264,17 @@ class TelegramBot:
                 f"深度分析 {industry} 产业链，包括上中下游和核心龙头股。如果本地不知道，请联网搜索。"
             )
             
-            # Use HTML Renderer
-            html_response = TelegramHTMLRenderer.render(response)
+            # 过滤掉 Thought/Observation 推理链，只保留最终输出
+            clean_response = TelegramBot._strip_thought(response)
+            html_response = TelegramHTMLRenderer.render(clean_response)
             
             if not html_response or not html_response.strip():
-                # Fallback for empty content
-                html_response = response if response else "❌ 分析完成，但生成的内容为空。"
+                html_response = clean_response if clean_response else "❌ 分析完成，但生成的内容为空。"
             
             if len(html_response) > 4000:
-                # Simple split
                 await update.message.reply_text(html_response[:4000], parse_mode="HTML")
                 await update.message.reply_text(html_response[4000:], parse_mode="HTML")
             else:
-                # Use reply_text instead of edit_text to ensure notification
                 await update.message.reply_text(html_response, parse_mode="HTML") 
                 
         except Exception as e:
@@ -309,11 +324,12 @@ class TelegramBot:
             # Run Agent logic
             response = await asyncio.to_thread(agent_executor.run, text)
             
-            # Use HTML Renderer
-            html_response = TelegramHTMLRenderer.render(response)
+            # 过滤掉 Thought/Observation 推理链
+            clean_response = TelegramBot._strip_thought(response)
+            html_response = TelegramHTMLRenderer.render(clean_response)
             
             if not html_response or not html_response.strip():
-                html_response = response if response else "❌ 生成内容为空。"
+                html_response = clean_response if clean_response else "❌ 生成内容为空。"
             
             if len(html_response) > 4000:
                 await status_msg.edit_text(html_response[:4000], parse_mode="HTML")
@@ -335,4 +351,8 @@ def create_bot():
     allowed_ids_str = os.getenv("ALLOWED_USER_IDS", "")
     allowed_ids = [int(i) for i in allowed_ids_str.split(",") if i.strip()]
     
-    return TelegramBot(token, allowed_ids)
+    # Optional: ALLOWED_GROUP_IDS="-100123456789" (群组ID通常为负数)
+    allowed_groups_str = os.getenv("ALLOWED_GROUP_IDS", "")
+    allowed_groups = [int(i) for i in allowed_groups_str.split(",") if i.strip()]
+    
+    return TelegramBot(token, allowed_ids, allowed_groups)
