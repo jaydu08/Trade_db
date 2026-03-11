@@ -31,7 +31,7 @@ class MonitorManager:
             "name": name,
             "added_at": str(datetime.now()),
             "last_alert_at": None,
-            "alert_threshold_pct": 0.1, # DEBUG: Low threshold for testing
+            "alert_threshold_pct": 5.0, # Default to 5.0% move
             "is_active": True,
             "chat_id": chat_id # Save chat_id
         }

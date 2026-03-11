@@ -7,17 +7,17 @@
     "last_alert_at": "2026-03-03 00:00:57.125931",
     "alert_threshold_pct": 5.0,
     "is_active": true,
-    "chat_id": 5573627236
+    "chat_id": -5201901502
   },
   "CRCL": {
     "symbol": "CRCL",
     "market": "US",
     "name": "CRCL",
     "added_at": "2026-02-21 00:29:04.923017",
-    "last_alert_at": "2026-03-03 00:00:58.183546",
+    "last_alert_at": "2026-03-10 23:42:22.304456",
     "alert_threshold_pct": 5.0,
     "is_active": true,
-    "chat_id": 5573627236
+    "chat_id": -5201901502
   },
   "NVDA": {
     "symbol": "NVDA",
@@ -27,17 +27,17 @@
     "last_alert_at": "2026-03-03 00:00:58.919277",
     "alert_threshold_pct": 5.0,
     "is_active": true,
-    "chat_id": 6728885887
+    "chat_id": -5201901502
   },
   "02513": {
     "symbol": "02513",
     "market": "HK",
     "name": "智谱",
     "added_at": "2026-02-26 10:23:09.293113",
-    "last_alert_at": "2026-03-03 09:41:49.987544",
+    "last_alert_at": "2026-03-11 09:52:22.015720",
     "alert_threshold_pct": 5.0,
     "is_active": true,
-    "chat_id": 6728885887
+    "chat_id": -5201901502
   },
   "600036": {
     "symbol": "600036",
@@ -47,26 +47,36 @@
     "last_alert_at": "2026-03-02 09:30:57.026507",
     "alert_threshold_pct": 5.0,
     "is_active": true,
-    "chat_id": 6728885887
+    "chat_id": -5201901502
   },
   "600410": {
     "symbol": "600410",
     "market": "CN",
     "name": "华胜天成",
     "added_at": "2026-02-27 10:22:56.129617",
-    "last_alert_at": "2026-03-03 09:31:49.982948",
+    "last_alert_at": "2026-03-11 09:34:22.091744",
     "alert_threshold_pct": 5.0,
     "is_active": true,
-    "chat_id": 6728885887
+    "chat_id": -5201901502
   },
-  "NFLX": {
-    "symbol": "NFLX",
+  "HIMS": {
+    "symbol": "HIMS",
     "market": "US",
-    "name": "NFLX",
-    "added_at": "2026-02-27 22:40:52.280611",
-    "last_alert_at": "2026-03-03 00:00:59.647244",
+    "name": "HIMS",
+    "added_at": "2026-03-10 23:33:02.459394",
+    "last_alert_at": "2026-03-11 21:33:22.085667",
     "alert_threshold_pct": 5.0,
     "is_active": true,
-    "chat_id": 6728885887
+    "chat_id": -5201901502
+  },
+  "002455": {
+    "symbol": "002455",
+    "market": "CN",
+    "name": "百川股份",
+    "added_at": "2026-03-11 09:29:36.862740",
+    "last_alert_at": "2026-03-11 09:30:22.130285",
+    "alert_threshold_pct": 5.0,
+    "is_active": true,
+    "chat_id": -5201901502
   }
 }
