@@ -234,6 +234,22 @@ class CommodityScanner:
                 report_lines.append("") # 空行分隔
                 
             report = "\n".join(report_lines).strip()
+            
+            # 7. 存入长线趋势种子池
+            try:
+                from modules.monitor.trend_service import TrendService
+                pool_items = []
+                for cat in CATEGORY_MAP.keys():
+                    items = top_commodities_by_sector.get(cat)
+                    if not items: continue
+                    sector_info = analysis_dict.get(cat)
+                    reason = sector_info.catalyst if sector_info else ""
+                    for i in items:
+                        pool_items.append({"symbol": i['symbol'], "name": i['name'], "reason": reason})
+                TrendService.add_to_pool("CF", pool_items)
+            except Exception as e:
+                logger.error(f"Failed to save commodity seeds to TrendSeedPool: {e}")
+
             Notifier.broadcast(report)
             logger.info("大宗商品每日战报推送完成。")
 

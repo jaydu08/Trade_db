@@ -292,6 +292,14 @@ class MarketHeatMap:
             
         # 还原回按涨幅排序 (因为 as_completed 不保证顺序)
         results.sort(key=lambda x: x['pct_chg'], reverse=True)
+        
+        # 5. 存入长线趋势种子池
+        try:
+            from modules.monitor.trend_service import TrendService
+            pool_items = [{"symbol": r["symbol"], "name": r["name"], "reason": r.get("reason", "")} for r in results]
+            TrendService.add_to_pool(market, pool_items)
+        except Exception as e:
+            logger.error(f"Failed to add heatmap results to TrendSeedPool: {e}")
 
         # 4. 组装消息并发送
         market_names = {'CN': 'A股', 'HK': '港股', 'US': '美股'}

@@ -38,3 +38,17 @@ class WatchlistAlert(SQLModel, table=True):
     price: float = Field(default=0.0)
     change_pct: float = Field(default=0.0)
     status: str = Field(default="PENDING", description="处理状态")
+
+
+class TrendSeedPool(SQLModel, table=True):
+    """
+    动量趋势种子池
+    每日上榜的高质异动标的，作为长线趋势重算的初筛缓存池
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    date: dt.date = Field(index=True, description="入榜结算日期")
+    market: str = Field(index=True, description="市场 (CN, HK, US, CF)")
+    symbol: str = Field(index=True, description="标的代码")
+    name: str = Field(default="", description="标的名称")
+    daily_reason: str = Field(default="", description="当日异动发酵理由(用于长线挖掘)")
+    created_at: dt.datetime = Field(default_factory=dt.datetime.utcnow)
