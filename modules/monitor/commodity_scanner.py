@@ -160,8 +160,8 @@ class CommodityScanner:
             flat_top_items = []
             
             for cat, items in market_data.items():
-                # 按涨幅降序，只保留涨幅 > 5%（过滤小幅波动）
-                positive_items = [i for i in items if i['pct_chg'] > 5.0]
+                # 按涨幅降序，只保留涨幅 > 3%（过滤小幅波动）
+                positive_items = [i for i in items if i['pct_chg'] > 3.0]
                 sorted_items = sorted(positive_items, key=lambda x: x['pct_chg'], reverse=True)
                 top_3 = sorted_items[:3]
                 
