@@ -204,8 +204,11 @@ class TrendCalculator:
 
             if market == "CN":
                 # CN 接口通常需要加 sh/sz 或直接用6位代码
-                df = ak.stock_zh_a_hist(symbol=api_symbol, period="daily")
-                # 东财线路被限时，回退到新浪日线接口
+                # 优先尝试 hist 接口，失败则回退新浪日线
+                try:
+                    df = ak.stock_zh_a_hist(symbol=api_symbol, period="daily")
+                except Exception:
+                    df = None
                 if df is None or df.empty:
                     prefixed = f"sh{api_symbol}" if str(api_symbol).startswith("6") else f"sz{api_symbol}"
                     df = ak.stock_zh_a_daily(symbol=prefixed)
