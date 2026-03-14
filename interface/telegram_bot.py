@@ -287,7 +287,9 @@ class TelegramBot:
         logger = logging.getLogger(__name__)
 
         try:
+            logger.info("cmd_trend start: days=%s, handler=TrendReportService", days)
             report_text = await asyncio.to_thread(TrendReportService.build_report, days)
+            logger.info("cmd_trend finish: days=%s, report_len=%s", days, len(report_text))
             await progress_msg.delete()
 
             # Telegram 单条消息最多 4096 字符，安全限制在 4000 左右进行拆包发送
