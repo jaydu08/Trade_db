@@ -106,7 +106,8 @@ class BochaProvider(BaseSearchProvider):
     Bocha AI Search
     """
     def __init__(self):
-        self.api_key = os.getenv("BOCHA_API_KEY", "sk-996761b2cea840f7a68cf72840f1642c") # Default fallback if provided in previous code
+        # Never ship with a hardcoded secret fallback.
+        self.api_key = os.getenv("BOCHA_API_KEY")
         
     @property
     def provider_name(self) -> str:

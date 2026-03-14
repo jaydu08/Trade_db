@@ -36,6 +36,10 @@ class AsyncMarketProber:
         return symbol
 
     @staticmethod
+    def _result_key(symbol: str, market: str) -> str:
+        return f"{str(market).upper()}:{symbol}"
+
+    @staticmethod
     def _parse_sina_response(text: str, market: str, original_symbol: str) -> Optional[Dict[str, Any]]:
         """解析新浪行情单条响应内容 (与原有逻辑兼容)"""
         text = text.strip()
@@ -110,7 +114,7 @@ class AsyncMarketProber:
             items: 包含 {"symbol": "...", "market": "..."} 的字典列表
             
         Returns:
-            Dict mapping symbol -> quote data
+            Dict mapping MARKET:SYMBOL -> quote data
         """
         if not items:
             return {}
@@ -130,10 +134,11 @@ class AsyncMarketProber:
             
             for item, response in zip(items, responses):
                 symbol = item["symbol"]
+                market = item["market"]
                 if isinstance(response, Exception):
-                    logger.error(f"Async probe failed for {symbol}: {response}")
+                    logger.error(f"Async probe failed for {market}:{symbol}: {response}")
                 elif response is not None:
-                    results[symbol] = response
+                    results[self._result_key(symbol, market)] = response
                     
         return results
 

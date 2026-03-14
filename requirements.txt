@@ -5,15 +5,28 @@ sqlmodel>=0.0.14
 sqlalchemy>=2.0.0
 pydantic>=2.0.0
 
+# Scheduling
+apscheduler>=3.10.0
+
 # Data Source
 akshare>=1.12.0
 pandas>=2.0.0
+requests>=2.31.0
+aiohttp>=3.9.0
+tenacity>=8.2.0
+tqdm>=4.66.0
 
 # Vector Database
 chromadb>=0.4.0
 
 # Cache
 diskcache>=5.6.0
+
+# LLM & Bot
+openai>=1.0.0
+httpx>=0.27.0
+python-telegram-bot>=21.0.0
+langchain-text-splitters>=0.2.0
 
 # CLI
 click>=8.0.0
@@ -23,3 +36,4 @@ loguru>=0.7.0
 
 # Utils
 python-dotenv>=1.0.0
+pytz>=2024.1

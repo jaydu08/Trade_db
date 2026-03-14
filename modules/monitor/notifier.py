@@ -30,18 +30,28 @@ class Notifier:
             return
 
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {
+        markdown_payload = {
             "chat_id": chat_id,
             "text": message,
             "parse_mode": "Markdown"
         }
+        plain_payload = {
+            "chat_id": chat_id,
+            "text": message,
+        }
         
         for attempt in range(max_retries):
             try:
-                resp = requests.post(url, json=payload, timeout=10)
+                resp = requests.post(url, json=markdown_payload, timeout=10)
                 if resp.status_code == 200:
                     logger.info(f"Notification sent to {chat_id} (attempt {attempt + 1})")
                     return
+                # Markdown 语法错误时，降级为纯文本重发，避免整条告警丢失
+                if resp.status_code == 400 and "parse" in resp.text.lower():
+                    fallback = requests.post(url, json=plain_payload, timeout=10)
+                    if fallback.status_code == 200:
+                        logger.info(f"Notification sent to {chat_id} in plain text fallback (attempt {attempt + 1})")
+                        return
                 else:
                     logger.warning(
                         f"Telegram API Error (attempt {attempt + 1}/{max_retries}): "

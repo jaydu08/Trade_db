@@ -1,7 +1,6 @@
 import logging
 import re
 from typing import Optional, Tuple
-from duckduckgo_search import DDGS
 from modules.ingestion.akshare_client import akshare_client
 
 logger = logging.getLogger(__name__)

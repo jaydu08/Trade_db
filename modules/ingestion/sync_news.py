@@ -3,13 +3,13 @@
 Sync News - 实时新闻监听
 """
 import logging
+import hashlib
 from datetime import datetime
 import pandas as pd
-from typing import List
+from typing import Dict
 
-from core.db import db_manager, get_collection
+from core.db import get_collection
 from core.llm import get_llm_client
-from domain.vector import MarketEventMetadata
 import akshare as ak
 
 logger = logging.getLogger(__name__)
@@ -96,15 +96,23 @@ class NewsSyncer:
         except Exception:
             return {}
 
-    def sync_news_stream(self, limit: int = 20):
+    def sync_news_stream(self, limit: int = 20) -> Dict[str, int]:
         """
         同步新闻流并分析
         """
+        result = {
+            "fetched": 0,
+            "analyzed": 0,
+            "synced": 0,
+            "skipped": 0,
+            "errors": 0,
+        }
         df = self.fetch_latest_news()
         if df.empty:
             logger.warning("No news fetched.")
-            return
+            return result
 
+        result["fetched"] = len(df)
         logger.info(f"Fetched {len(df)} news items. Analyzing top {limit}...")
         
         # Process latest N
@@ -117,7 +125,9 @@ class NewsSyncer:
                 break
         
         if not content_col:
-            return
+            logger.warning(f"No content column found in news dataframe: {list(df.columns)}")
+            result["errors"] += 1
+            return result
 
         count = 0
         for _, row in df.iterrows():
@@ -128,16 +138,23 @@ class NewsSyncer:
             
             # Analysis
             analysis = self.analyze_event(str(content))
+            result["analyzed"] += 1
             
             if analysis:
-                self._store_event(content, analysis)
+                if self._store_event(str(content), analysis):
+                    result["synced"] += 1
+                else:
+                    result["errors"] += 1
                 count += 1
+            else:
+                result["skipped"] += 1
 
-    def _store_event(self, content: str, analysis: dict):
+        return result
+
+    def _store_event(self, content: str, analysis: dict) -> bool:
         """存入向量库"""
         now = datetime.utcnow().isoformat()
         # Use content hash as ID
-        import hashlib
         doc_id = f"evt_{hashlib.md5(content.encode()).hexdigest()[:10]}"
         
         text = f"【市场事件】{content} (影响: {analysis.get('impact')} {analysis.get('score')})"
@@ -160,7 +177,9 @@ class NewsSyncer:
                 metadatas=[meta]
             )
             logger.info(f"Stored event: {content[:20]}... ({analysis.get('impact')})")
+            return True
         except Exception as e:
             logger.warning(f"Vector store failed: {e}")
+            return False
 
 news_syncer = NewsSyncer()

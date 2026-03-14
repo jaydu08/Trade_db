@@ -61,20 +61,25 @@ class DataManager:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.active_search_providers)) as executor:
             futures = [executor.submit(_fetch, p) for p in self.active_search_providers]
-            
-            for future in concurrent.futures.as_completed(futures, timeout=timeout):
-                try:
-                    p_name, results = future.result()
-                    if results:
-                        formatted = f"【{p_name} 搜索结果】:\n"
-                        for i, r in enumerate(results, 1):
-                            date_str = f"[{r['date']}] " if r.get('date') else ""
-                            formatted += f"{i}. {date_str}{r['title']}: {r['snippet'][:200]}...\n"
-                        all_results_str.append(formatted)
-                except concurrent.futures.TimeoutError:
-                    logger.warning("Search provider timed out.")
-                except Exception as e:
-                    logger.error(f"Error processing search future: {e}")
+            try:
+                for future in concurrent.futures.as_completed(futures, timeout=timeout):
+                    try:
+                        p_name, results = future.result()
+                        if results:
+                            formatted = f"【{p_name} 搜索结果】:\n"
+                            for i, r in enumerate(results, 1):
+                                date_str = f"[{r['date']}] " if r.get('date') else ""
+                                title = r.get("title", "")
+                                snippet = str(r.get("snippet", ""))[:200]
+                                formatted += f"{i}. {date_str}{title}: {snippet}...\n"
+                            all_results_str.append(formatted)
+                    except Exception as e:
+                        logger.error(f"Error processing search future: {e}")
+            except concurrent.futures.TimeoutError:
+                logger.warning("Search aggregation timed out, using partial results.")
+                for f in futures:
+                    if not f.done():
+                        f.cancel()
                     
         if all_results_str:
             return "\n".join(all_results_str)

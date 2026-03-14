@@ -23,6 +23,8 @@ from modules.ingestion.sync_relations import relation_syncer
 from modules.monitor.scanner import MonitorService
 from modules.analysis.heatmap import heatmap_service
 
+ENABLE_E2E_NOTIFY = os.getenv("E2E_NOTIFY", "0") == "1"
+
 def test_infra():
     logger.info("=== TEST 1: Infrastructure (Database & LLM) ===")
     
@@ -48,8 +50,11 @@ def test_infra():
     # 1.3 Telegram
     logger.info("Testing Telegram Bot...")
     try:
-        Notifier.broadcast("🚧 Tradedb 终极压测开始:\n正在验证全部 6 大核心链路...")
-        logger.info("[OK] Telegram message sent via Notifier.")
+        if ENABLE_E2E_NOTIFY:
+            Notifier.broadcast("🚧 Tradedb 终极压测开始:\n正在验证全部 6 大核心链路...")
+            logger.info("[OK] Telegram message sent via Notifier.")
+        else:
+            logger.info("[SKIP] Telegram notify disabled. Set E2E_NOTIFY=1 to enable.")
     except Exception as e:
         logger.error(f"[FAIL] Telegram Bot: {e}")
 
@@ -140,6 +145,7 @@ if __name__ == "__main__":
     time.sleep(1)
     test_heatmap_and_rag()
     
-    Notifier.broadcast("✅ Tradedb 终极压测完毕:\n所有的核心数据链路验证结束，请查看后端日志以确认全部 Success。")
+    if ENABLE_E2E_NOTIFY:
+        Notifier.broadcast("✅ Tradedb 终极压测完毕:\n所有的核心数据链路验证结束，请查看后端日志以确认全部 Success。")
     
     logger.info(f"🎉 All tests executed in {time.time() - start:.2f} seconds.")

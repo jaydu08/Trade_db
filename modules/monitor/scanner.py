@@ -6,7 +6,6 @@ from pydantic import BaseModel, Field
 
 from modules.monitor.repository import WatchlistRepository
 from modules.monitor.notifier import Notifier
-from modules.ingestion.akshare_client import akshare_client
 from core.llm import structured_output, simple_prompt
 from core.db import get_collection
 import hashlib
@@ -67,7 +66,9 @@ class MonitorService:
 
         for item in active_items:
             symbol = item['symbol']
-            quote = quotes_results.get(symbol)
+            market = item.get('market', 'CN')
+            item_key = WatchlistRepository.build_item_key(symbol, market)
+            quote = quotes_results.get(item_key)
             if not quote:
                 continue
                 
@@ -82,7 +83,6 @@ class MonitorService:
             
             if pct_chg >= threshold:
                 # Check Cooldown — 使用各市场本地时区的"今天"，防止北京时间跨日导致美股被误封
-                market = item.get('market', 'CN')
                 import pytz
                 tz_map = {'CN': 'Asia/Shanghai', 'HK': 'Asia/Hong_Kong', 'US': 'America/New_York'}
                 tz = pytz.timezone(tz_map.get(market, 'Asia/Shanghai'))
@@ -100,7 +100,7 @@ class MonitorService:
                     
                     # Update State
                     item['last_alert_at'] = str(datetime.datetime.now())
-                    repo.add_item(symbol, item)
+                    repo.upsert_by_symbol_market(item)
 
     @staticmethod
     def _is_market_open(market: str) -> bool:

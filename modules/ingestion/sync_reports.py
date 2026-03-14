@@ -3,14 +3,11 @@
 Sync Reports - 研报同步与逻辑提取
 """
 import logging
-from datetime import datetime, timedelta
-import pandas as pd
+from datetime import datetime
 from tqdm import tqdm
 
-from core.db import db_manager, get_collection
+from core.db import get_collection
 from core.llm import get_llm_client
-from modules.ingestion.akshare_client import akshare_client
-from domain.vector import IndustryKnowledgeMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -21,24 +18,6 @@ class ReportSyncer:
     def __init__(self):
         self.llm = get_llm_client()
         self.collection = get_collection("industry_knowledge") # 存入知识库
-
-    def fetch_latest_reports(self, limit: int = 50) -> pd.DataFrame:
-        """获取最近的研报"""
-        logger.info("Fetching latest research reports...")
-        try:
-            # 东方财富-研报中心-个股研报
-            df = akshare_client._safe_call(["stock_report_fund_em"], symbol="全部", date="最近24小时")
-            # 如果接口变动，可能需要调整参数或使用其他接口
-            # 备选: stock_news_em (个股新闻), stock_report_disclosure (公告)
-            # AkShare 研报接口较多，这里尝试通过 report 关键字查找最稳定的
-            # 实际上 ak.stock_em_yjyg (业绩预告) 也是一种，但我们更想要 深度研报
-            
-            # Let's try to get industry reports which contain more chain logic
-            # ak.stock_report_industry_em()
-            return pd.DataFrame() # Placeholder, wait for test to find correct api
-        except Exception as e:
-            logger.warning(f"Failed to fetch reports: {e}")
-            return pd.DataFrame()
 
     def extract_logic(self, title: str, content: str) -> dict:
         """
@@ -70,12 +49,13 @@ class ReportSyncer:
         except Exception:
             return {}
 
-    def sync_industry_reports(self):
+    def sync_industry_reports(self) -> dict:
         """
         同步行业研报 (含金量最高)
         """
         import akshare as ak
         logger.info("Syncing industry reports...")
+        result = {"fetched": 0, "synced": 0, "skipped": 0, "errors": 0}
         
         try:
             # 获取最近的行业研报
@@ -92,29 +72,30 @@ class ReportSyncer:
             if hasattr(ak, "stock_report_industry_eastmoney"):
                 df = ak.stock_report_industry_eastmoney()
             elif hasattr(ak, "stock_report_fund_em"):
-                 # This is "fund" report, might not be industry.
-                 # Let's use `stock_zh_a_spot_em`? No.
-                 # `stock_news_em` is news.
-                 
-                 # Fallback: fetch concept board news?
-                 # Let's try `stock_report_disclosure` which is official announcements.
-                 
-                 # Let's try to search for "industry" in ak
-                 candidates = [f for f in dir(ak) if "report" in f and "industry" in f]
-                 if candidates:
-                     func = getattr(ak, candidates[0])
-                     df = func()
-                 else:
-                     logger.warning("No industry report API found.")
-                     return
+                # This is "fund" report, might not be industry.
+                # Let's use `stock_zh_a_spot_em`? No.
+                # `stock_news_em` is news.
+
+                # Fallback: fetch concept board news?
+                # Let's try `stock_report_disclosure` which is official announcements.
+
+                # Let's try to search for "industry" in ak
+                candidates = [f for f in dir(ak) if "report" in f and "industry" in f]
+                if candidates:
+                    func = getattr(ak, candidates[0])
+                    df = func()
+                else:
+                    logger.warning("No industry report API found.")
+                    return result
             else:
-                 return
+                return result
 
             if df.empty:
                 logger.warning("No industry reports found.")
-                return
+                return result
 
-            print(f"Found {len(df)} industry reports. Extracting logic...")
+            result["fetched"] = len(df)
+            logger.info(f"Found {len(df)} industry reports. Extracting logic...")
             
             for _, row in tqdm(df.iterrows(), total=len(df)):
                 title = row.get("报告名称", "")
@@ -123,19 +104,29 @@ class ReportSyncer:
                 # 这里假设 title 本身就包含很多信息，或者我们有摘要字段
                 # 实际 akshare 返回 columns: 报告名称, 报告日期, 机构名称, 行业, 评级...
                 
-                if not title: continue
+                if not title:
+                    result["skipped"] += 1
+                    continue
                 
                 # LLM 提取
                 logic_data = self.extract_logic(title, f"行业: {industry}")
                 
                 if logic_data and logic_data.get("logic"):
                     # 存入向量库
-                    self._store_to_vector(industry, title, logic_data)
+                    if self._store_to_vector(industry, title, logic_data):
+                        result["synced"] += 1
+                    else:
+                        result["errors"] += 1
+                else:
+                    result["skipped"] += 1
+            return result
                     
         except Exception as e:
             logger.error(f"Industry report sync failed: {e}")
+            result["errors"] += 1
+            return result
 
-    def _store_to_vector(self, industry: str, title: str, data: dict):
+    def _store_to_vector(self, industry: str, title: str, data: dict) -> bool:
         """存入向量库"""
         now = datetime.utcnow().isoformat()
         doc_id = f"report_{hash(title)}"
@@ -160,7 +151,9 @@ class ReportSyncer:
                 metadatas=[meta]
             )
             logger.info(f"Stored report logic: {title[:20]}...")
+            return True
         except Exception as e:
             logger.warning(f"Vector store failed: {e}")
+            return False
 
 report_syncer = ReportSyncer()
