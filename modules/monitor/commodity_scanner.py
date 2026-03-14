@@ -239,6 +239,7 @@ class CommodityScanner:
             try:
                 from modules.monitor.trend_service import TrendService
                 pool_items = []
+                bar_items = []
                 for cat in CATEGORY_MAP.keys():
                     items = top_commodities_by_sector.get(cat)
                     if not items: continue
@@ -246,7 +247,16 @@ class CommodityScanner:
                     reason = sector_info.catalyst if sector_info else ""
                     for i in items:
                         pool_items.append({"symbol": i['symbol'], "name": i['name'], "reason": reason})
+                        bar_items.append({
+                            "symbol": i['symbol'],
+                            "name": i['name'],
+                            "price": float(i.get('price', 0) or 0),
+                            "pct_chg": float(i.get('pct_chg', 0) or 0),
+                            "amount": 0.0,
+                            "turnover_rate": 0.0,
+                        })
                 TrendService.add_to_pool("CF", pool_items)
+                TrendService.save_daily_bars("CF", bar_items, source="commodity")
             except Exception as e:
                 logger.error(f"Failed to save commodity seeds to TrendSeedPool: {e}")
 

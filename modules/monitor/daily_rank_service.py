@@ -31,6 +31,7 @@ class DailyRankService:
         today = date.today()
         
         with db_manager.ledger_session() as session:
+            bar_buffer = {}
             for market in markets:
                 if not DailyRankService._should_sync_today(market):
                     logger.info(f"Skipping {market} daily rank sync: Not a valid reporting day (Weekend).")
@@ -63,18 +64,34 @@ class DailyRankService:
                         # 仅保留正涨幅数据
                         if float(row["change_pct"]) <= 0:
                             continue
+                        symbol = str(row["symbol"])
+                        name = str(row["name"])
+                        price = float(row["price"])
+                        change_pct = float(row["change_pct"])
+                        amount = float(row["amount"])
+                        turnover_rate = float(row["turnover_rate"])
                         r = DailyRank(
                             date=today,
                             market=market,
                             rank_type=rank_type,
-                            symbol=str(row["symbol"]),
-                            name=str(row["name"]),
-                            price=float(row["price"]),
-                            change_pct=float(row["change_pct"]),
-                            amount=float(row["amount"]),
-                            turnover_rate=float(row["turnover_rate"]),
+                            symbol=symbol,
+                            name=name,
+                            price=price,
+                            change_pct=change_pct,
+                            amount=amount,
+                            turnover_rate=turnover_rate,
                         )
                         ranks.append(r)
+                        key = (market, symbol)
+                        if key not in bar_buffer or amount > bar_buffer[key]["amount"]:
+                            bar_buffer[key] = {
+                                "symbol": symbol,
+                                "name": name,
+                                "price": price,
+                                "pct_chg": change_pct,
+                                "amount": amount,
+                                "turnover_rate": turnover_rate,
+                            }
                         
                     session.add_all(ranks)
                     logger.info(f"[OK] 已写入 {len(ranks)} 条数据到每日榜单: {market} - {rank_type}")
@@ -105,6 +122,18 @@ class DailyRankService:
             # 提交事务
             session.commit()
             logger.info(f"All requested daily ranks synced successfully for {today}.")
+
+        # 写入趋势日线快照（与 DailyRank 解耦，避免单事务过重）
+        if bar_buffer:
+            try:
+                from modules.monitor.trend_service import TrendService
+                by_market = {}
+                for (mkt, _), payload in bar_buffer.items():
+                    by_market.setdefault(mkt, []).append(payload)
+                for mkt, payloads in by_market.items():
+                    TrendService.save_daily_bars(mkt, payloads, source="daily_rank")
+            except Exception as e:
+                logger.error(f"Failed to save TrendDailyBar from DailyRank: {e}")
 
     @staticmethod
     def _should_sync_today(market: str) -> bool:

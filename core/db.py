@@ -135,7 +135,7 @@ class DatabaseManager:
         # 导入所有 Ledger 模型
         from domain.ledger import (
             Strategy, StrategyRun, Signal, SignalExt, Order, Position,
-            DailyRank, WatchlistAlert, TrendSeedPool
+            DailyRank, WatchlistAlert, TrendSeedPool, TrendDailyBar
         )
         # Ledger 表需要单独创建，因为使用不同的 engine
         # 这里需要过滤出 ledger 相关的表
@@ -149,6 +149,7 @@ class DatabaseManager:
             DailyRank.__table__,
             WatchlistAlert.__table__,
             TrendSeedPool.__table__,
+            TrendDailyBar.__table__,
         ]
         for table in ledger_tables:
             table.create(self.ledger_engine, checkfirst=True)

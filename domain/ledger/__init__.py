@@ -5,7 +5,7 @@ from domain.ledger.strategy import Strategy, StrategyRun
 from domain.ledger.signal import Signal, SignalExt
 from domain.ledger.order import Order
 from domain.ledger.position import Position
-from domain.ledger.analytics import DailyRank, WatchlistAlert, TrendSeedPool
+from domain.ledger.analytics import DailyRank, WatchlistAlert, TrendSeedPool, TrendDailyBar
 
 __all__ = [
     "Strategy",
@@ -17,4 +17,5 @@ __all__ = [
     "DailyRank",
     "WatchlistAlert",
     "TrendSeedPool",
+    "TrendDailyBar",
 ]

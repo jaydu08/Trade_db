@@ -308,6 +308,18 @@ class MarketHeatMap:
             from modules.monitor.trend_service import TrendService
             pool_items = [{"symbol": r["symbol"], "name": r["name"], "reason": r.get("reason", "")} for r in results]
             TrendService.add_to_pool(market, pool_items)
+            bar_items = [
+                {
+                    "symbol": r.get("symbol", ""),
+                    "name": r.get("name", ""),
+                    "price": float(r.get("price", 0) or 0),
+                    "pct_chg": float(r.get("pct_chg", 0) or 0),
+                    "amount": float(r.get("amount", 0) or 0),
+                    "turnover_rate": float(r.get("turnover", 0) or 0),
+                }
+                for r in results
+            ]
+            TrendService.save_daily_bars(market, bar_items, source="heatmap")
         except Exception as e:
             logger.error(f"Failed to add heatmap results to TrendSeedPool: {e}")
 

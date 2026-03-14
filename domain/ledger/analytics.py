@@ -52,3 +52,23 @@ class TrendSeedPool(SQLModel, table=True):
     name: str = Field(default="", description="标的名称")
     daily_reason: str = Field(default="", description="当日异动发酵理由(用于长线挖掘)")
     created_at: dt.datetime = Field(default_factory=dt.datetime.utcnow)
+
+
+class TrendDailyBar(SQLModel, table=True):
+    """
+    趋势日线快照
+    记录趋势候选标的的每日截面行情，用于离线重算 trend7/trend30。
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    date: dt.date = Field(index=True, description="交易日期")
+    market: str = Field(index=True, description="市场 (CN, HK, US, CF)")
+    symbol: str = Field(index=True, description="标的代码")
+    name: str = Field(default="", description="标的名称")
+    open: float = Field(default=0.0, description="开盘价")
+    high: float = Field(default=0.0, description="最高价")
+    low: float = Field(default=0.0, description="最低价")
+    close: float = Field(default=0.0, description="收盘/最新价")
+    amount: float = Field(default=0.0, description="成交额")
+    turnover_rate: float = Field(default=0.0, description="换手率(%)")
+    source: str = Field(default="", description="来源: heatmap/commodity/daily_rank")
+    updated_at: dt.datetime = Field(default_factory=dt.datetime.utcnow)

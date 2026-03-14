@@ -6,7 +6,7 @@ from sqlmodel import select
 from typing import List, Dict, Tuple
 
 from core.db import get_ledger_session
-from domain.ledger.analytics import TrendSeedPool, DailyRank
+from domain.ledger.analytics import TrendSeedPool, DailyRank, TrendDailyBar
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +54,78 @@ class TrendService:
             logger.info(f"TrendSeedPool: Saved {len(items)} items for {market}")
         except Exception as e:
             logger.error(f"Failed to add to TrendSeedPool: {e}")
+
+    @staticmethod
+    def save_daily_bars(market: str, items: List[Dict], source: str = ""):
+        """
+        保存趋势标的的每日行情快照（滚动保留 180 天）。
+        items: [{"symbol","name","price","pct_chg","amount","turnover_rate","open","high","low"}]
+        """
+        today = dt.date.today()
+        cutoff = today - dt.timedelta(days=180)
+
+        try:
+            with get_ledger_session() as session:
+                for item in items:
+                    sym = str(item.get("symbol", "")).strip()
+                    if not sym:
+                        continue
+
+                    close = float(item.get("price", 0) or 0)
+                    if close <= 0:
+                        continue
+
+                    pct = float(item.get("pct_chg", 0) or 0)
+                    open_price = float(item.get("open", 0) or 0)
+                    if open_price <= 0:
+                        den = 1 + pct / 100.0
+                        open_price = close / den if den > 0 else close
+
+                    high = float(item.get("high", 0) or 0)
+                    low = float(item.get("low", 0) or 0)
+                    amount = float(item.get("amount", 0) or 0)
+                    turnover_rate = float(item.get("turnover_rate", 0) or 0)
+
+                    stmt = select(TrendDailyBar).where(
+                        TrendDailyBar.date == today,
+                        TrendDailyBar.market == market,
+                        TrendDailyBar.symbol == sym,
+                    )
+                    existing = session.exec(stmt).first()
+
+                    if existing:
+                        existing.name = item.get("name", existing.name or "")
+                        existing.close = close
+                        existing.open = open_price
+                        existing.high = high if high > 0 else max(close, open_price)
+                        existing.low = low if low > 0 else min(close, open_price)
+                        existing.amount = amount
+                        existing.turnover_rate = turnover_rate
+                        if source:
+                            existing.source = source
+                        existing.updated_at = dt.datetime.utcnow()
+                    else:
+                        bar = TrendDailyBar(
+                            date=today,
+                            market=market,
+                            symbol=sym,
+                            name=item.get("name", ""),
+                            close=close,
+                            open=open_price,
+                            high=high if high > 0 else max(close, open_price),
+                            low=low if low > 0 else min(close, open_price),
+                            amount=amount,
+                            turnover_rate=turnover_rate,
+                            source=source,
+                        )
+                        session.add(bar)
+
+                old_stmt = select(TrendDailyBar).where(TrendDailyBar.date < cutoff)
+                for row in session.exec(old_stmt).all():
+                    session.delete(row)
+            logger.info(f"TrendDailyBar: saved {len(items)} items for {market}, source={source}")
+        except Exception as e:
+            logger.error(f"Failed to save TrendDailyBar for {market}: {e}")
 
 class TrendCalculator:
     @staticmethod
@@ -103,6 +175,42 @@ class TrendCalculator:
             past_price = uniq[past_dates[-1]]
         else:
             past_price = uniq[dates[0]]
+
+        if past_price <= 0:
+            return 0.0, round(current_price, 4)
+        ret = round((current_price - past_price) / past_price * 100, 2)
+        return ret, round(current_price, 4)
+
+    @staticmethod
+    def _get_return_from_daily_bar_db(symbol: str, market: str, d_days: int) -> Tuple[float, float]:
+        """优先使用本地 TrendDailyBar 序列计算 N 日收益"""
+        raw = str(symbol or "").strip()
+        candidates = [raw]
+        if market == "US" and "." in raw:
+            candidates.append(raw.split(".")[-1].strip())
+
+        with get_ledger_session() as session:
+            stmt = (
+                select(TrendDailyBar)
+                .where(TrendDailyBar.market == market)
+                .where(TrendDailyBar.symbol.in_(candidates))
+                .order_by(TrendDailyBar.date.desc())
+            )
+            rows = list(session.exec(stmt).all())
+
+        uniq = {}
+        for r in rows:
+            if r.close and r.close > 0:
+                uniq[r.date] = float(r.close)
+        if not uniq:
+            return 0.0, 0.0
+
+        dates = sorted(uniq.keys())
+        current_date = dates[-1]
+        current_price = uniq[current_date]
+        target_date = current_date - dt.timedelta(days=d_days)
+        past_dates = [d for d in dates if d <= target_date]
+        past_price = uniq[past_dates[-1]] if past_dates else uniq[dates[0]]
 
         if past_price <= 0:
             return 0.0, round(current_price, 4)
@@ -198,6 +306,14 @@ class TrendCalculator:
         import pandas as pd
         from datetime import timedelta
         
+        # 先走本地快照库，避免周末/接口波动导致全0
+        try:
+            db_ret = TrendCalculator._get_return_from_daily_bar_db(symbol, market, d_days)
+            if db_ret != (0.0, 0.0):
+                return db_ret
+        except Exception as e:
+            logger.debug(f"TrendDailyBar fallback failed for {symbol} ({market}): {e}")
+
         try:
             df = None
             api_symbol = TrendCalculator._normalize_symbol_for_api(symbol, market)
