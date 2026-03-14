@@ -230,8 +230,8 @@ class TelegramBot:
             "• /del 00700  (移除自选股监控)\n"
             "• /list  (查看当前监控列表)\n"
             "• /quote 600519 (查询茅台行情)\n"
-            "📉 /trend [N] - 分析最近 N天(默认7天) 各市场涨跌金股趋势，带AI深度归因\n"
-            "   (目前支持: CN/HK/US/商品，N建议写7或30)\n"
+            "📉 /trend [N] - 输出最近 N天(默认7天) 多市场趋势简报\n"
+            "   (支持: A股/港股/美股/期货，N建议7或30)\n"
             "🔍 /chain <标的> [指令] - 组合查询 (例如: /chain 腾讯 最新消息)\n"
             "• 直接发送问题: '最近光模块有什么利好？'"
         )
@@ -280,54 +280,24 @@ class TelegramBot:
         if context.args and context.args[0].isdigit():
             days = int(context.args[0])
             
-        progress_msg = await update.message.reply_text(f"⏳ 正在收集全市场 {days} 日长线趋势种子，计算真实累计涨幅并交由大模型提取主线逻辑，预计需要几十秒，请稍候...")
-        
-        from modules.monitor.trend_service import TrendCalculator
-        from core.llm import simple_prompt
-        import asyncio
+        progress_msg = await update.message.reply_text(f"⏳ 正在生成 {days} 日趋势简报（含现价与涨幅），请稍候...")
+
+        from modules.monitor.trend_report_service import TrendReportService
         import logging
         logger = logging.getLogger(__name__)
-        
-        try:
-            # 1. 后台计算涨幅榜单
-            tops = await asyncio.to_thread(TrendCalculator.calculate_trend, days)
-            
-            if not tops:
-                await progress_msg.edit_text(f"📭 最近 {days} 日内没有积累到任何有价值的趋势种子，大宗和股市均较弱。")
-                return
 
-            market_names = {'CN': 'A股', 'HK': '港股', 'US': '美股', 'CF': '大宗商品'}
-            
+        try:
+            report_text = await asyncio.to_thread(TrendReportService.build_report, days)
             await progress_msg.delete()
-            
-            # 2. 对每个市场前 10 名并发展开 LLM 梳理
-            async def process_market(mkt, stks):
-                mkt_name = market_names.get(mkt, mkt)
-                sys_msg = (
-                    "你是一位顶级的量化宏观分析师。以下是一份按照累计涨幅降序排列的核心资产趋势榜单（附带收集到的发酵理由）。"
-                    "请提取出它们对应的【主营业务】补充解释原有理由形成【核心归因】，并总结出当前市场的**主线逻辑(宏大叙事)**和**资金抱团特征(赛道聚焦)**。"
-                    "要求排版精简且专业，直接输出纯文本搭配Emoji，**绝对不要使用任何 Markdown 的粗体星号(*)、下划线(_)等标记符号**，以防发送渲染错误。"
-                )
-                user_msg = f"市场: {mkt_name}\n清单:\n"
-                for i, s in enumerate(stks, 1):
-                    user_msg += f"{i}. {s['name']}({s['symbol']}) 累计涨跌: {s['return_pct']}%\n聚合异动理由: {s['aggregated_reason']}\n\n"
-                    
-                analysis = await asyncio.to_thread(simple_prompt, f"{sys_msg}\n\n{user_msg}")
-                return f"====== 🔥 {mkt_name} 动量趋势榜单 ({days} 日) ======\n\n{analysis}\n"
-                
-            tasks = [process_market(m, s) for m, s in tops.items()]
-            results = await asyncio.gather(*tasks)
-            
-            report_text = "\n\n".join(results)
-            
+
             # Telegram 单条消息最多 4096 字符，安全限制在 4000 左右进行拆包发送
             chunk_size = 4000
             for i in range(0, len(report_text), chunk_size):
                 await update.message.reply_text(report_text[i:i+chunk_size])
-                
+
         except Exception as e:
             logger.error(f"Trend cmd failed: {e}", exc_info=True)
-            await progress_msg.edit_text(f"❌ 趋势挖掘失败: {e}")
+            await progress_msg.edit_text(f"❌ 趋势简报生成失败: {e}")
 
     async def cmd_quote(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """查询行情 (Agent 版)"""

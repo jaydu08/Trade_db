@@ -125,21 +125,21 @@ class TaskScheduler:
             replace_existing=True
         )
         
-        # 7. 7日监控战报 (每周五 18:00)
+        # 7. Trend 7日简报 (每周日 10:00)
         self.scheduler.add_job(
-            self._job_report_7d,
-            CronTrigger(day_of_week='fri', hour=18, minute=0),
-            id="report_7d",
-            name="7日表现战报",
+            self._job_trend_7d,
+            CronTrigger(day_of_week='sun', hour=10, minute=0),
+            id="trend_7d",
+            name="7日趋势简报",
             replace_existing=True
         )
         
-        # 8. 30日监控战报 (每月最后一天 18:30)
+        # 8. Trend 30日简报 (每月最后一天 11:00)
         self.scheduler.add_job(
-            self._job_report_30d,
-            CronTrigger(day='last', hour=18, minute=30),
-            id="report_30d",
-            name="30日表现战报",
+            self._job_trend_30d,
+            CronTrigger(day='last', hour=11, minute=0),
+            id="trend_30d",
+            name="30日趋势简报",
             replace_existing=True
         )
         
@@ -192,15 +192,15 @@ class TaskScheduler:
         from modules.monitor.commodity_scanner import CommodityScanner
         self._run_job("commodity_scan", CommodityScanner.generate_daily_report)
 
-    def _job_report_7d(self):
-        """Job: 7日表现战报"""
-        from modules.monitor.performance_report import PerformanceReportService
-        self._run_job("report_7d", PerformanceReportService.generate_and_push_report, 7)
+    def _job_trend_7d(self):
+        """Job: 7日趋势简报"""
+        from modules.monitor.trend_report_service import TrendReportService
+        self._run_job("trend_7d", TrendReportService.generate_and_push, 7)
 
-    def _job_report_30d(self):
-        """Job: 30日表现战报"""
-        from modules.monitor.performance_report import PerformanceReportService
-        self._run_job("report_30d", PerformanceReportService.generate_and_push_report, 30)
+    def _job_trend_30d(self):
+        """Job: 30日趋势简报"""
+        from modules.monitor.trend_report_service import TrendReportService
+        self._run_job("trend_30d", TrendReportService.generate_and_push, 30)
 
     def _job_sync_fundamentals(self):
         """Job: 全市场基本面与分析更新 (深水区任务)"""

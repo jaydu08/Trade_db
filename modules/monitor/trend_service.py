@@ -1,7 +1,9 @@
 import logging
 import datetime as dt
+import re
+from difflib import SequenceMatcher
 from sqlmodel import Session, select
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 from core.db import get_ledger_session
 from domain.ledger.analytics import TrendSeedPool
@@ -55,12 +57,93 @@ class TrendService:
 
 class TrendCalculator:
     @staticmethod
-    def _get_return(symbol: str, market: str, d_days: int) -> float:
-        """获取标的 N 天前的真实累计涨幅 (基于日K线)"""
+    def _normalize_reason(reason: str) -> str:
+        """归一化理由文本，用于判定“同类理由”"""
+        if not reason:
+            return ""
+        text = str(reason).strip().lower()
+        # 去掉 markdown 与常见噪声词
+        text = re.sub(r"[`*_#>\[\]\(\)\|]+", " ", text)
+        text = re.sub(r"(未找到明显新闻催化|暂无新闻催化|分析原因失败|ai分板解析受限)", " ", text)
+        # 去掉数字/百分号等波动噪声
+        text = re.sub(r"[\d\.\-%％]+", " ", text)
+        # 仅保留中英文数字
+        text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fa5]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    @staticmethod
+    def _is_similar_reason(a: str, b: str, threshold: float = 0.82) -> bool:
+        """粗粒度相似度判定：用于同票同类理由去重"""
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        return SequenceMatcher(None, a, b).ratio() >= threshold
+
+    @staticmethod
+    def _aggregate_reasons_with_decay(
+        reason_records: List[Tuple[dt.date, str]],
+        today: dt.date,
+        decay_base: float = 0.88,
+    ) -> Tuple[str, float]:
+        """
+        聚合理由：
+        1) 同票同类理由去重（避免连续5天重复理由被5倍累加）
+        2) 越新的信号权重越高（指数衰减）
+        返回: (聚合理由文本, 信号强度分)
+        """
+        # 按日期从新到旧，优先保留最新语义与更高权重
+        sorted_records = sorted(reason_records, key=lambda x: x[0], reverse=True)
+
+        buckets: List[dict] = []
+        for r_date, raw_reason in sorted_records:
+            if not raw_reason:
+                continue
+            if "分析原因失败" in raw_reason:
+                continue
+
+            norm = TrendCalculator._normalize_reason(raw_reason)
+            if not norm:
+                continue
+
+            days_ago = max((today - r_date).days, 0)
+            weight = decay_base ** days_ago
+
+            matched = False
+            for b in buckets:
+                if TrendCalculator._is_similar_reason(norm, b["norm"]):
+                    # 同类理由不重复累加，只保留权重更高（更近）的那次
+                    if weight > b["weight"]:
+                        b["weight"] = weight
+                        b["date"] = r_date
+                        b["reason"] = raw_reason.strip()
+                    matched = True
+                    break
+
+            if not matched:
+                buckets.append({
+                    "norm": norm,
+                    "reason": raw_reason.strip(),
+                    "weight": weight,
+                    "date": r_date,
+                })
+
+        if not buckets:
+            return "暂无新闻催化", 0.0
+
+        buckets.sort(key=lambda x: x["weight"], reverse=True)
+        top_reasons = buckets[:3]
+        aggregated_reason = " | ".join([b["reason"] for b in top_reasons])
+        signal_strength = round(sum(b["weight"] for b in top_reasons), 3)
+        return aggregated_reason, signal_strength
+
+    @staticmethod
+    def _get_return(symbol: str, market: str, d_days: int) -> Tuple[float, float]:
+        """获取标的 N 天前的真实累计涨幅和现价 (基于日K线)"""
         import akshare as ak
         import pandas as pd
-        import time
-        from datetime import datetime, timedelta
+        from datetime import timedelta
         
         try:
             df = None
@@ -78,14 +161,14 @@ class TrendCalculator:
                 df = ak.futures_zh_daily_sina(symbol=symbol)
                 
             if df is None or df.empty:
-                return 0.0
+                return 0.0, 0.0
 
             # 字段归一化处理
             date_col = "date" if "date" in df.columns else "日期"
             close_col = "close" if "close" in df.columns else "收盘"
             
             if date_col not in df.columns or close_col not in df.columns:
-                return 0.0
+                return 0.0, 0.0
                 
             df[date_col] = pd.to_datetime(df[date_col])
             df = df.sort_values(by=date_col).reset_index(drop=True)
@@ -105,12 +188,13 @@ class TrendCalculator:
                 past_close = float(past_df.iloc[-1][close_col])
                 
             if past_close <= 0:
-                return 0.0
-                
-            return round((current_close - past_close) / past_close * 100, 2)
+                return 0.0, current_close
+
+            ret = round((current_close - past_close) / past_close * 100, 2)
+            return ret, round(current_close, 4)
         except Exception as e:
             logger.debug(f"Calculate return failed for {symbol} ({market}): {e}")
-            return 0.0
+            return 0.0, 0.0
 
     @staticmethod
     def calculate_trend(days: int = 7) -> Dict[str, List[Dict]]:
@@ -125,7 +209,18 @@ class TrendCalculator:
         # 1. 查询种子池
         with get_ledger_session() as session:
             stmt = select(TrendSeedPool).where(TrendSeedPool.date >= cutoff)
-            records = session.exec(stmt).all()
+            rows = session.exec(stmt).all()
+            # 避免 session 关闭后 ORM 对象懒加载导致 DetachedInstanceError
+            records = [
+                {
+                    "market": r.market,
+                    "symbol": r.symbol,
+                    "name": r.name,
+                    "date": r.date,
+                    "daily_reason": r.daily_reason,
+                }
+                for r in rows
+            ]
             
         if not records:
             return {}
@@ -133,26 +228,37 @@ class TrendCalculator:
         # 2. 按市场和代码去重合并理由
         grouped = defaultdict(dict)
         for r in records:
-            key = (r.market, r.symbol)
+            key = (r["market"], r["symbol"])
             if key not in grouped:
                 grouped[key] = {
-                    "market": r.market,
-                    "symbol": r.symbol,
-                    "name": r.name,
-                    "reasons": set()
+                    "market": r["market"],
+                    "symbol": r["symbol"],
+                    "name": r["name"],
+                    "reason_records": []
                 }
-            if r.daily_reason:
-                grouped[key]["reasons"].add(r.daily_reason.strip())
+            if r["daily_reason"]:
+                grouped[key]["reason_records"].append((r["date"], r["daily_reason"].strip()))
                 
         items = list(grouped.values())
         
         # 3. 并发查 N 日涨幅
         def _process(item: dict):
-            ret = TrendCalculator._get_return(item["symbol"], item["market"], days)
+            ret, current_price = TrendCalculator._get_return(item["symbol"], item["market"], days)
             item["return_pct"] = ret
-            # 将多日的理由合并成一条主线索，供下游 LLM 做宏大叙事归纳
-            lines = [r for r in item["reasons"] if r and "分析原因失败" not in r]
-            item["aggregated_reason"] = " | ".join(lines) if lines else "暂无新闻催化"
+            item["current_price"] = current_price
+
+            # 多日理由做“同类去重 + 新鲜度衰减”
+            aggregated_reason, signal_strength = TrendCalculator._aggregate_reasons_with_decay(
+                item.get("reason_records", []),
+                today=dt.date.today(),
+            )
+            item["aggregated_reason"] = aggregated_reason
+            item["signal_strength"] = signal_strength
+
+            # 趋势总分：在原始累计涨幅基础上，给新鲜有效信号一定加权
+            # 目标：老热点理由重复刷屏时，难以长期霸榜
+            freshness_factor = min(1.25, 0.85 + signal_strength * 0.18)
+            item["trend_score"] = round(ret * freshness_factor, 2)
             return item
             
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -165,7 +271,7 @@ class TrendCalculator:
             
         final_tops = {}
         for mkt, stks in market_tops.items():
-            stks.sort(key=lambda x: x["return_pct"], reverse=True)
+            stks.sort(key=lambda x: x.get("trend_score", x["return_pct"]), reverse=True)
             # 取出前10名
             final_tops[mkt] = stks[:10]
             
