@@ -87,66 +87,76 @@ class MarketHeatMap:
         
         if market == 'CN':
             # ────────────────────────────────────────────────────────────────
-            # A股热榜算法：百分位排名归一化综合评分
+            # A股热榜算法（无换手率模式）：百分位排名归一化综合评分
             #
-            # 最低门槛：涨幅 >= 5%（过滤北方国际之类平庸涨幅股）
             # 对于不同板块归一化涨幅：
             #   主板 → 除以10, 创业板/科创 → 除以20, 北交所 → 除以30
-            # 评分 = 涨幅百分位(0.5) + 成交额百分位(0.3) + 换手率百分位(0.2)
-            # 百分位归一化让三个指标量纲统一，避免成交额绝对值数量级碾压涨幅
+            # 入池门槛：归一化涨幅 >= 0.70（同一尺度下可横向比较）
+            # 评分 = 归一化涨幅百分位(0.70) + 成交额对数百分位(0.30)
+            # 说明：当前A股链路换手率不可用，临时不纳入评分以避免“假因子”
             # ────────────────────────────────────────────────────────────────
 
             # 各板块涨停限制（用于归一化涨幅）
             limits = pd.Series(10.0, index=filtered.index)
-            limits[filtered['symbol'].str.startswith(('30', '688'))] = 20.0
-            limits[filtered['symbol'].str.startswith(('8', '4'))] = 30.0
+            limits[filtered["symbol"].str.startswith(("30", "688"))] = 20.0
+            limits[filtered["symbol"].str.startswith(("8", "4"))] = 30.0
 
-            # 最低涨幅门槛 5%（防止平庸股入榜）
-            filtered = filtered[filtered["pct_chg"] >= 5.0].copy()
+            # 归一化涨幅（把主板10%涨停 与 创业板20%涨停 等价视为1.0）
+            normalized_pct = filtered["pct_chg"] / limits
+
+            # 入池门槛：归一化涨幅 >= 0.70
+            pool_mask = normalized_pct >= 0.70
+            filtered = filtered[pool_mask].copy()
             limits = limits.loc[filtered.index]
+            normalized_pct = normalized_pct.loc[filtered.index]
 
+            # 弱市降级：归一化门槛放宽到 0.55（避免空榜）
             if filtered.empty:
-                # 弱市降级：放宽到 >= 3%
-                logger.warning("CN: 涨幅>=5%无满足条件股票，降级展示>=3%涨幅股票")
-                filtered = renamed_df[
-                    (renamed_df["amount"] >= min_amount) & (renamed_df["pct_chg"] >= 3.0)
-                ].copy()
-                limits = pd.Series(10.0, index=filtered.index)
-                limits[filtered['symbol'].str.startswith(('30', '688'))] = 20.0
-                limits[filtered['symbol'].str.startswith(('8', '4'))] = 30.0
+                logger.warning("CN: normalized_pct>=0.70 无满足标的，降级到 >=0.55")
+                fallback_mask = (renamed_df["amount"] >= min_amount)
+                fallback_df = renamed_df[fallback_mask].copy()
+                fallback_limits = pd.Series(10.0, index=fallback_df.index)
+                fallback_limits[fallback_df["symbol"].str.startswith(("30", "688"))] = 20.0
+                fallback_limits[fallback_df["symbol"].str.startswith(("8", "4"))] = 30.0
+                fallback_norm = fallback_df["pct_chg"] / fallback_limits
+                fallback_pool = fallback_norm >= 0.55
+                filtered = fallback_df[fallback_pool].copy()
+                limits = fallback_limits.loc[filtered.index]
+                normalized_pct = fallback_norm.loc[filtered.index]
 
             filtered = filtered[filtered["amount"] >= min_amount].copy()
             limits = limits.loc[filtered.index]
+            normalized_pct = normalized_pct.loc[filtered.index]
 
             if filtered.empty:
                 logger.warning("CN: 最终候选池为空，跳过热榜")
                 return []
 
-            # 归一化涨幅（把主板10%涨停 与 创业板20%涨停 等价视为1.0）
-            normalized_pct = (filtered["pct_chg"] / limits)
             # 抹平涨停板之间的微小差价 (例如 19.98%, 19.99%, 10.03%)
             # 将接近甚至略微超过涨停价 (0.96~1.05倍) 的标的，归一化强度全部强制锁定为 1.0
-            # 这样它们的 rank_pct 得分完全一致，最终的龙虎榜排序决定权将完美交还给 成交额 和 换手率
+            # 这样它们的 rank_pct 得分完全一致，排序主要交给成交额因子
             mask = (normalized_pct >= 0.96) & (normalized_pct <= 1.05)
             normalized_pct.loc[mask] = 1.0
             normalized_pct = normalized_pct.clip(0, 1.2)
 
-            # 百分位排名（pct_rank → 0~1，越大越靠前）
-            rank_pct     = normalized_pct.rank(pct=True)
-            rank_amount  = filtered["amount"].rank(pct=True)
-            has_turnover = filtered["turnover"].sum() > 0
-            rank_turnover = filtered["turnover"].rank(pct=True) if has_turnover else pd.Series(0.5, index=filtered.index)
+            # 百分位排名（0~1，越大越靠前）
+            rank_pct = normalized_pct.rank(pct=True)
+            rank_amount = np.log1p(filtered["amount"]).rank(pct=True)
 
-            # 综合评分：涨幅50% + 成交额30% + 换手20%
+            # 综合评分：涨幅强度70% + 流动性30%
             filtered = filtered.copy()
             filtered["heat_score"] = (
-                rank_pct     * 0.50 +
-                rank_amount  * 0.30 +
-                rank_turnover * 0.20
+                rank_pct * 0.70 +
+                rank_amount * 0.30
             )
 
             sorted_df = filtered.sort_values(by="heat_score", ascending=False)
-            logger.info(f"CN热榜: 候选 {len(filtered)} 只，最高涨幅 {filtered['pct_chg'].max():.2f}%, 最低 {filtered['pct_chg'].min():.2f}%")
+            logger.info(
+                "CN热榜(无换手率): 候选=%s 最高涨幅=%.2f%% 最低涨幅=%.2f%%",
+                len(filtered),
+                filtered["pct_chg"].max(),
+                filtered["pct_chg"].min(),
+            )
         else:
             # HK / US：同样改用百分位归一化
             filtered = filtered[filtered["pct_chg"] >= 5.0].copy()
