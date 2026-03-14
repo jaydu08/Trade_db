@@ -1,5 +1,6 @@
 import logging
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Dict, List
 
 from core.llm import simple_prompt
@@ -75,8 +76,13 @@ class TrendReportService:
             )
 
         try:
-            out = simple_prompt(prompt, temperature=0.1).strip()
-            return out
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(simple_prompt, prompt, temperature=0.1)
+                out = future.result(timeout=TrendReportService.LLM_TIMEOUT_SEC)
+            return str(out).strip()
+        except FutureTimeout:
+            logger.warning(f"Trend LLM summary timeout for {market}, fallback used.")
+            return "主线逻辑：暂无\n资金抱团：暂无\n独立逻辑：暂无明显独立逻辑"
         except Exception as e:
             logger.warning(f"Trend LLM summary failed for {market}: {e}")
             return "主线逻辑：暂无\n资金抱团：暂无\n独立逻辑：暂无明显独立逻辑"
@@ -89,6 +95,7 @@ class TrendReportService:
 
         lines: List[str] = [f"Trend {days}日趋势推送"]
         market_order = ["CN", "HK", "US", "CF"]
+        selected_by_market: Dict[str, List[dict]] = {}
 
         for market in market_order:
             stks = tops.get(market, [])
@@ -99,7 +106,28 @@ class TrendReportService:
                 picked = TrendReportService._pick_cf_items(stks)
             else:
                 picked = TrendReportService._pick_market_items(market, stks)
+            selected_by_market[market] = picked
 
+        # 并行生成各市场 3 行总结，避免串行调用导致 /trend 长时间等待
+        summaries: Dict[str, str] = {}
+        if selected_by_market:
+            with ThreadPoolExecutor(max_workers=min(4, len(selected_by_market))) as executor:
+                future_map = {
+                    market: executor.submit(TrendReportService._llm_summary, market, days, picked)
+                    for market, picked in selected_by_market.items()
+                }
+                for market, future in future_map.items():
+                    try:
+                        summaries[market] = future.result(timeout=TrendReportService.LLM_TIMEOUT_SEC + 5)
+                    except FutureTimeout:
+                        summaries[market] = "主线逻辑：暂无\n资金抱团：暂无\n独立逻辑：暂无明显独立逻辑"
+                    except Exception:
+                        summaries[market] = "主线逻辑：暂无\n资金抱团：暂无\n独立逻辑：暂无明显独立逻辑"
+
+        for market in market_order:
+            picked = selected_by_market.get(market)
+            if not picked:
+                continue
             market_name = TrendReportService.MARKET_NAMES.get(market, market)
             lines.append(f"\n【{market_name}】")
             for i, s in enumerate(picked, 1):
@@ -108,7 +136,7 @@ class TrendReportService:
                     prefix = f"{s.get('category')}-"
                 lines.append(prefix + TrendReportService._format_stock_line(i, s))
 
-            lines.append(TrendReportService._llm_summary(market, days, picked))
+            lines.append(summaries.get(market, "主线逻辑：暂无\n资金抱团：暂无\n独立逻辑：暂无明显独立逻辑"))
 
         return "\n".join(lines).strip()
 
@@ -117,3 +145,4 @@ class TrendReportService:
         report = TrendReportService.build_report(days)
         Notifier.broadcast(report)
         logger.info(f"Trend report pushed for {days} days.")
+    LLM_TIMEOUT_SEC = 20
