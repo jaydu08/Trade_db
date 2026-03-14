@@ -145,4 +145,4 @@ class TrendReportService:
         report = TrendReportService.build_report(days)
         Notifier.broadcast(report)
         logger.info(f"Trend report pushed for {days} days.")
-    LLM_TIMEOUT_SEC = 90
+    LLM_TIMEOUT_SEC = 300

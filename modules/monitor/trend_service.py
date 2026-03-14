@@ -2,11 +2,11 @@ import logging
 import datetime as dt
 import re
 from difflib import SequenceMatcher
-from sqlmodel import Session, select
+from sqlmodel import select
 from typing import List, Dict, Tuple
 
 from core.db import get_ledger_session
-from domain.ledger.analytics import TrendSeedPool
+from domain.ledger.analytics import TrendSeedPool, DailyRank
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,59 @@ class TrendService:
             logger.error(f"Failed to add to TrendSeedPool: {e}")
 
 class TrendCalculator:
+    @staticmethod
+    def _normalize_symbol_for_api(symbol: str, market: str) -> str:
+        """统一符号格式，兼容 US 的 105.TICKER 形态"""
+        sym = str(symbol or "").strip()
+        if market == "US" and "." in sym:
+            # 例如 105.NVDA -> NVDA
+            sym = sym.split(".")[-1].strip()
+        return sym
+
+    @staticmethod
+    def _get_return_from_daily_rank_db(symbol: str, market: str, d_days: int) -> Tuple[float, float]:
+        """接口失败时，回退使用本地 DailyRank 价格序列计算 N 日收益"""
+        if market == "CF":
+            return 0.0, 0.0
+
+        raw = str(symbol or "").strip()
+        candidates = [raw]
+        if market == "US" and "." in raw:
+            candidates.append(raw.split(".")[-1].strip())
+
+        with get_ledger_session() as session:
+            stmt = (
+                select(DailyRank)
+                .where(DailyRank.market == market)
+                .where(DailyRank.symbol.in_(candidates))
+                .order_by(DailyRank.date.desc())
+            )
+            rows = list(session.exec(stmt).all())
+
+        # 去重并保留有效价格
+        uniq = {}
+        for r in rows:
+            if r.price and r.price > 0:
+                uniq[r.date] = float(r.price)
+        if not uniq:
+            return 0.0, 0.0
+
+        dates = sorted(uniq.keys())
+        current_date = dates[-1]
+        current_price = uniq[current_date]
+        target_date = current_date - dt.timedelta(days=d_days)
+
+        past_dates = [d for d in dates if d <= target_date]
+        if past_dates:
+            past_price = uniq[past_dates[-1]]
+        else:
+            past_price = uniq[dates[0]]
+
+        if past_price <= 0:
+            return 0.0, round(current_price, 4)
+        ret = round((current_price - past_price) / past_price * 100, 2)
+        return ret, round(current_price, 4)
+
     @staticmethod
     def _normalize_reason(reason: str) -> str:
         """归一化理由文本，用于判定“同类理由”"""
@@ -147,18 +200,20 @@ class TrendCalculator:
         
         try:
             df = None
+            api_symbol = TrendCalculator._normalize_symbol_for_api(symbol, market)
+
             if market == "CN":
                 # CN 接口通常需要加 sh/sz 或直接用6位代码
-                df = ak.stock_zh_a_hist(symbol=symbol, period="daily")
+                df = ak.stock_zh_a_hist(symbol=api_symbol, period="daily")
             elif market == "US":
                 # US 接口接受 AAPL
-                df = ak.stock_us_daily(symbol=symbol)
+                df = ak.stock_us_daily(symbol=api_symbol)
             elif market == "HK":
                 # HK 接口接受 00700
-                df = ak.stock_hk_daily(symbol=symbol)
+                df = ak.stock_hk_daily(symbol=api_symbol)
             elif market == "CF":
                 # CF 期货历史数据
-                df = ak.futures_zh_daily_sina(symbol=symbol)
+                df = ak.futures_zh_daily_sina(symbol=api_symbol)
                 
             if df is None or df.empty:
                 return 0.0, 0.0
@@ -194,7 +249,12 @@ class TrendCalculator:
             return ret, round(current_close, 4)
         except Exception as e:
             logger.debug(f"Calculate return failed for {symbol} ({market}): {e}")
-            return 0.0, 0.0
+            # 回退：用本地 DailyRank 历史价格序列估算，避免全 0
+            try:
+                return TrendCalculator._get_return_from_daily_rank_db(symbol, market, d_days)
+            except Exception as e2:
+                logger.debug(f"DailyRank fallback failed for {symbol} ({market}): {e2}")
+                return 0.0, 0.0
 
     @staticmethod
     def calculate_trend(days: int = 7) -> Dict[str, List[Dict]]:
