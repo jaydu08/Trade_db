@@ -1,0 +1,19 @@
+[Unit]
+Description=Trade_db Telegram Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Trade_db
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/root/Trade_db
+ExecStart=/root/.pyenv/versions/3.12.12/bin/python3 /root/Trade_db/main.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/root/Trade_db/logs/system_run.log
+StandardError=append:/root/Trade_db/logs/system_run.log
+
+[Install]
+WantedBy=multi-user.target
