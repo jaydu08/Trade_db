@@ -340,7 +340,11 @@ class MarketHeatMap:
             symbol = stock['symbol']
             pct = stock['pct_chg']
             reason = stock['reason']
-            msg_lines.append(f"**{i}. {name} ({symbol})**  `+{pct:.2f}%`")
+            if market == 'US':
+                display = f"({symbol})"
+            else:
+                display = f"{name} ({symbol})"
+            msg_lines.append(f"**{i}. {display}**  `+{pct:.2f}%`")
             msg_lines.append(f"💡 {reason}\n")
             
         final_msg = "\n".join(msg_lines)

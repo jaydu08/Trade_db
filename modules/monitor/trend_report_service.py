@@ -16,10 +16,13 @@ class TrendReportService:
     MARKET_NAMES = {"CN": "A股", "HK": "港股", "US": "美股", "CF": "期货"}
 
     @staticmethod
-    def _format_stock_line(i: int, s: dict) -> str:
+    def _format_stock_line(i: int, s: dict, market: str) -> str:
         price = s.get("current_price", 0)
         ret = s.get("return_pct", 0)
-        return f"{i}. {s.get('name','')}({s.get('symbol','')}) 现价:{price} {ret:+.2f}%"
+        symbol = s.get("symbol", "")
+        if market == "US":
+            return f"{i}. ({symbol}) 现价:{price} {ret:+.2f}%"
+        return f"{i}. {s.get('name','')}({symbol}) 现价:{price} {ret:+.2f}%"
 
     @staticmethod
     def _pick_market_items(market: str, stks: List[dict]) -> List[dict]:
@@ -134,7 +137,7 @@ class TrendReportService:
                 prefix = ""
                 if market == "CF" and s.get("category"):
                     prefix = f"{s.get('category')}-"
-                lines.append(prefix + TrendReportService._format_stock_line(i, s))
+                lines.append(prefix + TrendReportService._format_stock_line(i, s, market))
 
             lines.append(summaries.get(market, "主线逻辑：暂无\n资金抱团：暂无\n独立逻辑：暂无明显独立逻辑"))
 
