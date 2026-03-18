@@ -1,5 +1,5 @@
 {
-  "GOOG": {
+  "US:GOOG": {
     "symbol": "GOOG",
     "market": "US",
     "name": "GOOG",
@@ -9,17 +9,17 @@
     "is_active": true,
     "chat_id": -5201901502
   },
-  "CRCL": {
+  "US:CRCL": {
     "symbol": "CRCL",
     "market": "US",
     "name": "CRCL",
     "added_at": "2026-02-21 00:29:04.923017",
-    "last_alert_at": "2026-03-10 23:42:22.304456",
+    "last_alert_at": "2026-03-18 04:30:07.393675",
     "alert_threshold_pct": 5.0,
     "is_active": true,
     "chat_id": -5201901502
   },
-  "NVDA": {
+  "US:NVDA": {
     "symbol": "NVDA",
     "market": "US",
     "name": "NVDA",
@@ -29,17 +29,17 @@
     "is_active": true,
     "chat_id": -5201901502
   },
-  "02513": {
+  "HK:02513": {
     "symbol": "02513",
     "market": "HK",
     "name": "智谱",
     "added_at": "2026-02-26 10:23:09.293113",
-    "last_alert_at": "2026-03-11 09:52:22.015720",
+    "last_alert_at": "2026-03-18 09:56:07.393977",
     "alert_threshold_pct": 5.0,
     "is_active": true,
     "chat_id": -5201901502
   },
-  "600036": {
+  "CN:600036": {
     "symbol": "600036",
     "market": "CN",
     "name": "招商银行",
@@ -49,7 +49,7 @@
     "is_active": true,
     "chat_id": -5201901502
   },
-  "600410": {
+  "CN:600410": {
     "symbol": "600410",
     "market": "CN",
     "name": "华胜天成",
@@ -59,7 +59,7 @@
     "is_active": true,
     "chat_id": -5201901502
   },
-  "HIMS": {
+  "US:HIMS": {
     "symbol": "HIMS",
     "market": "US",
     "name": "HIMS",
@@ -69,12 +69,12 @@
     "is_active": true,
     "chat_id": -5201901502
   },
-  "002455": {
-    "symbol": "002455",
-    "market": "CN",
-    "name": "百川股份",
-    "added_at": "2026-03-11 09:29:36.862740",
-    "last_alert_at": "2026-03-11 09:30:22.130285",
+  "HK:06809": {
+    "symbol": "06809",
+    "market": "HK",
+    "name": "澜起科技",
+    "added_at": "2026-03-18 11:45:35.339906",
+    "last_alert_at": "2026-03-18 11:46:07.199131",
     "alert_threshold_pct": 5.0,
     "is_active": true,
     "chat_id": -5201901502

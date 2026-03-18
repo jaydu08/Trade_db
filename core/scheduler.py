@@ -142,7 +142,16 @@ class TaskScheduler:
             name="30日趋势简报",
             replace_existing=True
         )
-        
+
+        # 9. 每日推送标的汇总 TXT (工作日 20:00，北京时间)
+        self.scheduler.add_job(
+            self._job_daily_summary,
+            CronTrigger(day_of_week='mon-fri', hour=20, minute=0),
+            id="daily_summary",
+            name="每日推送标的汇总",
+            replace_existing=True
+        )
+
         logger.info(f"Registered {len(self.scheduler.get_jobs())} jobs.")
 
     def _run_job(self, job_id: str, func, *args, **kwargs):
@@ -201,6 +210,11 @@ class TaskScheduler:
         """Job: 30日趋势简报"""
         from modules.monitor.trend_report_service import TrendReportService
         self._run_job("trend_30d", TrendReportService.generate_and_push, 30)
+
+    def _job_daily_summary(self):
+        """Job: 每日推送标的汇总 → 写入 logs/daily_summary_YYYYMMDD.txt"""
+        from modules.monitor.daily_summary_service import DailySummaryService
+        self._run_job("daily_summary", DailySummaryService.generate_and_save)
 
     def _job_sync_fundamentals(self):
         """Job: 全市场基本面与分析更新 (深水区任务)"""

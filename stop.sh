@@ -4,7 +4,7 @@
 
 cd "$(dirname "$0")"
 PIDFILE="logs/trade_db.pid"
-PROC_REGEX="python(3)?[[:space:]]+main\\.py"
+PROC_REGEX="[p]ython3?.*Trade_db/main\.py"
 
 if [ -f "$PIDFILE" ]; then
     PID=$(cat "$PIDFILE")

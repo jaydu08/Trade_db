@@ -9,7 +9,8 @@ cd "$(dirname "$0")"
 mkdir -p logs
 
 PIDFILE="logs/trade_db.pid"
-PROC_REGEX="python(3)?[[:space:]]+main\\.py"
+# 使用更精确的匹配：包含 python 且同时包含 Trade_db 和 main.py
+PROC_REGEX="[p]ython3?.*Trade_db/main\.py"
 
 # 清理失效 pidfile
 if [ -f "$PIDFILE" ]; then
@@ -32,7 +33,9 @@ echo "🚀 正在后台启动 Trade_db..."
 
 # 设置环境变量并使用 nohup 运行主程序
 export PYTHONPATH="$(pwd)"
-nohup python3 main.py > logs/system_run.log 2>&1 &
+
+# 确保使用的是绝对路径来启动，以便进程名中包含完整的 Trade_db/main.py，便于后续精确 kill
+nohup python3 "$(pwd)/main.py" > logs/system_run.log 2>&1 &
 
 # 获取并保存后台进程的 PID
 PID=$!

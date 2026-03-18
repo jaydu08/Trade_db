@@ -143,12 +143,25 @@ class MarketHeatMap:
             rank_pct = normalized_pct.rank(pct=True)
             rank_amount = np.log1p(filtered["amount"]).rank(pct=True)
 
-            # 综合评分：涨幅强度70% + 流动性30%
+            # 综合评分：涨幅强度35% + 流动性65%
             filtered = filtered.copy()
             filtered["heat_score"] = (
-                rank_pct * 0.70 +
-                rank_amount * 0.30
+                rank_pct * 0.35 +
+                rank_amount * 0.65
             )
+
+            # 需求2: 创业板(30x)/科创板(688x) 且涨幅 > 10% → heat_score × 1.2
+            bonus_mask = (
+                filtered["symbol"].str.startswith(("30", "688")) &
+                (filtered["pct_chg"] > 10.0)
+            )
+            if bonus_mask.any():
+                filtered.loc[bonus_mask, "heat_score"] *= 1.2
+                logger.info(
+                    "CN热榜: 创业板/科创板涨幅>10%%加成1.2x，命中 %d 支: %s",
+                    bonus_mask.sum(),
+                    filtered.loc[bonus_mask, "symbol"].tolist(),
+                )
 
             sorted_df = filtered.sort_values(by="heat_score", ascending=False)
             logger.info(
@@ -339,12 +352,15 @@ class MarketHeatMap:
             name = stock['name']
             symbol = stock['symbol']
             pct = stock['pct_chg']
+            price = stock.get('price', 0)
             reason = stock['reason']
             if market == 'US':
                 display = f"({symbol})"
             else:
                 display = f"{name} ({symbol})"
-            msg_lines.append(f"**{i}. {display}**  `+{pct:.2f}%`")
+            # 需求1: 推送标的加上具体价格
+            price_str = f"{price:.2f}" if price else "N/A"
+            msg_lines.append(f"**{i}. {display}**  💰 现价: {price_str}  `+{pct:.2f}%`")
             msg_lines.append(f"💡 {reason}\n")
             
         final_msg = "\n".join(msg_lines)
