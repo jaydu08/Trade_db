@@ -11,7 +11,7 @@ from typing import List, Dict
 from sqlmodel import select, Session
 
 from core.db import db_manager
-from domain.ledger.analytics import DailyRank, TrendDailyBar
+from domain.ledger.analytics import TrendDailyBar
 from modules.monitor.notifier import Notifier
 
 logger = logging.getLogger(__name__)
@@ -27,8 +27,8 @@ class DailySummaryService:
     汇总当日所有推送标的并写入 TXT 文件。
 
     数据来源：
-    ─ DailyRank (rank_type='change_pct')   → A股 / 港股 / 美股热榜
-    ─ TrendDailyBar (market='CF')           → 大宗商品战报
+    ─ TrendDailyBar (source='heatmap')        → A股 / 港股 / 美股热榜
+    ─ TrendDailyBar (source='commodity')      → 大宗商品战报
     """
 
     @staticmethod
@@ -43,48 +43,51 @@ class DailySummaryService:
 
         logger.info("生成每日推送汇总: %s", target_date)
 
+        # 涨幅统一从 open/close 反算
+        def _bar_pct(b: TrendDailyBar) -> float:
+            if b.open and b.open > 0 and b.close and b.close > 0:
+                return round((b.close - b.open) / b.open * 100, 2)
+            return 0.0
+
         engine = db_manager.ledger_engine
         with Session(engine) as session:
-            # ── 1. 股票热榜（DailyRank，涨幅榜，去重保留最高涨幅的一条）
-            ranks: List[DailyRank] = session.exec(
-                select(DailyRank).where(
-                    DailyRank.date == target_date,
-                    DailyRank.rank_type == "change_pct",
+            # ── 1. 股票热榜（TrendDailyBar，source='heatmap'）
+            stock_bars: List[TrendDailyBar] = session.exec(
+                select(TrendDailyBar).where(
+                    TrendDailyBar.date == target_date,
+                    TrendDailyBar.source == "heatmap",
                 )
             ).all()
 
-            # ── 2. 大宗商品（TrendDailyBar，market='CF'，数据源=commodity）
-            bars: List[TrendDailyBar] = session.exec(
+            # ── 2. 大宗商品（TrendDailyBar，source='commodity'）
+            cf_bars: List[TrendDailyBar] = session.exec(
                 select(TrendDailyBar).where(
                     TrendDailyBar.date == target_date,
-                    TrendDailyBar.market == "CF",
                     TrendDailyBar.source == "commodity",
                 )
             ).all()
 
         # 按市场分组（股票）
-        market_map: Dict[str, List[DailyRank]] = {"CN": [], "HK": [], "US": []}
+        market_map: Dict[str, List[TrendDailyBar]] = {"CN": [], "HK": [], "US": []}
         seen = {}  # symbol → 已保留的最高涨幅记录
-        for r in ranks:
+        for r in stock_bars:
             key = (r.market, r.symbol)
-            if key not in seen or r.change_pct > seen[key].change_pct:
+            pct = _bar_pct(r)
+            prev = seen.get(key)
+            if prev is None or pct > _bar_pct(prev):
                 seen[key] = r
+                
         for r in seen.values():
             if r.market in market_map:
                 market_map[r.market].append(r)
 
         # 各市场按涨幅降序
         for mkt in market_map:
-            market_map[mkt].sort(key=lambda x: x.change_pct, reverse=True)
+            market_map[mkt].sort(key=_bar_pct, reverse=True)
 
-        # 大宗商品去重（同 symbol 保留一条）；涨幅从 open/close 反算
-        def _bar_pct(b: TrendDailyBar) -> float:
-            if b.open and b.open > 0 and b.close and b.close > 0:
-                return round((b.close - b.open) / b.open * 100, 2)
-            return 0.0
-
+        # 大宗商品去重（同 symbol 保留一条）
         cf_seen = {}
-        for b in bars:
+        for b in cf_bars:
             pct = _bar_pct(b)
             prev = cf_seen.get(b.symbol)
             if prev is None or pct > _bar_pct(prev):
@@ -121,11 +124,13 @@ class DailySummaryService:
                 continue
             lines.append(f"【{market_labels[mkt]}】")
             for i, r in enumerate(items, 1):
-                price_str = f"{r.price:.2f}" if r.price else "N/A"
+                price_str = f"{r.close:.2f}" if r.close else "N/A"
+                pct = _bar_pct(r)
+                pct_str = f"+{pct:.2f}%" if pct >= 0 else f"{pct:.2f}%"
                 lines.append(
                     f"  {i:>2}. {r.name} ({r.symbol})"
                     f" | 现价: {price_str}"
-                    f" | 涨幅: +{r.change_pct:.2f}%"
+                    f" | 涨幅: {pct_str}"
                 )
             lines.append("")
 
