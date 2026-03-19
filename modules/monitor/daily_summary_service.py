@@ -12,6 +12,7 @@ from sqlmodel import select, Session
 
 from core.db import db_manager
 from domain.ledger.analytics import DailyRank, TrendDailyBar
+from modules.monitor.notifier import Notifier
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +159,15 @@ class DailySummaryService:
             f.write(content)
 
         logger.info("每日汇总已写入: %s  (共 %d 条标的)", filepath, total)
+        
+        # 增加推送到 Telegram 的逻辑
+        caption = f"📊 TradeDB 每日汇总 ({target_date})\n合计推送标的数: {total}"
+        try:
+            Notifier.broadcast_document(filepath, caption=caption)
+            logger.info("每日汇总已成功通过 Telegram 广播。")
+        except Exception as e:
+            logger.error("每日汇总推送到 Telegram 失败: %s", e)
+
         return filepath
 
 
