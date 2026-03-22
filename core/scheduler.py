@@ -152,6 +152,60 @@ class TaskScheduler:
             replace_existing=True
         )
 
+        # 10. 趋势池日线补齐（A/H）: 工作日 19:10
+        self.scheduler.add_job(
+            self._job_trend_pool_refresh_cn_hk,
+            CronTrigger(day_of_week='mon-fri', hour=19, minute=10),
+            id="trend_pool_refresh_cn_hk",
+            name="趋势池日线补齐(A/H)",
+            replace_existing=True
+        )
+
+        # 10.1 趋势池日线补齐（A/H）重试: 工作日 21:10
+        self.scheduler.add_job(
+            self._job_trend_pool_refresh_cn_hk_retry,
+            CronTrigger(day_of_week='mon-fri', hour=21, minute=10),
+            id="trend_pool_refresh_cn_hk_retry",
+            name="趋势池日线补齐(A/H)-重试",
+            replace_existing=True
+        )
+
+        # 11. 趋势池日线补齐（US/CF）: 周二至周六 08:10
+        self.scheduler.add_job(
+            self._job_trend_pool_refresh_us_cf,
+            CronTrigger(day_of_week='tue-sat', hour=8, minute=10),
+            id="trend_pool_refresh_us_cf",
+            name="趋势池日线补齐(US/CF)",
+            replace_existing=True
+        )
+
+        # 11.1 趋势池日线补齐（US/CF）重试: 周二至周六 10:10
+        self.scheduler.add_job(
+            self._job_trend_pool_refresh_us_cf_retry,
+            CronTrigger(day_of_week='tue-sat', hour=10, minute=10),
+            id="trend_pool_refresh_us_cf_retry",
+            name="趋势池日线补齐(US/CF)-重试",
+            replace_existing=True
+        )
+
+        # 12. DailyRank 同步（CN/HK）: 工作日 18:50
+        self.scheduler.add_job(
+            self._job_daily_rank_cn_hk,
+            CronTrigger(day_of_week='mon-fri', hour=18, minute=50),
+            id="daily_rank_cn_hk",
+            name="每日榜单同步(CN/HK)",
+            replace_existing=True
+        )
+
+        # 13. DailyRank 同步（US）: 周二至周六 08:05
+        self.scheduler.add_job(
+            self._job_daily_rank_us,
+            CronTrigger(day_of_week='tue-sat', hour=8, minute=5),
+            id="daily_rank_us",
+            name="每日榜单同步(US)",
+            replace_existing=True
+        )
+
         logger.info(f"Registered {len(self.scheduler.get_jobs())} jobs.")
 
     def _run_job(self, job_id: str, func, *args, **kwargs):
@@ -251,6 +305,64 @@ class TaskScheduler:
             }
 
         self._run_job("sync_fundamentals", _execute)
+
+    def _job_trend_pool_refresh_cn_hk(self):
+        """Job: 趋势池日线补齐（CN/HK）"""
+        from modules.monitor.trend_service import TrendService
+        self._run_job(
+            "trend_pool_refresh_cn_hk",
+            TrendService.refresh_pool_daily_bars,
+            ["CN", "HK"],
+            60,
+            "trend_pool_refresh_eod",
+            True,
+        )
+
+    def _job_trend_pool_refresh_cn_hk_retry(self):
+        """Job: 趋势池日线补齐重试（CN/HK）"""
+        from modules.monitor.trend_service import TrendService
+        self._run_job(
+            "trend_pool_refresh_cn_hk_retry",
+            TrendService.refresh_pool_daily_bars,
+            ["CN", "HK"],
+            60,
+            "trend_pool_refresh_eod",
+            False,
+        )
+
+    def _job_trend_pool_refresh_us_cf(self):
+        """Job: 趋势池日线补齐（US/CF）"""
+        from modules.monitor.trend_service import TrendService
+        self._run_job(
+            "trend_pool_refresh_us_cf",
+            TrendService.refresh_pool_daily_bars,
+            ["US", "CF"],
+            60,
+            "trend_pool_refresh_eod",
+            True,
+        )
+
+    def _job_trend_pool_refresh_us_cf_retry(self):
+        """Job: 趋势池日线补齐重试（US/CF）"""
+        from modules.monitor.trend_service import TrendService
+        self._run_job(
+            "trend_pool_refresh_us_cf_retry",
+            TrendService.refresh_pool_daily_bars,
+            ["US", "CF"],
+            60,
+            "trend_pool_refresh_eod",
+            False,
+        )
+
+    def _job_daily_rank_cn_hk(self):
+        """Job: 每日榜单同步（CN/HK）"""
+        from modules.monitor.daily_rank_service import DailyRankService
+        self._run_job("daily_rank_cn_hk", DailyRankService.sync_daily_ranks, ["CN", "HK"])
+
+    def _job_daily_rank_us(self):
+        """Job: 每日榜单同步（US）"""
+        from modules.monitor.daily_rank_service import DailyRankService
+        self._run_job("daily_rank_us", DailyRankService.sync_daily_ranks, ["US"])
 
 # 全局单例
 task_scheduler = TaskScheduler()

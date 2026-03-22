@@ -1,4 +1,5 @@
 import logging
+import datetime as dt
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Dict, List
@@ -21,8 +22,56 @@ class TrendReportService:
         ret = s.get("return_pct", 0)
         symbol = s.get("symbol", "")
         if market == "US":
-            return f"{i}. ({symbol}) 现价:{price} {ret:+.2f}%"
+            display_symbol = str(symbol).split(".")[-1].strip() if symbol else symbol
+            return f"{i}. ({display_symbol}) 现价:{price} {ret:+.2f}%"
         return f"{i}. {s.get('name','')}({symbol}) 现价:{price} {ret:+.2f}%"
+
+    @staticmethod
+    def _refresh_market_prices(market: str, stks: List[dict]) -> None:
+        """
+        用实时行情补齐/修正 trend 展示价：
+        - US: 优先使用 Finnhub（通过 DataManager provider 顺序）
+        - HK/CN: 若当前价缺失(<=0)再尝试补齐
+        失败时静默回退到本地 TrendDailyBar 价格。
+        """
+        from modules.ingestion.data_factory import data_manager
+        if not stks:
+            return
+
+        def _need_refresh(s: dict) -> bool:
+            p = float(s.get("current_price", 0) or 0)
+            if market == "US":
+                return True
+            return p <= 0
+
+        targets = [s for s in stks if _need_refresh(s)]
+        if not targets:
+            return
+
+        def _fetch_one(s: dict):
+            symbol = str(s.get("symbol", "")).strip()
+            if not symbol:
+                return None
+            quote = data_manager.get_quote(symbol, market)
+            if not quote:
+                return None
+            if market == "US" and quote.get("provider") != "Finnhub":
+                return None
+            p = float(quote.get("price", 0) or 0)
+            if p <= 0:
+                return None
+            return symbol, p
+
+        with ThreadPoolExecutor(max_workers=min(8, len(targets))) as executor:
+            future_map = {executor.submit(_fetch_one, s): s for s in targets}
+            for future, stock in future_map.items():
+                try:
+                    out = future.result(timeout=6)
+                    if out:
+                        _, price = out
+                        stock["current_price"] = round(price, 4)
+                except Exception:
+                    continue
 
     @staticmethod
     def _pick_market_items(market: str, stks: List[dict]) -> List[dict]:
@@ -104,11 +153,15 @@ class TrendReportService:
             stks = tops.get(market, [])
             if not stks:
                 continue
+            stks = [s for s in stks if TrendReportService._is_fresh_price(market, str(s.get("price_date", "")))]
+            if not stks:
+                continue
 
             if market == "CF":
                 picked = TrendReportService._pick_cf_items(stks)
             else:
                 picked = TrendReportService._pick_market_items(market, stks)
+            # Trend 报告只使用本地收盘价序列，避免实时行情口径波动
             selected_by_market[market] = picked
 
         # 并行生成各市场 3 行总结，避免串行调用导致 /trend 长时间等待
@@ -126,6 +179,9 @@ class TrendReportService:
                         summaries[market] = "主线逻辑：暂无\n资金抱团：暂无\n独立逻辑：暂无明显独立逻辑"
                     except Exception:
                         summaries[market] = "主线逻辑：暂无\n资金抱团：暂无\n独立逻辑：暂无明显独立逻辑"
+
+        if not selected_by_market:
+            return f"📭 最近{days}日暂无新鲜收盘价趋势标的。"
 
         for market in market_order:
             picked = selected_by_market.get(market)
@@ -149,3 +205,13 @@ class TrendReportService:
         Notifier.broadcast(report)
         logger.info(f"Trend report pushed for {days} days.")
     LLM_TIMEOUT_SEC = 300
+    @staticmethod
+    def _is_fresh_price(market: str, price_date: str) -> bool:
+        if not price_date:
+            return False
+        try:
+            d = dt.datetime.strptime(price_date, "%Y-%m-%d").date()
+        except Exception:
+            return False
+        max_age = 4 if market in {"US", "CF"} else 3
+        return (dt.date.today() - d).days <= max_age

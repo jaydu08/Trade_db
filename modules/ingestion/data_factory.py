@@ -39,6 +39,7 @@ class DataManager:
             TushareProvider()
         ]
         self.active_market_providers = [p for p in self.market_providers if p.health_check()]
+        logger.info(f"Active market providers: {[p.provider_name for p in self.active_market_providers]}")
         
     def search(self, query: str, limit_per_source: int = 5, timeout: int = 20) -> str:
         """
@@ -93,7 +94,8 @@ class DataManager:
         for provider in self.active_market_providers:
             try:
                 res = provider.get_quote(symbol, market)
-                if res is not None:
+                # 只有拿到有效价格才算成功，否则继续尝试下一数据源
+                if res is not None and float(res.get("price", 0) or 0) > 0:
                     # 标准化返回
                     return {
                         "provider": provider.provider_name,

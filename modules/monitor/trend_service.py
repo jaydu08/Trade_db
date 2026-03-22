@@ -1,6 +1,7 @@
 import logging
 import datetime as dt
 import re
+import concurrent.futures
 from difflib import SequenceMatcher
 from sqlmodel import select
 from typing import List, Dict, Tuple
@@ -11,6 +12,117 @@ from domain.ledger.analytics import TrendSeedPool, DailyRank, TrendDailyBar
 logger = logging.getLogger(__name__)
 
 class TrendService:
+    EOD_SOURCES = {"daily_rank", "trend_pool_refresh_eod", "commodity", "heatmap", "selftest"}
+    POOL_RETENTION_DAYS = 60
+    POOL_SYMBOL_CAPS = {"CN": 100, "US": 100, "HK": 50, "CF": 30}
+
+    @staticmethod
+    def _enforce_pool_symbol_cap(session, market: str):
+        """按市场限制 trend 种子池标的数量，优先保留最近出现的标的。"""
+        cap = TrendService.POOL_SYMBOL_CAPS.get(market)
+        if not cap:
+            return
+
+        cutoff = dt.date.today() - dt.timedelta(days=TrendService.POOL_RETENTION_DAYS)
+        rows = session.exec(
+            select(TrendSeedPool).where(
+                TrendSeedPool.market == market,
+                TrendSeedPool.date >= cutoff,
+            )
+        ).all()
+        if not rows:
+            return
+
+        last_seen = {}
+        for r in rows:
+            prev = last_seen.get(r.symbol)
+            if prev is None or r.date > prev:
+                last_seen[r.symbol] = r.date
+
+        if len(last_seen) <= cap:
+            return
+
+        keep_symbols = {
+            sym
+            for sym, _ in sorted(last_seen.items(), key=lambda x: (x[1], x[0]), reverse=True)[:cap]
+        }
+        drop_symbols = set(last_seen.keys()) - keep_symbols
+        if not drop_symbols:
+            return
+
+        to_delete = session.exec(
+            select(TrendSeedPool).where(
+                TrendSeedPool.market == market,
+                TrendSeedPool.symbol.in_(list(drop_symbols)),
+            )
+        ).all()
+        for row in to_delete:
+            session.delete(row)
+        logger.info(
+            "TrendSeedPool cap enforced: market=%s cap=%s dropped_symbols=%s",
+            market,
+            cap,
+            len(drop_symbols),
+        )
+
+    @staticmethod
+    def _is_anomalous_close(
+        session,
+        market: str,
+        symbol: str,
+        close: float,
+        pct_chg: float,
+        sample_n: int = 20,
+    ) -> bool:
+        """
+        港/美价格异常保护：
+        - 与近期中位数相比出现异常倍数跳变
+        - 且当日涨跌幅并未体现同等异常（通常意味着口径错位）
+        """
+        if market not in {"HK", "US"} or close <= 0:
+            return False
+
+        stmt = (
+            select(TrendDailyBar)
+            .where(TrendDailyBar.market == market)
+            .where(TrendDailyBar.symbol == symbol)
+            .order_by(TrendDailyBar.date.desc())
+        )
+        rows = list(session.exec(stmt).all())[:sample_n]
+        hist = [float(r.close) for r in rows if r.close and float(r.close) > 0]
+        if len(hist) < 5:
+            return False
+
+        hist_sorted = sorted(hist)
+        median = hist_sorted[len(hist_sorted) // 2]
+        if median <= 0:
+            return False
+
+        ratio = close / median
+        # 异常价倍数 + 非异常涨跌幅 => 高概率为错误口径（如币种错位）
+        if (ratio > 2.5 or ratio < 0.4) and abs(float(pct_chg or 0)) <= 25:
+            logger.warning(
+                "TrendDailyBar anomaly blocked: market=%s symbol=%s close=%s median=%s ratio=%.3f pct=%s",
+                market, symbol, close, median, ratio, pct_chg,
+            )
+            return True
+        return False
+
+    @staticmethod
+    def _pick_trusted_quote(symbol: str, market: str):
+        """
+        趋势场景下的可信行情源策略：
+        - US: 仅信任 Finnhub（避免其他源口径偏差）
+        - 其他市场: 接受 DataManager 正常返回
+        """
+        from modules.ingestion.data_factory import data_manager
+        quote = data_manager.get_quote(symbol, market)
+        if not quote:
+            return None
+        if market == "US" and quote.get("provider") != "Finnhub":
+            return None
+        return quote
+
     @staticmethod
     def add_to_pool(market: str, items: List[Dict]):
         """
@@ -43,12 +155,15 @@ class TrendService:
                             daily_reason=item.get("reason", "")
                         )
                         session.add(seed)
-                # 自动清理 30 天前的数据
-                cutoff = today - dt.timedelta(days=30)
+                # 自动清理 60 天前的数据
+                cutoff = today - dt.timedelta(days=TrendService.POOL_RETENTION_DAYS)
                 del_stmt = select(TrendSeedPool).where(TrendSeedPool.date < cutoff)
                 old_records = session.exec(del_stmt).all()
                 for old in old_records:
                     session.delete(old)
+
+                # 硬顶控制：按市场限制池内标的总数
+                TrendService._enforce_pool_symbol_cap(session, market)
                 
                 # context manager 将在退出时自动 commit
             logger.info(f"TrendSeedPool: Saved {len(items)} items for {market}")
@@ -65,6 +180,14 @@ class TrendService:
         cutoff = today - dt.timedelta(days=180)
 
         try:
+            if source not in TrendService.EOD_SOURCES:
+                logger.info(
+                    "Skip TrendDailyBar write for non-EOD source: market=%s source=%s items=%s",
+                    market,
+                    source,
+                    len(items),
+                )
+                return
             with get_ledger_session() as session:
                 for item in items:
                     sym = str(item.get("symbol", "")).strip()
@@ -86,6 +209,20 @@ class TrendService:
                     amount = float(item.get("amount", 0) or 0)
                     turnover_rate = float(item.get("turnover_rate", 0) or 0)
 
+                    # US 优先用可信实时源覆盖（防止口径偏差）
+                    if market == "US":
+                        trusted = TrendService._pick_trusted_quote(sym, market)
+                        if trusted and float(trusted.get("price", 0) or 0) > 0:
+                            close = float(trusted.get("price"))
+                            pct = float(trusted.get("pct_chg", pct) or pct)
+                            if open_price <= 0:
+                                den = 1 + pct / 100.0
+                                open_price = close / den if den > 0 else close
+
+                    # 价格异常保护（港/美）
+                    if TrendService._is_anomalous_close(session, market, sym, close, pct):
+                        continue
+
                     stmt = select(TrendDailyBar).where(
                         TrendDailyBar.date == today,
                         TrendDailyBar.market == market,
@@ -94,16 +231,8 @@ class TrendService:
                     existing = session.exec(stmt).first()
 
                     if existing:
-                        existing.name = item.get("name", existing.name or "")
-                        existing.close = close
-                        existing.open = open_price
-                        existing.high = high if high > 0 else max(close, open_price)
-                        existing.low = low if low > 0 else min(close, open_price)
-                        existing.amount = amount
-                        existing.turnover_rate = turnover_rate
-                        if source:
-                            existing.source = source
-                        existing.updated_at = dt.datetime.utcnow()
+                        # 当日已写入则不回写，保持“落盘一次”语义
+                        continue
                     else:
                         bar = TrendDailyBar(
                             date=today,
@@ -127,6 +256,110 @@ class TrendService:
         except Exception as e:
             logger.error(f"Failed to save TrendDailyBar for {market}: {e}")
 
+    @staticmethod
+    def refresh_pool_daily_bars(
+        markets: List[str],
+        lookback_days: int = 60,
+        source: str = "trend_pool_refresh_eod",
+        alert_on_zero: bool = False,
+    ) -> Dict[str, Dict[str, int]]:
+        """
+        每日补齐趋势池标的的快照价格（按市场批量拉取实时行情）。
+        目标：即使标的不在当日热榜，也能持续更新 trend 价格序列。
+        """
+        from modules.ingestion.data_factory import data_manager
+        today = dt.date.today()
+        cutoff = today - dt.timedelta(days=lookback_days)
+        summary: Dict[str, Dict[str, int]] = {}
+
+        with get_ledger_session() as session:
+            stmt = select(TrendSeedPool).where(TrendSeedPool.date >= cutoff)
+            rows = session.exec(stmt).all()
+            records = [
+                {"market": r.market, "symbol": r.symbol, "name": r.name}
+                for r in rows
+                if r.market in markets and r.symbol
+            ]
+
+        by_market: Dict[str, Dict[str, str]] = {}
+        for r in records:
+            by_market.setdefault(r["market"], {})
+            by_market[r["market"]][r["symbol"]] = r.get("name", "")
+
+        for market in markets:
+            sym_map = by_market.get(market, {})
+            if not sym_map:
+                summary[market] = {"candidates": 0, "quoted": 0, "saved": 0}
+                continue
+
+            symbols = list(sym_map.keys())
+            payloads: List[Dict] = []
+
+            def _fetch(sym: str):
+                quote = TrendService._pick_trusted_quote(sym, market)
+                if not quote:
+                    return None
+                price = float(quote.get("price", 0) or 0)
+                if price <= 0:
+                    return None
+                return {
+                    "symbol": sym,
+                    "name": sym_map.get(sym, ""),
+                    "price": price,
+                    "pct_chg": float(quote.get("pct_chg", 0) or 0),
+                    "amount": 0.0,
+                    "turnover_rate": 0.0,
+                }
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(symbols))) as executor:
+                future_map = {executor.submit(_fetch, sym): sym for sym in symbols}
+                try:
+                    done_iter = concurrent.futures.as_completed(future_map, timeout=120)
+                    for future in done_iter:
+                        try:
+                            item = future.result(timeout=0)
+                            if item:
+                                payloads.append(item)
+                        except Exception:
+                            continue
+                except concurrent.futures.TimeoutError:
+                    logger.warning("Trend pool refresh timeout for market=%s, use partial results.", market)
+
+            if payloads:
+                TrendService.save_daily_bars(market, payloads, source=source)
+
+            summary[market] = {
+                "candidates": len(symbols),
+                "quoted": len(payloads),
+                "saved": len(payloads),
+            }
+
+            if len(symbols) > 0 and len(payloads) == 0:
+                logger.error(
+                    "Trend pool EOD refresh got zero quotes: market=%s candidates=%s",
+                    market,
+                    len(symbols),
+                )
+
+        logger.info("Trend pool daily refresh finished: %s", summary)
+        if alert_on_zero:
+            try:
+                from modules.monitor.notifier import Notifier
+                bad = [
+                    f"{m}:0/{v.get('candidates', 0)}"
+                    for m, v in summary.items()
+                    if v.get("candidates", 0) > 0 and v.get("quoted", 0) == 0
+                ]
+                if bad:
+                    Notifier.broadcast(
+                        "⚠️ Trend收盘价采集异常："
+                        + "，".join(bad)
+                        + "（请检查行情源网络/DNS）"
+                    )
+            except Exception as e:
+                logger.warning("Trend refresh alert failed: %s", e)
+        return summary
+
 class TrendCalculator:
     @staticmethod
     def _normalize_symbol_for_api(symbol: str, market: str) -> str:
@@ -138,10 +371,10 @@ class TrendCalculator:
         return sym
 
     @staticmethod
-    def _get_return_from_daily_rank_db(symbol: str, market: str, d_days: int) -> Tuple[float, float]:
+    def _get_return_from_daily_rank_db(symbol: str, market: str, d_days: int) -> Tuple[float, float, str]:
         """接口失败时，回退使用本地 DailyRank 价格序列计算 N 日收益"""
         if market == "CF":
-            return 0.0, 0.0
+            return 0.0, 0.0, ""
 
         raw = str(symbol or "").strip()
         candidates = [raw]
@@ -155,15 +388,15 @@ class TrendCalculator:
                 .where(DailyRank.symbol.in_(candidates))
                 .order_by(DailyRank.date.desc())
             )
-            rows = list(session.exec(stmt).all())
+            # 在 session 生命周期内提取纯数据，避免 detached ORM 访问
+            rows = [(r.date, float(r.price)) for r in session.exec(stmt).all() if r.price and r.price > 0]
 
         # 去重并保留有效价格
         uniq = {}
-        for r in rows:
-            if r.price and r.price > 0:
-                uniq[r.date] = float(r.price)
+        for d, p in rows:
+            uniq[d] = p
         if not uniq:
-            return 0.0, 0.0
+            return 0.0, 0.0, ""
 
         dates = sorted(uniq.keys())
         current_date = dates[-1]
@@ -177,12 +410,12 @@ class TrendCalculator:
             past_price = uniq[dates[0]]
 
         if past_price <= 0:
-            return 0.0, round(current_price, 4)
+            return 0.0, round(current_price, 4), str(current_date)
         ret = round((current_price - past_price) / past_price * 100, 2)
-        return ret, round(current_price, 4)
+        return ret, round(current_price, 4), str(current_date)
 
     @staticmethod
-    def _get_return_from_daily_bar_db(symbol: str, market: str, d_days: int) -> Tuple[float, float]:
+    def _get_return_from_daily_bar_db(symbol: str, market: str, d_days: int) -> Tuple[float, float, str]:
         """优先使用本地 TrendDailyBar 序列计算 N 日收益"""
         raw = str(symbol or "").strip()
         candidates = [raw]
@@ -196,14 +429,14 @@ class TrendCalculator:
                 .where(TrendDailyBar.symbol.in_(candidates))
                 .order_by(TrendDailyBar.date.desc())
             )
-            rows = list(session.exec(stmt).all())
+            # 在 session 生命周期内提取纯数据，避免 detached ORM 访问
+            rows = [(r.date, float(r.close)) for r in session.exec(stmt).all() if r.close and r.close > 0]
 
         uniq = {}
-        for r in rows:
-            if r.close and r.close > 0:
-                uniq[r.date] = float(r.close)
+        for d, c in rows:
+            uniq[d] = c
         if not uniq:
-            return 0.0, 0.0
+            return 0.0, 0.0, ""
 
         dates = sorted(uniq.keys())
         current_date = dates[-1]
@@ -213,9 +446,9 @@ class TrendCalculator:
         past_price = uniq[past_dates[-1]] if past_dates else uniq[dates[0]]
 
         if past_price <= 0:
-            return 0.0, round(current_price, 4)
+            return 0.0, round(current_price, 4), str(current_date)
         ret = round((current_price - past_price) / past_price * 100, 2)
-        return ret, round(current_price, 4)
+        return ret, round(current_price, 4), str(current_date)
 
     @staticmethod
     def _normalize_reason(reason: str) -> str:
@@ -300,84 +533,22 @@ class TrendCalculator:
         return aggregated_reason, signal_strength
 
     @staticmethod
-    def _get_return(symbol: str, market: str, d_days: int) -> Tuple[float, float]:
-        """获取标的 N 天前的真实累计涨幅和现价 (基于日K线)"""
-        import akshare as ak
-        import pandas as pd
-        from datetime import timedelta
-        
-        # 先走本地快照库，避免周末/接口波动导致全0
+    def _get_return(symbol: str, market: str, d_days: int) -> Tuple[float, float, str]:
+        """获取标的 N 天前累计涨幅和现价（仅基于本地收盘价库）"""
+        # 先走本地 TrendDailyBar（收盘快照）
         try:
             db_ret = TrendCalculator._get_return_from_daily_bar_db(symbol, market, d_days)
-            if db_ret != (0.0, 0.0):
+            if db_ret[:2] != (0.0, 0.0):
                 return db_ret
         except Exception as e:
             logger.debug(f"TrendDailyBar fallback failed for {symbol} ({market}): {e}")
 
+        # 再回退 DailyRank 历史价格序列；不再调用外部实时/历史接口，避免口径和可达性波动
         try:
-            df = None
-            api_symbol = TrendCalculator._normalize_symbol_for_api(symbol, market)
-
-            if market == "CN":
-                # CN 接口通常需要加 sh/sz 或直接用6位代码
-                # 优先尝试 hist 接口，失败则回退新浪日线
-                try:
-                    df = ak.stock_zh_a_hist(symbol=api_symbol, period="daily")
-                except Exception:
-                    df = None
-                if df is None or df.empty:
-                    prefixed = f"sh{api_symbol}" if str(api_symbol).startswith("6") else f"sz{api_symbol}"
-                    df = ak.stock_zh_a_daily(symbol=prefixed)
-            elif market == "US":
-                # US 接口接受 AAPL
-                df = ak.stock_us_daily(symbol=api_symbol)
-            elif market == "HK":
-                # HK 接口接受 00700
-                df = ak.stock_hk_daily(symbol=api_symbol)
-            elif market == "CF":
-                # CF 期货历史数据
-                df = ak.futures_zh_daily_sina(symbol=api_symbol)
-                
-            if df is None or df.empty:
-                return 0.0, 0.0
-
-            # 字段归一化处理
-            date_col = "date" if "date" in df.columns else "日期"
-            close_col = "close" if "close" in df.columns else "收盘"
-            
-            if date_col not in df.columns or close_col not in df.columns:
-                return 0.0, 0.0
-                
-            df[date_col] = pd.to_datetime(df[date_col])
-            df = df.sort_values(by=date_col).reset_index(drop=True)
-            
-            # 最近的收盘价
-            current_close = float(df.iloc[-1][close_col])
-            current_date = df.iloc[-1][date_col]
-            
-            # N 天前的实际交易日 (往回找 d_days 个自然日左右的最近交易日)
-            target_date = current_date - timedelta(days=d_days)
-            # 找到小于等于 target_date 的最后一条记录
-            past_df = df[df[date_col] <= target_date]
-            if past_df.empty:
-                # 获取不到足够长的数据，用第一条
-                past_close = float(df.iloc[0][close_col])
-            else:
-                past_close = float(past_df.iloc[-1][close_col])
-                
-            if past_close <= 0:
-                return 0.0, current_close
-
-            ret = round((current_close - past_close) / past_close * 100, 2)
-            return ret, round(current_close, 4)
-        except Exception as e:
-            logger.debug(f"Calculate return failed for {symbol} ({market}): {e}")
-            # 回退：用本地 DailyRank 历史价格序列估算，避免全 0
-            try:
-                return TrendCalculator._get_return_from_daily_rank_db(symbol, market, d_days)
-            except Exception as e2:
-                logger.debug(f"DailyRank fallback failed for {symbol} ({market}): {e2}")
-                return 0.0, 0.0
+            return TrendCalculator._get_return_from_daily_rank_db(symbol, market, d_days)
+        except Exception as e2:
+            logger.debug(f"DailyRank fallback failed for {symbol} ({market}): {e2}")
+            return 0.0, 0.0, ""
 
     @staticmethod
     def calculate_trend(days: int = 7) -> Dict[str, List[Dict]]:
@@ -426,9 +597,10 @@ class TrendCalculator:
         
         # 3. 并发查 N 日涨幅
         def _process(item: dict):
-            ret, current_price = TrendCalculator._get_return(item["symbol"], item["market"], days)
+            ret, current_price, price_date = TrendCalculator._get_return(item["symbol"], item["market"], days)
             item["return_pct"] = ret
             item["current_price"] = current_price
+            item["price_date"] = price_date
 
             # 多日理由做“同类去重 + 新鲜度衰减”
             aggregated_reason, signal_strength = TrendCalculator._aggregate_reasons_with_decay(

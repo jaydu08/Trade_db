@@ -79,13 +79,18 @@ class FinnhubProvider(BaseMarketProvider):
             
         try:
             import requests
-            url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={self.api_key}"
+            # 兼容 EastMoney 风格代码: 105.TSEM -> TSEM
+            norm_symbol = str(symbol or "").split(".")[-1].strip().upper()
+            if not norm_symbol:
+                return None
+            url = f"https://finnhub.io/api/v1/quote?symbol={norm_symbol}&token={self.api_key}"
             resp = requests.get(url, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
                 # c: Current price, d: Change, dp: Percent change
                 if data.get('c') and data.get('c') > 0:
                     return {
+                        "symbol": norm_symbol,
                         "price": data['c'],
                         "change": data['d'],
                         "pct_chg": data['dp'],

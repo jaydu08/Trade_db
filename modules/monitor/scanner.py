@@ -1,8 +1,10 @@
 import logging
 import datetime
 import concurrent.futures
+import os
 from typing import Optional
 from pydantic import BaseModel, Field
+from zoneinfo import ZoneInfo
 
 from modules.monitor.repository import WatchlistRepository
 from modules.monitor.notifier import Notifier
@@ -30,12 +32,29 @@ class MonitorService:
     
     # 异动判定阈值 (%)
     THRESHOLD_PCT = 3.0
+    # 扫描互斥锁文件（防多进程重复扫描）
+    SCAN_LOCK_FILE = "/tmp/trade_db_monitor_scan.lock"
     
     @staticmethod
     def scan_and_alert():
         """
         Scan all watchlist items for anomalies using AsyncMarketProber.
         """
+        # 多实例并发保护：同一时刻仅允许一个进程执行扫描
+        lock_fp = None
+        try:
+            import fcntl
+            lock_fp = open(MonitorService.SCAN_LOCK_FILE, "w")
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except Exception:
+            logger.info("Skip monitor_scan: another process holds scan lock.")
+            if lock_fp:
+                try:
+                    lock_fp.close()
+                except Exception:
+                    pass
+            return
+
         logger.info("Scanning watchlist...")
         
         repo = WatchlistRepository()
@@ -64,43 +83,107 @@ class MonitorService:
             logger.error(f"Failed to fetch quotes async: {e}")
             return
 
-        for item in active_items:
-            symbol = item['symbol']
-            market = item.get('market', 'CN')
-            item_key = WatchlistRepository.build_item_key(symbol, market)
-            quote = quotes_results.get(item_key)
-            if not quote:
-                continue
-                
-            pct_chg = quote.get('pct_chg')
-            
-            # 仅推送正向涨幅（只监控上涨异动）
-            if pct_chg is None or pct_chg <= 0:
-                continue
-                
-            # Check Threshold
-            threshold = item.get('alert_threshold_pct', 5.0)
-            
-            if pct_chg >= threshold:
-                # Check Cooldown — 使用各市场本地时区的"今天"，防止北京时间跨日导致美股被误封
-                import pytz
-                tz_map = {'CN': 'Asia/Shanghai', 'HK': 'Asia/Hong_Kong', 'US': 'America/New_York'}
-                tz = pytz.timezone(tz_map.get(market, 'Asia/Shanghai'))
-                today = str(datetime.datetime.now(tz).date())
-                
-                last_alert_str = item.get('last_alert_at')
-                last_alert = last_alert_str.split()[0] if last_alert_str else None
-                
-                if last_alert != today:
-                    # Persist Alert to DB
-                    MonitorService._persist_alert(item, quote)
-                    
+        try:
+            for item in active_items:
+                symbol = item['symbol']
+                market = item.get('market', 'CN')
+                item_key = WatchlistRepository.build_item_key(symbol, market)
+                quote = quotes_results.get(item_key)
+                if not quote:
+                    continue
+
+                pct_chg = quote.get('pct_chg')
+
+                # 仅推送正向涨幅（只监控上涨异动）
+                if pct_chg is None or pct_chg <= 0:
+                    continue
+
+                # Check Threshold
+                threshold = item.get('alert_threshold_pct', 5.0)
+
+                if pct_chg >= threshold:
+                    # 双重去重：watchlist 本地状态 + DB 告警记录（跨进程可靠）
+                    if MonitorService._already_alerted_today(item):
+                        continue
+
+                    # Persist Alert to DB（仅当真正落库成功时才触发推送）
+                    inserted = MonitorService._persist_alert(item, quote)
+                    if not inserted:
+                        continue
+
                     # Trigger Alert
                     MonitorService.trigger_alert(item, quote)
-                    
+
                     # Update State
                     item['last_alert_at'] = str(datetime.datetime.now())
                     repo.upsert_by_symbol_market(item)
+        finally:
+            # 释放锁
+            if lock_fp:
+                try:
+                    import fcntl
+                    fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+                    lock_fp.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _market_timezone(market: str) -> ZoneInfo:
+        tz_map = {
+            "CN": "Asia/Shanghai",
+            "HK": "Asia/Hong_Kong",
+            "US": "America/New_York",
+        }
+        return ZoneInfo(tz_map.get(market, "Asia/Shanghai"))
+
+    @staticmethod
+    def _already_alerted_today(item: dict) -> bool:
+        """
+        去重判断（今天是否已告警）：
+        1) watchlist.json 的 last_alert_at
+        2) ledger.watchlistalert 最近记录（防多进程/状态回滚）
+        """
+        market = item.get("market", "CN")
+        symbol = item.get("symbol", "")
+        if not symbol:
+            return False
+
+        tz = MonitorService._market_timezone(market)
+        today_local = datetime.datetime.now(tz).date()
+
+        # 1) watchlist 本地状态
+        last_alert_str = item.get("last_alert_at")
+        if last_alert_str:
+            try:
+                last_dt = datetime.datetime.fromisoformat(str(last_alert_str).strip())
+                if last_dt.tzinfo is None:
+                    # 历史数据当作本地时间使用
+                    last_dt = last_dt.replace(tzinfo=tz)
+                if last_dt.astimezone(tz).date() == today_local:
+                    return True
+            except Exception:
+                pass
+
+        # 2) DB 记录兜底（timestamp 存 UTC naive）
+        from core.db import db_manager
+        from domain.ledger.analytics import WatchlistAlert
+        from sqlmodel import select
+        try:
+            with db_manager.ledger_session() as session:
+                latest = session.exec(
+                    select(WatchlistAlert)
+                    .where(WatchlistAlert.symbol == symbol)
+                    .where(WatchlistAlert.market == market)
+                    .order_by(WatchlistAlert.timestamp.desc())
+                ).first()
+                if latest and latest.timestamp:
+                    ts_utc = latest.timestamp.replace(tzinfo=datetime.timezone.utc)
+                    if ts_utc.astimezone(tz).date() == today_local:
+                        return True
+        except Exception as e:
+            logger.warning(f"Alert dedupe check failed for {symbol}: {e}")
+
+        return False
 
     @staticmethod
     def _is_market_open(market: str) -> bool:
@@ -133,12 +216,16 @@ class MonitorService:
         return False
 
     @staticmethod
-    def _persist_alert(item: dict, quote: dict):
+    def _persist_alert(item: dict, quote: dict) -> bool:
         """记录预警信息到数据库"""
         from core.db import db_manager
         from domain.ledger.analytics import WatchlistAlert
         
         try:
+            # 二次兜底：避免并发情况下重复写入（按“市场本地日”只落一条）
+            if MonitorService._already_alerted_today(item):
+                return False
+
             alert = WatchlistAlert(
                 symbol=item['symbol'],
                 name=item['name'],
@@ -151,8 +238,10 @@ class MonitorService:
             with db_manager.ledger_session() as session:
                 session.add(alert)
                 logger.info(f"Persisted WatchlistAlert for {item['symbol']} to ledger DB.")
+            return True
         except Exception as e:
             logger.error(f"Failed to persist WatchlistAlert: {e}")
+            return False
 
     @staticmethod
     def trigger_alert(item: dict, quote: dict):

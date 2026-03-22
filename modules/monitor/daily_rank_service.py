@@ -29,6 +29,8 @@ class DailyRankService:
             rank_types = ["change_pct", "amount", "turnover"]
             
         today = date.today()
+        inserted_by_market = {}
+        expected_markets = []
         
         with db_manager.ledger_session() as session:
             bar_buffer = {}
@@ -36,6 +38,8 @@ class DailyRankService:
                 if not DailyRankService._should_sync_today(market):
                     logger.info(f"Skipping {market} daily rank sync: Not a valid reporting day (Weekend).")
                     continue
+                expected_markets.append(market)
+                inserted_by_market.setdefault(market, 0)
                     
                 for rank_type in rank_types:
                     # 检查今天是否已经同步过
@@ -82,6 +86,7 @@ class DailyRankService:
                             turnover_rate=turnover_rate,
                         )
                         ranks.append(r)
+                        inserted_by_market[market] = inserted_by_market.get(market, 0) + 1
                         key = (market, symbol)
                         if key not in bar_buffer or amount > bar_buffer[key]["amount"]:
                             bar_buffer[key] = {
@@ -134,6 +139,16 @@ class DailyRankService:
                     TrendService.save_daily_bars(mkt, payloads, source="daily_rank")
             except Exception as e:
                 logger.error(f"Failed to save TrendDailyBar from DailyRank: {e}")
+
+        # 交易日应采集但全 0 时，主动告警
+        zero_markets = [m for m in expected_markets if inserted_by_market.get(m, 0) == 0]
+        if zero_markets:
+            logger.error("DailyRank sync wrote zero rows on valid day: markets=%s", zero_markets)
+            try:
+                from modules.monitor.notifier import Notifier
+                Notifier.broadcast("⚠️ DailyRank采集异常：交易日写入为0 -> " + ",".join(zero_markets))
+            except Exception as e:
+                logger.warning("DailyRank zero-row alert failed: %s", e)
 
     @staticmethod
     def _should_sync_today(market: str) -> bool:
