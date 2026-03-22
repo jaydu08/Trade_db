@@ -4,7 +4,7 @@ import re
 import concurrent.futures
 from difflib import SequenceMatcher
 from sqlmodel import select
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 from core.db import get_ledger_session
 from domain.ledger.analytics import TrendSeedPool, DailyRank, TrendDailyBar
@@ -12,7 +12,14 @@ from domain.ledger.analytics import TrendSeedPool, DailyRank, TrendDailyBar
 logger = logging.getLogger(__name__)
 
 class TrendService:
-    EOD_SOURCES = {"daily_rank", "trend_pool_refresh_eod", "commodity", "heatmap", "selftest"}
+    EOD_SOURCES = {
+        "daily_rank",
+        "trend_pool_refresh_eod",
+        "trend_pool_history_backfill",
+        "commodity",
+        "heatmap",
+        "selftest",
+    }
     POOL_RETENTION_DAYS = 60
     POOL_SYMBOL_CAPS = {"CN": 100, "US": 100, "HK": 50, "CF": 30}
 
@@ -122,6 +129,260 @@ class TrendService:
         if market == "US" and quote.get("provider") != "Finnhub":
             return None
         return quote
+
+    @staticmethod
+    def _to_date(value) -> Optional[dt.date]:
+        if value is None:
+            return None
+        if isinstance(value, dt.datetime):
+            return value.date()
+        if isinstance(value, dt.date):
+            return value
+        s = str(value).strip()
+        if not s:
+            return None
+        try:
+            return dt.datetime.fromisoformat(s[:10]).date()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalize_symbol_for_history(symbol: str, market: str) -> str:
+        sym = str(symbol or "").strip()
+        if market == "US" and "." in sym:
+            sym = sym.split(".")[-1].strip()
+        return sym
+
+    @staticmethod
+    def _fetch_symbol_history(market: str, symbol: str):
+        """
+        获取单标的历史日线（优先项目内已验证可用接口）。
+        """
+        import akshare as ak
+
+        sym = TrendService._normalize_symbol_for_history(symbol, market)
+        if not sym:
+            return None
+
+        if market == "CN":
+            prefixed = f"sh{sym}" if str(sym).startswith("6") else f"sz{sym}"
+            try:
+                return ak.stock_zh_a_daily(symbol=prefixed)
+            except Exception:
+                try:
+                    return ak.stock_zh_a_hist(symbol=sym, period="daily")
+                except Exception:
+                    return None
+        if market == "HK":
+            try:
+                return ak.stock_hk_daily(symbol=sym)
+            except Exception:
+                return None
+        if market == "US":
+            try:
+                return ak.stock_us_daily(symbol=sym)
+            except Exception:
+                return None
+        if market == "CF":
+            try:
+                return ak.futures_zh_daily_sina(symbol=sym)
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _build_history_items(market: str, symbol: str, name: str, df, cutoff: dt.date) -> List[Dict]:
+        if df is None or getattr(df, "empty", True):
+            return []
+
+        # 字段兼容（akshare 各接口列名有差异）
+        cols = set(str(c).lower() for c in list(df.columns))
+        date_col = "date" if "date" in cols else ("日期" if "日期" in df.columns else None)
+        open_col = "open" if "open" in cols else ("开盘" if "开盘" in df.columns else None)
+        high_col = "high" if "high" in cols else ("最高" if "最高" in df.columns else None)
+        low_col = "low" if "low" in cols else ("最低" if "最低" in df.columns else None)
+        close_col = "close" if "close" in cols else ("收盘" if "收盘" in df.columns else None)
+        amount_col = "amount" if "amount" in cols else ("成交额" if "成交额" in df.columns else None)
+        turnover_col = "turnover" if "turnover" in cols else ("换手率" if "换手率" in df.columns else None)
+
+        if not date_col or not close_col:
+            return []
+
+        items: List[Dict] = []
+        for _, row in df.iterrows():
+            d = TrendService._to_date(row.get(date_col))
+            if not d or d < cutoff:
+                continue
+            close = float(row.get(close_col, 0) or 0)
+            if close <= 0:
+                continue
+            open_price = float(row.get(open_col, 0) or 0) if open_col else close
+            high = float(row.get(high_col, 0) or 0) if high_col else max(close, open_price)
+            low = float(row.get(low_col, 0) or 0) if low_col else min(close, open_price)
+            amount = float(row.get(amount_col, 0) or 0) if amount_col else 0.0
+            turnover = float(row.get(turnover_col, 0) or 0) if turnover_col else 0.0
+            pct = 0.0
+            if open_price > 0:
+                pct = round((close - open_price) / open_price * 100, 4)
+            items.append(
+                {
+                    "date": d,
+                    "symbol": symbol,
+                    "name": name or "",
+                    "open": open_price if open_price > 0 else close,
+                    "high": high if high > 0 else max(close, open_price),
+                    "low": low if low > 0 else min(close, open_price),
+                    "close": close,
+                    "amount": amount,
+                    "turnover_rate": turnover,
+                    "pct_chg": pct,
+                }
+            )
+        return items
+
+    @staticmethod
+    def _save_historical_bars(market: str, symbol: str, items: List[Dict], source: str) -> int:
+        """
+        仅插入缺失历史，不覆盖已有记录。
+        """
+        if not items:
+            return 0
+        cutoff = dt.date.today() - dt.timedelta(days=180)
+        saved = 0
+        try:
+            with get_ledger_session() as session:
+                existing_dates = {
+                    r.date
+                    for r in session.exec(
+                        select(TrendDailyBar).where(
+                            TrendDailyBar.market == market,
+                            TrendDailyBar.symbol == symbol,
+                            TrendDailyBar.date >= cutoff,
+                        )
+                    ).all()
+                }
+
+                for item in sorted(items, key=lambda x: x["date"]):
+                    d = item["date"]
+                    if d in existing_dates:
+                        continue
+                    close = float(item.get("close", 0) or 0)
+                    if close <= 0:
+                        continue
+                    pct = float(item.get("pct_chg", 0) or 0)
+                    if source != "trend_pool_history_backfill":
+                        if TrendService._is_anomalous_close(session, market, symbol, close, pct):
+                            continue
+                    open_price = float(item.get("open", 0) or 0)
+                    base_open = open_price if open_price > 0 else close
+                    high = float(item.get("high", 0) or 0)
+                    low = float(item.get("low", 0) or 0)
+                    amount = float(item.get("amount", 0) or 0)
+                    turnover = float(item.get("turnover_rate", 0) or 0)
+                    session.add(
+                        TrendDailyBar(
+                            date=d,
+                            market=market,
+                            symbol=symbol,
+                            name=str(item.get("name", "") or ""),
+                            open=base_open,
+                            high=high if high > 0 else max(close, base_open),
+                            low=low if low > 0 else min(close, base_open),
+                            close=close,
+                            amount=amount,
+                            turnover_rate=turnover,
+                            source=source,
+                        )
+                    )
+                    existing_dates.add(d)
+                    saved += 1
+
+                old_rows = session.exec(
+                    select(TrendDailyBar).where(TrendDailyBar.market == market, TrendDailyBar.date < cutoff)
+                ).all()
+                for row in old_rows:
+                    session.delete(row)
+        except Exception as e:
+            logger.error("Failed saving historical bars: market=%s symbol=%s err=%s", market, symbol, e)
+            return 0
+        return saved
+
+    @staticmethod
+    def _get_symbols_need_backfill(market: str, symbols: List[str], cutoff: dt.date, lookback_days: int) -> List[str]:
+        if not symbols:
+            return []
+        earliest: Dict[str, dt.date] = {}
+        with get_ledger_session() as session:
+            rows = session.exec(
+                select(TrendDailyBar.symbol, TrendDailyBar.date).where(
+                    TrendDailyBar.market == market,
+                    TrendDailyBar.symbol.in_(symbols),
+                    TrendDailyBar.date >= cutoff,
+                )
+            ).all()
+        for sym, d in rows:
+            if sym not in earliest or d < earliest[sym]:
+                earliest[sym] = d
+
+        tolerance_days = 3 if lookback_days >= 14 else 1
+        threshold = cutoff + dt.timedelta(days=tolerance_days)
+        return [sym for sym in symbols if sym not in earliest or earliest[sym] > threshold]
+
+    @staticmethod
+    def backfill_pool_history(markets: List[str], lookback_days: int = 60) -> Dict[str, Dict[str, int]]:
+        """
+        给趋势池标的补齐近 lookback_days 天的历史交易日收盘序列。
+        只插入缺失日期，不覆盖已落盘数据。
+        """
+        today = dt.date.today()
+        cutoff = today - dt.timedelta(days=lookback_days)
+        summary: Dict[str, Dict[str, int]] = {}
+
+        with get_ledger_session() as session:
+            rows = session.exec(select(TrendSeedPool).where(TrendSeedPool.date >= cutoff)).all()
+            recs = [
+                {"market": r.market, "symbol": r.symbol, "name": r.name}
+                for r in rows
+                if r.market in markets and r.symbol
+            ]
+
+        by_market: Dict[str, Dict[str, str]] = {}
+        for r in recs:
+            by_market.setdefault(r["market"], {})
+            by_market[r["market"]][r["symbol"]] = r.get("name", "")
+
+        for market in markets:
+            sym_map = by_market.get(market, {})
+            symbols = list(sym_map.keys())
+            if not symbols:
+                summary[market] = {"candidates": 0, "targets": 0, "saved_rows": 0}
+                continue
+
+            targets = TrendService._get_symbols_need_backfill(market, symbols, cutoff, lookback_days)
+            saved_rows = 0
+
+            def _work(sym: str) -> int:
+                df = TrendService._fetch_symbol_history(market, sym)
+                items = TrendService._build_history_items(market, sym, sym_map.get(sym, ""), df, cutoff)
+                return TrendService._save_historical_bars(market, sym, items, source="trend_pool_history_backfill")
+
+            if targets:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(targets))) as executor:
+                    future_map = {executor.submit(_work, sym): sym for sym in targets}
+                    for fut in concurrent.futures.as_completed(future_map, timeout=360):
+                        try:
+                            saved_rows += int(fut.result() or 0)
+                        except Exception:
+                            continue
+
+            summary[market] = {
+                "candidates": len(symbols),
+                "targets": len(targets),
+                "saved_rows": saved_rows,
+            }
+
+        logger.info("Trend pool history backfill finished: %s", summary)
+        return summary
 
     @staticmethod
     def add_to_pool(market: str, items: List[Dict]):
@@ -262,6 +523,7 @@ class TrendService:
         lookback_days: int = 60,
         source: str = "trend_pool_refresh_eod",
         alert_on_zero: bool = False,
+        backfill_history: bool = True,
     ) -> Dict[str, Dict[str, int]]:
         """
         每日补齐趋势池标的的快照价格（按市场批量拉取实时行情）。
@@ -289,7 +551,7 @@ class TrendService:
         for market in markets:
             sym_map = by_market.get(market, {})
             if not sym_map:
-                summary[market] = {"candidates": 0, "quoted": 0, "saved": 0}
+                summary[market] = {"candidates": 0, "quoted": 0, "saved": 0, "backfill_targets": 0, "backfill_saved_rows": 0}
                 continue
 
             symbols = list(sym_map.keys())
@@ -332,6 +594,8 @@ class TrendService:
                 "candidates": len(symbols),
                 "quoted": len(payloads),
                 "saved": len(payloads),
+                "backfill_targets": 0,
+                "backfill_saved_rows": 0,
             }
 
             if len(symbols) > 0 and len(payloads) == 0:
@@ -340,6 +604,16 @@ class TrendService:
                     market,
                     len(symbols),
                 )
+
+        if backfill_history:
+            try:
+                backfill = TrendService.backfill_pool_history(markets, lookback_days=lookback_days)
+                for market, payload in backfill.items():
+                    summary.setdefault(market, {})
+                    summary[market]["backfill_targets"] = payload.get("targets", 0)
+                    summary[market]["backfill_saved_rows"] = payload.get("saved_rows", 0)
+            except Exception as e:
+                logger.error("Trend pool history backfill failed: %s", e, exc_info=True)
 
         logger.info("Trend pool daily refresh finished: %s", summary)
         if alert_on_zero:
