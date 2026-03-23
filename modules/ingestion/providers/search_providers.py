@@ -14,9 +14,20 @@ class SearXNGProvider(BaseSearchProvider):
     SearXNG 多 URLs 自动降级 Provider
     """
     def __init__(self):
-        # 允许多个URL配置，逗号分隔
-        urls_str = os.getenv("SEARXNG_URLS", "http://localhost:8080,https://searx.be")
-        self.urls = [url.strip() for url in urls_str.split(",") if url.strip()]
+        # 允许多个URL配置，逗号分隔。若未配置，使用公网可用实例兜底。
+        urls_str = os.getenv("SEARXNG_URLS", "")
+        urls = [url.strip() for url in urls_str.split(",") if url.strip()]
+        fallback_urls = [
+            "https://searx.be",
+            "https://searx.tiekoetter.com",
+        ]
+        if not urls:
+            urls = fallback_urls.copy()
+        else:
+            for u in fallback_urls:
+                if u not in urls:
+                    urls.append(u)
+        self.urls = urls
         self.timeout = 10
         
     @property
@@ -64,7 +75,7 @@ class TavilyProvider(BaseSearchProvider):
     Tavily 搜索 API
     """
     def __init__(self):
-        self.api_key = os.getenv("TAVILY_API_KEY")
+        self.api_key = os.getenv("TAVILY_API_KEY") or os.getenv("TAVILY_KEY")
         
     @property
     def provider_name(self) -> str:
@@ -107,7 +118,11 @@ class BochaProvider(BaseSearchProvider):
     """
     def __init__(self):
         # Never ship with a hardcoded secret fallback.
-        self.api_key = os.getenv("BOCHA_API_KEY")
+        self.api_key = (
+            os.getenv("BOCHA_API_KEY")
+            or os.getenv("BOCHA_KEY")
+            or os.getenv("BOCHA_API_TOKEN")
+        )
         
     @property
     def provider_name(self) -> str:

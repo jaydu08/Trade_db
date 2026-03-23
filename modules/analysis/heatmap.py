@@ -24,9 +24,30 @@ class MarketHeatMap:
     def _get_news_and_reason(self, symbol: str, name: str, pct_chg: float, market: str) -> str:
         """获取个股最新消息，并交给 LLM 极简归因"""
         try:
-            # 搜索新闻
-            query = f"{symbol} {name} stock news latest" if market == 'US' else f"{symbol} {name} 最新消息"
-            news_context = Tools.web_search(query)
+            # 双通道搜索：个股 + 市场背景（与异动归因链路保持一致口径）
+            if market == 'US':
+                q_specific = f"{symbol} stock news why down up today"
+                q_market = "US stock market today main drivers tech news"
+            elif market == 'HK':
+                q_specific = f"{symbol} {name} 港股 股价 异动原因 暴涨 暴跌 财报"
+                q_market = "港股 恒生科技 恒指 今日异动 大盘分析"
+            else:
+                q_specific = f"{symbol} {name} 股票 为什么 涨停 跌停 异动 最新公告"
+                q_market = "A股 沪指 创业板 今日异动 板块 领涨"
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                f_specific = pool.submit(Tools.web_search, q_specific)
+                f_market = pool.submit(Tools.web_search, q_market)
+                specific_news = f_specific.result(timeout=25)
+                market_news = f_market.result(timeout=25)
+
+            news_context = f"【个股专有资讯】:\n{specific_news}"
+            if (
+                len(specific_news) < 100
+                or "暂无相关新闻" in specific_news
+                or "所有搜索引擎均未返回有效结果" in specific_news
+            ):
+                news_context += f"\n\n【市场/大盘/板块背景】:\n{market_news}"
 
             # LLM 归因
             prompt = f"""
@@ -47,6 +68,48 @@ class MarketHeatMap:
         except Exception as e:
             logger.warning(f"Failed to get reason for {symbol}: {e}")
             return "分析原因失败"
+
+    def _persist_daily_rank_from_heatmap(self, market: str, results: List[Dict]):
+        """将热榜结果直接写入 DailyRank（口径统一为 heatmap 结果）"""
+        from sqlmodel import select
+        from core.db import db_manager
+        from domain.ledger.analytics import DailyRank
+
+        today = datetime.date.today()
+        rows = []
+        for item in results:
+            pct = float(item.get("pct_chg", 0) or 0)
+            if pct <= 0:
+                continue
+            rows.append(
+                DailyRank(
+                    date=today,
+                    market=market,
+                    rank_type="change_pct",
+                    symbol=str(item.get("symbol", "")),
+                    name=str(item.get("name", "")),
+                    price=float(item.get("price", 0) or 0),
+                    change_pct=pct,
+                    amount=float(item.get("amount", 0) or 0),
+                    turnover_rate=float(item.get("turnover", 0) or 0),
+                )
+            )
+
+        with db_manager.ledger_session() as session:
+            existing = session.exec(
+                select(DailyRank).where(
+                    DailyRank.date == today,
+                    DailyRank.market == market,
+                    DailyRank.rank_type == "change_pct",
+                )
+            ).all()
+            for old in existing:
+                session.delete(old)
+            if rows:
+                session.add_all(rows)
+            session.commit()
+
+        logger.info("DailyRank synced from heatmap: market=%s rows=%s date=%s", market, len(rows), today)
 
     def _generate_heatmap(self, df: pd.DataFrame, market: str, top_n: int = 10, min_amount: float = 50000000) -> List[Dict]:
         """从行情 DataFrame 中选出榜单"""
@@ -256,15 +319,19 @@ class MarketHeatMap:
         # 1. 获取行情
         df = pd.DataFrame()
         try:
+            from modules.ingestion.akshare_client import AkShareClient
             if market == 'CN':
                 # 东方财富接口(stock_zh_a_spot_em)在当前服务器被封，改用新浪批量接口
                 # _fetch_bulk_sina 已被 HK/US 验证可用，CN同样支持
-                from modules.ingestion.akshare_client import AkShareClient
                 df = AkShareClient._fetch_bulk_sina('CN')
             elif market == 'HK':
                 df = akshare_client.get_stock_info_hk()
+                if df.empty:
+                    df = AkShareClient._to_rank_schema(AkShareClient._safe_call(["stock_hk_spot"]))
             elif market == 'US':
                 df = akshare_client.get_stock_info_us()
+                if df.empty:
+                    df = AkShareClient._to_rank_schema(AkShareClient._safe_call(["stock_us_spot"]))
         except Exception as e:
             logger.error(f"Failed to fetch market data for {market}: {e}")
             return
@@ -291,8 +358,24 @@ class MarketHeatMap:
         top_stocks = self._generate_heatmap(df, market, top_n=n, min_amount=min_amt)
         
         if not top_stocks:
-            logger.warning(f"No stocks found for {market} heat map.")
-            return
+            logger.warning(f"No stocks found for {market} heat map. Fallback to daily top ranks.")
+            fallback_df = akshare_client.get_daily_top_ranks(
+                market=market, rank_type="change_pct", top_n=n
+            )
+            if fallback_df.empty:
+                logger.warning(f"Fallback daily ranks still empty for {market}.")
+                return
+            top_stocks = [
+                {
+                    "symbol": str(row.get("symbol", "")),
+                    "name": str(row.get("name", "")),
+                    "price": float(row.get("price", 0) or 0),
+                    "pct_chg": float(row.get("change_pct", 0) or 0),
+                    "amount": float(row.get("amount", 0) or 0),
+                    "turnover": float(row.get("turnover_rate", 0) or 0),
+                }
+                for _, row in fallback_df.iterrows()
+            ]
 
         # 3. 并发获取归因
         futures = {}
@@ -315,6 +398,12 @@ class MarketHeatMap:
             
         # 还原回按涨幅排序 (因为 as_completed 不保证顺序)
         results.sort(key=lambda x: x['pct_chg'], reverse=True)
+
+        # 4. 先把热榜结果直接写入 DailyRank，统一“推送口径=入库口径”
+        try:
+            self._persist_daily_rank_from_heatmap(market, results)
+        except Exception as e:
+            logger.error(f"Failed to persist DailyRank from heatmap ({market}): {e}")
         
         # 5. 存入长线趋势种子池
         try:

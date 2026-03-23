@@ -2,6 +2,7 @@
 Daily Rank Service - 每日榜单服务
 """
 import logging
+import os
 from datetime import date
 from typing import List
 
@@ -31,6 +32,8 @@ class DailyRankService:
         today = date.today()
         inserted_by_market = {}
         expected_markets = []
+        enable_top_alert = DailyRankService._env_flag("ENABLE_DAILY_RANK_TOP_ALERT", default=False)
+        enable_zero_alert = DailyRankService._env_flag("ENABLE_DAILY_RANK_ZERO_ALERT", default=False)
         
         with db_manager.ledger_session() as session:
             bar_buffer = {}
@@ -104,8 +107,9 @@ class DailyRankService:
                     # 触发 AI 归因 (抽取 Top 3)
                     try:
                         from modules.monitor.scanner import MonitorService, analysis_executor
-                        from modules.monitor.notifier import Notifier
-                        if ranks:
+                        # 默认关闭：避免盘后榜单产生额外“Top标的预警”噪音
+                        # 如需启用，设置 ENABLE_DAILY_RANK_TOP_ALERT=1
+                        if enable_top_alert and rank_type == "change_pct" and ranks:
                             market_cn = {'CN': 'A股', 'HK': '港股', 'US': '美股'}.get(market, market)
                             top_focus = sorted(ranks, key=lambda x: x.change_pct, reverse=True)[:3]
                             for focus_r in top_focus:
@@ -144,11 +148,23 @@ class DailyRankService:
         zero_markets = [m for m in expected_markets if inserted_by_market.get(m, 0) == 0]
         if zero_markets:
             logger.error("DailyRank sync wrote zero rows on valid day: markets=%s", zero_markets)
-            try:
-                from modules.monitor.notifier import Notifier
-                Notifier.broadcast("⚠️ DailyRank采集异常：交易日写入为0 -> " + ",".join(zero_markets))
-            except Exception as e:
-                logger.warning("DailyRank zero-row alert failed: %s", e)
+            # 默认不向 UI/Telegram 广播内部采集异常，避免污染用户侧体验
+            # 如需启用，设置 ENABLE_DAILY_RANK_ZERO_ALERT=1
+            if enable_zero_alert:
+                try:
+                    from modules.monitor.notifier import Notifier
+                    Notifier.broadcast("⚠️ DailyRank采集异常：交易日写入为0 -> " + ",".join(zero_markets))
+                except Exception as e:
+                    logger.warning("DailyRank zero-row alert failed: %s", e)
+            else:
+                logger.info("DailyRank zero-row broadcast disabled, markets=%s", zero_markets)
+
+    @staticmethod
+    def _env_flag(name: str, default: bool = False) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
     @staticmethod
     def _should_sync_today(market: str) -> bool:

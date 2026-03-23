@@ -4,6 +4,7 @@ Task Scheduler - 核心调度系统
 """
 import logging
 import time
+import os
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -188,23 +189,26 @@ class TaskScheduler:
             replace_existing=True
         )
 
-        # 12. DailyRank 同步（CN/HK）: 工作日 18:50
-        self.scheduler.add_job(
-            self._job_daily_rank_cn_hk,
-            CronTrigger(day_of_week='mon-fri', hour=18, minute=50),
-            id="daily_rank_cn_hk",
-            name="每日榜单同步(CN/HK)",
-            replace_existing=True
-        )
+        # 12/13. DailyRank 独立同步任务（默认关闭）
+        # 当前主链路由 heatmap 直接写入 ledger.dailyrank，避免双链路口径冲突。
+        if os.getenv("ENABLE_DAILY_RANK_JOB", "0") == "1":
+            self.scheduler.add_job(
+                self._job_daily_rank_cn_hk,
+                CronTrigger(day_of_week='mon-fri', hour=18, minute=50),
+                id="daily_rank_cn_hk",
+                name="每日榜单同步(CN/HK)",
+                replace_existing=True
+            )
 
-        # 13. DailyRank 同步（US）: 周二至周六 08:05
-        self.scheduler.add_job(
-            self._job_daily_rank_us,
-            CronTrigger(day_of_week='tue-sat', hour=8, minute=5),
-            id="daily_rank_us",
-            name="每日榜单同步(US)",
-            replace_existing=True
-        )
+            self.scheduler.add_job(
+                self._job_daily_rank_us,
+                CronTrigger(day_of_week='tue-sat', hour=8, minute=5),
+                id="daily_rank_us",
+                name="每日榜单同步(US)",
+                replace_existing=True
+            )
+        else:
+            logger.info("DailyRank standalone jobs disabled; heatmap pipeline will persist DailyRank directly.")
 
         logger.info(f"Registered {len(self.scheduler.get_jobs())} jobs.")
 

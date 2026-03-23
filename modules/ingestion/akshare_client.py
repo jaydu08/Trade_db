@@ -173,6 +173,63 @@ class AkShareClient:
         return pd.DataFrame(results)
 
     @staticmethod
+    def _pick_first_column(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
+        for col in candidates:
+            if col in df.columns:
+                return col
+        return None
+
+    @staticmethod
+    def _to_rank_schema(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        将不同来源的行情字段统一为 DailyRank 所需口径：
+        代码/名称/最新价/涨跌幅/成交额/换手率
+        """
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        work = df.copy()
+        symbol_col = AkShareClient._pick_first_column(work, ["代码", "symbol"])
+        name_col = AkShareClient._pick_first_column(work, ["名称", "中文名称", "cname", "name", "英文名称"])
+        price_col = AkShareClient._pick_first_column(work, ["最新价", "price"])
+        pct_col = AkShareClient._pick_first_column(work, ["涨跌幅", "chg", "changepercent"])
+        amount_col = AkShareClient._pick_first_column(work, ["成交额", "amount"])
+        volume_col = AkShareClient._pick_first_column(work, ["成交量", "volume"])
+        turn_col = AkShareClient._pick_first_column(work, ["换手率", "turnover_rate", "turnover"])
+
+        if not symbol_col or not price_col or not pct_col:
+            return pd.DataFrame()
+
+        if not name_col:
+            name_col = symbol_col
+
+        if not amount_col:
+            if volume_col:
+                work["_amount_tmp"] = (
+                    pd.to_numeric(work[volume_col], errors="coerce").fillna(0.0)
+                    * pd.to_numeric(work[price_col], errors="coerce").fillna(0.0)
+                )
+            else:
+                work["_amount_tmp"] = 0.0
+            amount_col = "_amount_tmp"
+
+        if not turn_col:
+            work["_turn_tmp"] = 0.0
+            turn_col = "_turn_tmp"
+
+        out = pd.DataFrame(
+            {
+                "代码": work[symbol_col].astype(str).str.strip(),
+                "名称": work[name_col].astype(str).str.strip(),
+                "最新价": pd.to_numeric(work[price_col], errors="coerce").fillna(0.0),
+                "涨跌幅": pd.to_numeric(work[pct_col], errors="coerce").fillna(0.0),
+                "成交额": pd.to_numeric(work[amount_col], errors="coerce").fillna(0.0),
+                "换手率": pd.to_numeric(work[turn_col], errors="coerce").fillna(0.0),
+            }
+        )
+        return out
+
+    @staticmethod
     @cached("ak_stock_hk", ttl=3600)
     def get_stock_info_hk() -> pd.DataFrame:
         logger.info("Fetching HK stock list using Sina batch...")
@@ -531,20 +588,26 @@ class AkShareClient:
         
         try:
             if market == "CN":
-                # 东方财富接口在当前服务器被封(RemoteDisconnected)，改用新浪批量接口
-                df = AkShareClient._fetch_bulk_sina("CN")
-                symbol_col, name_col, price_col, pct_col, amt_col, turn_col = "代码", "名称", "最新价", "涨跌幅", "成交额", "换手率"
+                df = AkShareClient._to_rank_schema(AkShareClient._fetch_bulk_sina("CN"))
             elif market == "HK":
-                df = ak.stock_hk_spot_em()
-                symbol_col, name_col, price_col, pct_col, amt_col, turn_col = "代码", "名称", "最新价", "涨跌幅", "成交额", "换手率"
+                # HK: 优先新浪批量；失败后回退新浪全市场接口（不走东财）
+                df = AkShareClient._to_rank_schema(AkShareClient._fetch_bulk_sina("HK"))
+                if df.empty:
+                    df = AkShareClient._to_rank_schema(AkShareClient._safe_call(["stock_hk_spot"]))
             elif market == "US":
-                df = ak.stock_us_spot_em()
-                symbol_col, name_col, price_col, pct_col, amt_col, turn_col = "代码", "名称", "最新价", "涨跌幅", "成交额", "换手率"
+                # US: 优先新浪批量；失败后回退新浪全市场接口（不走东财）
+                df = AkShareClient._to_rank_schema(AkShareClient._fetch_bulk_sina("US"))
+                if df.empty:
+                    df = AkShareClient._to_rank_schema(AkShareClient._safe_call(["stock_us_spot"]))
             else:
                 return pd.DataFrame()
                 
             if df.empty:
                 return pd.DataFrame()
+
+            symbol_col, name_col, price_col, pct_col, amt_col, turn_col = (
+                "代码", "名称", "最新价", "涨跌幅", "成交额", "换手率"
+            )
                 
             # 清理数据类型
             for col in [price_col, pct_col, amt_col, turn_col]:

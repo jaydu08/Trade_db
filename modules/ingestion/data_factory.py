@@ -22,8 +22,8 @@ class DataManager:
     def __init__(self):
         # 注册 Search Providers
         self.search_providers = [
-            SearXNGProvider(),
             TavilyProvider(),
+            SearXNGProvider(),
             BochaProvider(),
             # 其他可以在此添加
         ]
