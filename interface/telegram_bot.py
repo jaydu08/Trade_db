@@ -159,6 +159,11 @@ class TelegramBot:
         self.app.add_handler(CommandHandler("del", self.cmd_del))
         self.app.add_handler(CommandHandler("list", self.cmd_list))
         self.app.add_handler(CommandHandler("trend", self.cmd_trend))
+        # 模拟交易指令
+        self.app.add_handler(CommandHandler("buy", self.cmd_buy))
+        self.app.add_handler(CommandHandler("sell", self.cmd_sell))
+        self.app.add_handler(CommandHandler("holds", self.cmd_holds))
+        self.app.add_handler(CommandHandler("review", self.cmd_review))
         self.app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self.handle_message))
 
     async def cmd_monitor(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -301,6 +306,135 @@ class TelegramBot:
             logger.error(f"Trend cmd failed: {e}", exc_info=True)
             await progress_msg.edit_text(f"❌ 趋势简报生成失败: {e}")
 
+    # ──────────────────────────────────────────────────────
+    # 模拟交易系统指令：/buy /sell /holds /review
+    # ──────────────────────────────────────────────────────
+    async def cmd_buy(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/buy [标的] [可选:天数] [可选:理由] - 模拟建仓"""
+        if not await self._check_auth(update): return
+        if not context.args:
+            await update.message.reply_text("用法: /buy 腾讯 [可选:持仓天数] [可选:逻辑]")
+            return
+            
+        query = context.args[0]
+        target_days = None
+        reason_parts = []
+        
+        if len(context.args) > 1:
+            if context.args[1].isdigit():
+                target_days = int(context.args[1])
+                reason_parts = context.args[2:]
+            else:
+                reason_parts = context.args[1:]
+        reason = " ".join(reason_parts)
+                
+        await update.message.reply_text(f"🔍 正在处理建仓: {query}...")
+        
+        from modules.paper_trading.service import PaperTradingService
+        chat_id = update.effective_chat.id
+        is_success, msg, trade = await asyncio.to_thread(
+            PaperTradingService.open_position, query, chat_id, target_days, reason
+        )
+        await update.message.reply_text(msg)
+
+    async def cmd_sell(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/sell [标的] - 模拟平仓并复盘"""
+        if not await self._check_auth(update): return
+        if not context.args:
+            await update.message.reply_text("用法: /sell 腾讯")
+            return
+            
+        query = context.args[0]
+        await update.message.reply_text(f"🔍 正在处理平仓并准备复盘数据: {query}...")
+        
+        from modules.paper_trading.service import PaperTradingService
+        from modules.paper_trading.reviewer import PaperTradeReviewer
+        chat_id = update.effective_chat.id
+        
+        is_success, msg, trade = await asyncio.to_thread(
+            PaperTradingService.close_position, query, chat_id
+        )
+        await update.message.reply_text(msg)
+        
+        if is_success and trade:
+            report_msg = await update.message.reply_text("⏳ 正在生成六维度 AI 回测研报，请稍候...")
+            report = await asyncio.to_thread(PaperTradeReviewer.generate_review, trade)
+            
+            trade.review_text = report
+            from core.db import db_manager
+            with db_manager.ledger_session() as session:
+                session.add(trade)
+                session.commit()
+                
+            report_html = TelegramHTMLRenderer.render(report)
+            if len(report_html) > 4000:
+                await report_msg.edit_text(report_html[:4000], parse_mode="HTML")
+                await update.message.reply_text(report_html[4000:], parse_mode="HTML")
+            else:
+                await report_msg.edit_text(report_html, parse_mode="HTML")
+
+    async def cmd_holds(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/holds - 查看当前模拟持仓"""
+        if not await self._check_auth(update): return
+        
+        from modules.paper_trading.service import PaperTradingService
+        chat_id = update.effective_chat.id
+        trades = await asyncio.to_thread(PaperTradingService.get_active_trades, chat_id)
+        
+        if not trades:
+            await update.message.reply_text("您当前没有任何进行中的模拟持仓记录。")
+            return
+            
+        lines = ["💼 **您的模拟持仓**\n"]
+        for t in trades:
+            target = f"目标:{t.target_days}天" if t.target_days else "长期持有"
+            lines.append(f"• {t.name}({t.symbol}) - 成本: {t.entry_price} [{target}]")
+            
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    async def cmd_review(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/review [标的] - 对记录进行单边复盘"""
+        if not await self._check_auth(update): return
+        if not context.args:
+            await update.message.reply_text("用法: /review 腾讯")
+            return
+            
+        query = context.args[0]
+        await update.message.reply_text(f"🔍 正在寻找交易记录: {query}...")
+        
+        from modules.monitor.resolver import SymbolResolver
+        from modules.paper_trading.reviewer import PaperTradeReviewer
+        from core.db import db_manager
+        from domain.ledger.paper_trade import PaperTrade
+        from sqlmodel import select
+        
+        resolved = SymbolResolver.resolve(query)
+        if not resolved:
+            await update.message.reply_text("未识别到该标的。")
+            return
+        symbol, _, name = resolved
+        
+        chat_id = update.effective_chat.id
+        with db_manager.ledger_session() as session:
+            stmt = select(PaperTrade).where(
+                PaperTrade.symbol == symbol,
+                PaperTrade.chat_id == chat_id
+            ).order_by(PaperTrade.created_at.desc())
+            trade = session.exec(stmt).first()
+            
+        if not trade:
+            await update.message.reply_text(f"未找到 {name}({symbol}) 的模拟交易记录。")
+            return
+            
+        report_msg = await update.message.reply_text("⏳ 正在生成 AI 复盘研报，请稍候...")
+        report = await asyncio.to_thread(PaperTradeReviewer.generate_review, trade)
+        report_html = TelegramHTMLRenderer.render(report)
+        if len(report_html) > 4000:
+            await report_msg.edit_text(report_html[:4000], parse_mode="HTML")
+            await update.message.reply_text(report_html[4000:], parse_mode="HTML")
+        else:
+            await report_msg.edit_text(report_html, parse_mode="HTML")
+            
     async def cmd_quote(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """查询行情 (Agent 版)"""
         if not await self._check_auth(update): return

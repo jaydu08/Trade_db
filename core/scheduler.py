@@ -210,6 +210,15 @@ class TaskScheduler:
         else:
             logger.info("DailyRank standalone jobs disabled; heatmap pipeline will persist DailyRank directly.")
 
+        # 14. 模拟交易到期检查 (每天 19:20 扫一波)
+        self.scheduler.add_job(
+            self._job_paper_trade_check,
+            CronTrigger(hour=19, minute=20),
+            id="paper_trade_check",
+            name="模拟交易到期检查",
+            replace_existing=True
+        )
+
         logger.info(f"Registered {len(self.scheduler.get_jobs())} jobs.")
 
     def _run_job(self, job_id: str, func, *args, **kwargs):
@@ -367,6 +376,54 @@ class TaskScheduler:
         """Job: 每日榜单同步（US）"""
         from modules.monitor.daily_rank_service import DailyRankService
         self._run_job("daily_rank_us", DailyRankService.sync_daily_ranks, ["US"])
+
+    def _job_paper_trade_check(self):
+        """Job: 模拟交易到期检查"""
+        from modules.paper_trading.service import PaperTradingService
+        from modules.paper_trading.reviewer import PaperTradeReviewer
+        
+        def _execute():
+            expired_trades = PaperTradingService.check_expired_trades()
+            if not expired_trades:
+                return {"expired_count": 0}
+            
+            from interface.telegram_bot import bot_instance, TelegramHTMLRenderer
+            import asyncio
+            import nest_asyncio
+            
+            # Apply nest_asyncio to allow nested event loops in threads if necessary
+            nest_asyncio.apply()
+            
+            success_count = 0
+            for trade in expired_trades:
+                try:
+                    report = PaperTradeReviewer.generate_review(trade)
+                    trade.review_text = report
+                    from core.db import db_manager
+                    with db_manager.ledger_session() as session:
+                        session.add(trade)
+                        session.commit()
+                    
+                    if bot_instance and trade.chat_id:
+                        text = f"🚨 <b>【到期复盘】您的模拟持仓 {trade.name}({trade.symbol}) 已到达打卡时间！自动平仓并复盘：</b>\n\n{report}"
+                        html_text = TelegramHTMLRenderer.render(text)
+                        
+                        loop = asyncio.get_event_loop()
+                        if len(html_text) > 4000:
+                            coro1 = bot_instance.app.bot.send_message(chat_id=trade.chat_id, text=html_text[:4000], parse_mode="HTML")
+                            coro2 = bot_instance.app.bot.send_message(chat_id=trade.chat_id, text=html_text[4000:], parse_mode="HTML")
+                            loop.run_until_complete(coro1)
+                            loop.run_until_complete(coro2)
+                        else:
+                            coro = bot_instance.app.bot.send_message(chat_id=trade.chat_id, text=html_text, parse_mode="HTML")
+                            loop.run_until_complete(coro)
+                        success_count += 1
+                except Exception as e:
+                    logger.error(f"Failed to process and notify expired trade {trade.symbol}: {e}")
+            
+            return {"expired_count": len(expired_trades), "notified_count": success_count}
+            
+        self._run_job("paper_trade_check", _execute)
 
 # 全局单例
 task_scheduler = TaskScheduler()

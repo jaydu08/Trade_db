@@ -86,6 +86,7 @@ Trade_db/
 |---|---|---|
 | `dailyrank` | date, market, rank_type, symbol, name, price, change_pct, amount, turnover_rate | 每日榜单 |
 | `watchlistalert` | symbol, name, market, alert_reason, price, change_pct, status | 异动预警记录 |
+| `papertrade` | symbol, name, market, entry_date, entry_price, status, exit_price, pnl_pct | AI 模拟投研复盘 |
 
 ### 3.3 `vector_store`（ChromaDB，语义知识库）
 
@@ -120,6 +121,7 @@ Trade_db/
 | `report_30d`| 每月最后一天 18:30 | 30日监控战报（标的胜率追踪）→ Telegram推送 |
 | `sync_reports` | 每天 18:00 | 同步行业研报到ChromaDB |
 | `sync_fundamentals` | 每天 02:00 | 全量财务数据+公司画像更新 |
+| `paper_trade_check` | 每天 19:20 | 模拟交易到期检查与自动平仓复盘推送 |
 
 ---
 
@@ -228,6 +230,10 @@ ak.futures_display_main_sina()（拉取全市场约 80+ 个实物主力合约）
 | `/del 代码` | 移除监控标的 |
 | `/quote 代码` | 实时行情查询 |
 | `/chain 产业名` | 产业链深度挖掘 (已过滤 AI 推理过程) |
+| `/buy 代码 [天数] [逻辑]`| 模拟建仓并进入跟踪状态 |
+| `/sell 代码` | 模拟平仓并输出 AI 深度回测报告 |
+| `/holds` | 查看当前正在进行的模拟持仓列表 |
+| `/review 代码` | 手动提取特定股票的最新 AI 回测复盘 |
 | 任意文本 | 触发 AI 投研问答（被@或群内直接提及即可） |
 
 ---

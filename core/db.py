@@ -78,7 +78,7 @@ class DatabaseManager:
     @contextmanager
     def meta_session(self) -> Generator[Session, None, None]:
         """获取 Meta 数据库会话"""
-        session = Session(self.meta_engine)
+        session = Session(self.meta_engine, expire_on_commit=False)
         try:
             yield session
             session.commit()
@@ -120,7 +120,7 @@ class DatabaseManager:
     @contextmanager
     def ledger_session(self) -> Generator[Session, None, None]:
         """获取 Ledger 数据库会话"""
-        session = Session(self.ledger_engine)
+        session = Session(self.ledger_engine, expire_on_commit=False)
         try:
             yield session
             session.commit()
@@ -135,7 +135,7 @@ class DatabaseManager:
         # 导入所有 Ledger 模型
         from domain.ledger import (
             Strategy, StrategyRun, Signal, SignalExt, Order, Position,
-            DailyRank, WatchlistAlert, TrendSeedPool, TrendDailyBar
+            DailyRank, WatchlistAlert, TrendSeedPool, TrendDailyBar, PaperTrade
         )
         # Ledger 表需要单独创建，因为使用不同的 engine
         # 这里需要过滤出 ledger 相关的表
@@ -150,6 +150,7 @@ class DatabaseManager:
             WatchlistAlert.__table__,
             TrendSeedPool.__table__,
             TrendDailyBar.__table__,
+            PaperTrade.__table__,
         ]
         for table in ledger_tables:
             table.create(self.ledger_engine, checkfirst=True)
