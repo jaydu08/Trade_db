@@ -4,6 +4,9 @@ Search Providers Implementation
 import os
 import requests
 import logging
+import html
+import re
+import xml.etree.ElementTree as ET
 from typing import List, Dict, Any
 from .base import BaseSearchProvider
 
@@ -62,6 +65,12 @@ class SearXNGProvider(BaseSearchProvider):
                             "date": item.get("publishedDate", "")
                         })
                     return results
+                logger.warning(
+                    "SearXNG instance %s returned status=%s, body=%s",
+                    url,
+                    resp.status_code,
+                    str(resp.text)[:120].replace("\n", " "),
+                )
             except Exception as e:
                 logger.warning(f"SearXNG instance {url} failed: {e}. Trying next...")
                 continue
@@ -167,3 +176,61 @@ class BochaProvider(BaseSearchProvider):
             logger.error(f"Bocha search failed: {e}")
             
         return []
+
+
+class GoogleNewsRSSProvider(BaseSearchProvider):
+    """
+    Google News RSS 兜底搜索（免 API Key）
+    """
+    def __init__(self):
+        self.url = "https://news.google.com/rss/search"
+        self.timeout = 12
+
+    @property
+    def provider_name(self) -> str:
+        return "GoogleNewsRSS"
+
+    def health_check(self) -> bool:
+        return True
+
+    @staticmethod
+    def _clean_text(text: str) -> str:
+        if not text:
+            return ""
+        unescaped = html.unescape(str(text))
+        cleaned = re.sub(r"<[^>]+>", " ", unescaped)
+        return re.sub(r"\s+", " ", cleaned).strip()
+
+    def search(self, query: str, limit: int = 5, **kwargs) -> List[Dict[str, Any]]:
+        params = {
+            "q": query,
+            "hl": kwargs.get("hl", "zh-CN"),
+            "gl": kwargs.get("gl", "CN"),
+            "ceid": kwargs.get("ceid", "CN:zh-Hans"),
+        }
+        try:
+            resp = requests.get(self.url, params=params, timeout=self.timeout)
+            if resp.status_code != 200:
+                logger.warning("GoogleNewsRSS returned %s: %s", resp.status_code, str(resp.text)[:120])
+                return []
+
+            root = ET.fromstring(resp.content)
+            items = root.findall(".//item")
+            results: List[Dict[str, Any]] = []
+            for item in items[:limit]:
+                title = self._clean_text(item.findtext("title", default=""))
+                link = self._clean_text(item.findtext("link", default=""))
+                pub_date = self._clean_text(item.findtext("pubDate", default=""))
+                snippet = self._clean_text(item.findtext("description", default=""))
+                results.append(
+                    {
+                        "title": title,
+                        "snippet": snippet,
+                        "url": link,
+                        "date": pub_date,
+                    }
+                )
+            return results
+        except Exception as e:
+            logger.error(f"GoogleNewsRSS search failed: {e}")
+            return []

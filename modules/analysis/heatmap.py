@@ -1,6 +1,7 @@
 import logging
 import datetime
 import concurrent.futures
+import os
 from typing import List, Dict
 
 import pandas as pd
@@ -20,6 +21,9 @@ class MarketHeatMap:
     """
     def __init__(self):
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+        self.enable_daily_attribution = str(
+            os.getenv("ENABLE_HEATMAP_ATTRIBUTION", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
 
     def _get_news_and_reason(self, symbol: str, name: str, pct_chg: float, market: str) -> str:
         """获取个股最新消息，并交给 LLM 极简归因"""
@@ -377,24 +381,30 @@ class MarketHeatMap:
                 for _, row in fallback_df.iterrows()
             ]
 
-        # 3. 并发获取归因
-        futures = {}
-        for stock in top_stocks:
-            f = self.executor.submit(
-                self._get_news_and_reason, 
-                stock['symbol'], 
-                stock['name'], 
-                stock['pct_chg'], 
-                market
-            )
-            futures[f] = stock
-            
+        # 3. 日报智能归因（默认关闭）
         results = []
-        for f in concurrent.futures.as_completed(futures):
-            stock = futures[f]
-            reason = f.result()
-            stock['reason'] = reason
-            results.append(stock)
+        if self.enable_daily_attribution:
+            futures = {}
+            for stock in top_stocks:
+                f = self.executor.submit(
+                    self._get_news_and_reason,
+                    stock['symbol'],
+                    stock['name'],
+                    stock['pct_chg'],
+                    market
+                )
+                futures[f] = stock
+
+            for f in concurrent.futures.as_completed(futures):
+                stock = futures[f]
+                reason = f.result()
+                stock['reason'] = reason
+                results.append(stock)
+        else:
+            for stock in top_stocks:
+                enriched = dict(stock)
+                enriched["reason"] = ""
+                results.append(enriched)
             
         # 还原回按涨幅排序 (因为 as_completed 不保证顺序)
         results.sort(key=lambda x: x['pct_chg'], reverse=True)
@@ -442,7 +452,6 @@ class MarketHeatMap:
             symbol = stock['symbol']
             pct = stock['pct_chg']
             price = stock.get('price', 0)
-            reason = stock['reason']
             if market == 'US':
                 display = f"({symbol})"
             else:
@@ -450,7 +459,11 @@ class MarketHeatMap:
             # 需求1: 推送标的加上具体价格
             price_str = f"{price:.2f}" if price else "N/A"
             msg_lines.append(f"**{i}. {display}**  💰 现价: {price_str}  `+{pct:.2f}%`")
-            msg_lines.append(f"💡 {reason}\n")
+            if self.enable_daily_attribution:
+                reason = stock.get('reason', '')
+                msg_lines.append(f"💡 {reason}\n")
+            else:
+                msg_lines.append("")
             
         final_msg = "\n".join(msg_lines)
         

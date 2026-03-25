@@ -1,6 +1,8 @@
 import logging
 import datetime as dt
 import re
+import os
+import time
 import concurrent.futures
 from difflib import SequenceMatcher
 from sqlmodel import select
@@ -556,8 +558,12 @@ class TrendService:
 
             symbols = list(sym_map.keys())
             payloads: List[Dict] = []
+            us_interval = float(os.getenv("TREND_US_QUOTE_INTERVAL_SEC", "1.1") or 1.1)
 
             def _fetch(sym: str):
+                # Finnhub 免费额度通常较低，US 走限速串行可显著降低 429 丢数。
+                if market == "US" and us_interval > 0:
+                    time.sleep(us_interval)
                 quote = TrendService._pick_trusted_quote(sym, market)
                 if not quote:
                     return None
@@ -573,10 +579,16 @@ class TrendService:
                     "turnover_rate": 0.0,
                 }
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(symbols))) as executor:
+            max_workers = min(16, len(symbols))
+            timeout_sec = 120
+            if market == "US":
+                max_workers = 1
+                timeout_sec = 300
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_map = {executor.submit(_fetch, sym): sym for sym in symbols}
                 try:
-                    done_iter = concurrent.futures.as_completed(future_map, timeout=120)
+                    done_iter = concurrent.futures.as_completed(future_map, timeout=timeout_sec)
                     for future in done_iter:
                         try:
                             item = future.result(timeout=0)

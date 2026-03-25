@@ -5,9 +5,10 @@ Data Factory (Router)
 import logging
 import concurrent.futures
 from typing import List, Dict, Any, Optional
+from dotenv import load_dotenv
 
 from modules.ingestion.providers.search_providers import (
-    SearXNGProvider, TavilyProvider, BochaProvider
+    SearXNGProvider, TavilyProvider, BochaProvider, GoogleNewsRSSProvider
 )
 from modules.ingestion.providers.market_providers import (
     AkShareProvider, TushareProvider, FinnhubProvider
@@ -20,11 +21,14 @@ class DataManager:
     统一数据源管理器
     """
     def __init__(self):
+        # 兜底加载 .env，确保被脚本直接调用时也能读取 API 配置
+        load_dotenv(dotenv_path=".env")
         # 注册 Search Providers
         self.search_providers = [
             TavilyProvider(),
             SearXNGProvider(),
             BochaProvider(),
+            GoogleNewsRSSProvider(),
             # 其他可以在此添加
         ]
         

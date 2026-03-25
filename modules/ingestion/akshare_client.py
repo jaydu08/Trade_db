@@ -460,6 +460,30 @@ class AkShareClient:
         原为东方财富获取实时行情，由于IP被限，替换为新浪行情接口 (兼容原返回格式)。
         """
         import requests
+
+        if market == "CF":
+            try:
+                df = ak.futures_zh_spot(symbol=str(symbol).upper(), market="CF")
+                if df is None or df.empty:
+                    return {}
+                row = df.iloc[0]
+                price = float(row.get("current_price", 0) or 0)
+                if price <= 0:
+                    return {}
+                prev = float(row.get("last_settle_price", 0) or row.get("last_close", 0) or 0)
+                change = price - prev if prev > 0 else 0.0
+                pct_chg = round((change / prev) * 100, 2) if prev > 0 else 0.0
+                return {
+                    "symbol": str(symbol).upper(),
+                    "name": str(row.get("symbol", "") or ""),
+                    "price": price,
+                    "change": round(change, 4),
+                    "pct_chg": pct_chg,
+                    "timestamp": str(row.get("time", "") or ""),
+                }
+            except Exception as e:
+                logger.warning(f"CF quote failed for {symbol}: {e}")
+                return {}
         
         # 构建 Sina symbol
         sina_symbol = ""
