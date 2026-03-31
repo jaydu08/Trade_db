@@ -4,6 +4,13 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Dict, List
 
+from modules.ingestion.market_cap import (
+    get_cn_market_metrics,
+    get_cn_fund_flow,
+    format_mv_cn,
+    format_flow_cn,
+)
+
 from core.llm import simple_prompt
 from modules.monitor.notifier import Notifier
 from modules.monitor.trend_service import TrendCalculator
@@ -21,9 +28,23 @@ class TrendReportService:
         price = s.get("current_price", 0)
         ret = s.get("return_pct", 0)
         symbol = s.get("symbol", "")
+
         if market == "US":
             display_symbol = str(symbol).split(".")[-1].strip() if symbol else symbol
-            return f"{i}. ({display_symbol}) 现价:{price} {ret:+.2f}%"
+            cap_100m = float(s.get("market_cap_100m_usd", 0) or 0)
+            cap_text = f" 市值:{cap_100m:.1f}亿美元" if cap_100m > 0 else ""
+            return f"{i}. ({display_symbol}) 现价:{price} {ret:+.2f}%{cap_text}"
+
+        if market == "CN":
+            total_mv = float(s.get("total_mv_100m", 0) or 0)
+            circ_mv = float(s.get("circ_mv_100m", 0) or 0)
+            main_inflow = float(s.get("main_net_inflow_100m", 0) or 0)
+            mv_txt = format_mv_cn(total_mv, circ_mv)
+            flow_txt = format_flow_cn(main_inflow)
+            cap_text = f" {mv_txt}" if mv_txt else ""
+            flow_text = f" {flow_txt}" if flow_txt else ""
+            return f"{i}. {s.get('name','')}({symbol}) 现价:{price} {ret:+.2f}%{cap_text}{flow_text}"
+
         return f"{i}. {s.get('name','')}({symbol}) 现价:{price} {ret:+.2f}%"
 
     @staticmethod
@@ -72,6 +93,44 @@ class TrendReportService:
                         stock["current_price"] = round(price, 4)
                 except Exception:
                     continue
+
+    @staticmethod
+    def _enrich_market_caps(market: str, stks: List[dict]) -> None:
+        """补齐趋势推送的市值与资金流信息（当前重点支持 A 股）。"""
+        if not stks:
+            return
+
+        if market == "CN":
+            def _fetch_one(s: dict):
+                symbol = str(s.get("symbol", "")).strip()
+                if not symbol:
+                    return None
+                trade_date = str(s.get("price_date", "") or "")
+                metrics = get_cn_market_metrics(symbol)
+                flow = get_cn_fund_flow(symbol, trade_date=trade_date)
+                return s, metrics, flow
+
+            with ThreadPoolExecutor(max_workers=min(8, len(stks))) as executor:
+                future_map = [executor.submit(_fetch_one, s) for s in stks]
+                for future in future_map:
+                    try:
+                        out = future.result(timeout=6)
+                        if not out:
+                            continue
+                        stock, metrics, flow = out
+                        if metrics:
+                            total_mv = float(metrics.get("total_mv_100m", 0) or 0)
+                            circ_mv = float(metrics.get("circ_mv_100m", 0) or 0)
+                            if total_mv > 0:
+                                stock["total_mv_100m"] = total_mv
+                            if circ_mv > 0:
+                                stock["circ_mv_100m"] = circ_mv
+                        if flow:
+                            main_inflow = float(flow.get("main_net_inflow_100m", 0) or 0)
+                            if main_inflow != 0:
+                                stock["main_net_inflow_100m"] = main_inflow
+                    except Exception:
+                        continue
 
     @staticmethod
     def _pick_market_items(market: str, stks: List[dict]) -> List[dict]:
@@ -161,6 +220,9 @@ class TrendReportService:
                 picked = TrendReportService._pick_cf_items(stks)
             else:
                 picked = TrendReportService._pick_market_items(market, stks)
+            # 补齐市值字段（主要用于推送展示）
+            TrendReportService._enrich_market_caps(market, picked)
+
             # Trend 报告只使用本地收盘价序列，避免实时行情口径波动
             selected_by_market[market] = picked
 

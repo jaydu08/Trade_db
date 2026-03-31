@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 class PaperTradingService:
     """模拟交易服务类"""
 
+    REVIEW_PENDING = "PENDING"
+    REVIEW_DONE = "DONE"
+    REVIEW_FAILED = "FAILED"
+
     @staticmethod
     def _fetch_current_price(symbol: str, market: str) -> Optional[float]:
         """拉取最新价格"""
@@ -31,6 +35,62 @@ class PaperTradingService:
         return None
 
     @staticmethod
+    def mark_review_pending(trade_id: int, source: str = "manual") -> None:
+        """将复盘状态置为待处理，并记录触发来源。"""
+        with db_manager.ledger_session() as session:
+            trade = session.get(PaperTrade, trade_id)
+            if not trade:
+                return
+            trade.review_status = PaperTradingService.REVIEW_PENDING
+            trade.review_error = None
+            trade.review_source = source
+            trade.updated_at = datetime.datetime.utcnow()
+            session.add(trade)
+
+    @staticmethod
+    def save_review_success(trade_id: int, review_text: str, source: str = "manual") -> Optional[PaperTrade]:
+        """保存复盘成功结果。"""
+        now = datetime.datetime.utcnow()
+        with db_manager.ledger_session() as session:
+            trade = session.get(PaperTrade, trade_id)
+            if not trade:
+                return None
+
+            trade.review_text = review_text
+            trade.review_status = PaperTradingService.REVIEW_DONE
+            trade.review_attempts = int(trade.review_attempts or 0) + 1
+            trade.review_error = None
+            trade.review_source = source
+            trade.last_reviewed_at = now
+            trade.updated_at = now
+
+            session.add(trade)
+            session.commit()
+            session.refresh(trade)
+            return trade
+
+    @staticmethod
+    def save_review_failure(trade_id: int, error: str, source: str = "manual") -> Optional[PaperTrade]:
+        """保存复盘失败状态，不抛出异常，保证主流程不中断。"""
+        now = datetime.datetime.utcnow()
+        with db_manager.ledger_session() as session:
+            trade = session.get(PaperTrade, trade_id)
+            if not trade:
+                return None
+
+            trade.review_status = PaperTradingService.REVIEW_FAILED
+            trade.review_attempts = int(trade.review_attempts or 0) + 1
+            trade.review_error = (error or "")[:1000]
+            trade.review_source = source
+            trade.last_reviewed_at = now
+            trade.updated_at = now
+
+            session.add(trade)
+            session.commit()
+            session.refresh(trade)
+            return trade
+
+    @staticmethod
     def open_position(query: str, chat_id: int, target_days: Optional[int] = None, reason: str = "") -> Tuple[bool, str, Optional[PaperTrade]]:
         """
         发起一笔模拟交易 (建仓)
@@ -40,19 +100,16 @@ class PaperTradingService:
         :param reason: 建仓逻辑
         :return: (is_success, message, trade)
         """
-        # 解析标的
         resolved = SymbolResolver.resolve(query)
         if not resolved:
             return False, f"未识别到标的: {query}，请使用规范的代码或全称。", None
-            
+
         symbol, market, name = resolved
 
-        # 获取现价
         price = PaperTradingService._fetch_current_price(symbol, market)
         if not price or price <= 0:
             return False, f"获取 {name}({symbol}) 最新价格失败，可能未开盘或接口异常。", None
 
-        # 检查是否已有一笔正在进行的模拟交易
         with db_manager.ledger_session() as session:
             stmt = select(PaperTrade).where(
                 PaperTrade.symbol == symbol,
@@ -73,12 +130,13 @@ class PaperTradingService:
                 entry_reason=reason,
                 target_days=target_days,
                 status="ACTIVE",
+                review_status=PaperTradingService.REVIEW_PENDING,
                 chat_id=chat_id
             )
             session.add(trade)
             session.commit()
             session.refresh(trade)
-            
+
             return True, f"✅ 成功建仓 {name}({symbol})，成本：{price}。", trade
 
     @staticmethod
@@ -90,8 +148,8 @@ class PaperTradingService:
         resolved = SymbolResolver.resolve(query)
         if not resolved:
             return False, f"未识别到标的: {query}", None
-            
-        symbol, market, name = resolved
+
+        symbol, _, name = resolved
 
         with db_manager.ledger_session() as session:
             stmt = select(PaperTrade).where(
@@ -103,16 +161,16 @@ class PaperTradingService:
             if not trade:
                 return False, f"暂未找到 {name}({symbol}) 的进行中模拟持仓记录。", None
 
-            # 获取现价用于平仓
             price = PaperTradingService._fetch_current_price(symbol, trade.market)
             if not price or price <= 0:
-                # 若无法获取，用上次收盘价或拒绝平仓
                 return False, f"无法获取 {name}({symbol}) 的当前价格，平仓失败。", trade
 
             trade.exit_date = datetime.date.today()
             trade.exit_price = price
             trade.pnl_pct = round(((price - trade.entry_price) / trade.entry_price) * 100, 2)
             trade.status = "CLOSED"
+            trade.review_status = PaperTradingService.REVIEW_PENDING
+            trade.review_error = None
             trade.updated_at = datetime.datetime.utcnow()
 
             session.add(trade)
@@ -130,7 +188,7 @@ class PaperTradingService:
                 PaperTrade.status == "ACTIVE"
             ).order_by(PaperTrade.entry_date.desc())
             return list(session.exec(stmt).all())
-    
+
     @staticmethod
     def check_expired_trades() -> List[PaperTrade]:
         """
@@ -139,32 +197,32 @@ class PaperTradingService:
         """
         expired_trades = []
         today = datetime.date.today()
-        
+
         with db_manager.ledger_session() as session:
             stmt = select(PaperTrade).where(
                 PaperTrade.status == "ACTIVE",
                 PaperTrade.target_days.is_not(None)
             )
             active_trades = session.exec(stmt).all()
-            
+
             for trade in active_trades:
                 expected_exit_date = trade.entry_date + datetime.timedelta(days=trade.target_days)
                 if today >= expected_exit_date:
-                    # 获取现价并平仓
                     price = PaperTradingService._fetch_current_price(trade.symbol, trade.market)
                     if price and price > 0:
                         trade.exit_date = today
                         trade.exit_price = price
                         trade.pnl_pct = round(((price - trade.entry_price) / trade.entry_price) * 100, 2)
                         trade.status = "CLOSED"
+                        trade.review_status = PaperTradingService.REVIEW_PENDING
+                        trade.review_error = None
                         trade.updated_at = datetime.datetime.utcnow()
                         session.add(trade)
                         expired_trades.append(trade)
-            
+
             if expired_trades:
                 session.commit()
-                # 刷新避免 detached
                 for t in expired_trades:
                     session.refresh(t)
-                    
+
         return expired_trades

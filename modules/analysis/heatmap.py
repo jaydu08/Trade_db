@@ -11,6 +11,12 @@ from modules.ingestion.akshare_client import akshare_client
 from core.llm import simple_prompt
 from core.agent import Tools
 from modules.monitor.notifier import Notifier
+from modules.ingestion.market_cap import (
+    get_cn_market_metrics,
+    get_cn_fund_flow,
+    format_mv_cn,
+    format_flow_cn,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +30,66 @@ class MarketHeatMap:
         self.enable_daily_attribution = str(
             os.getenv("ENABLE_HEATMAP_ATTRIBUTION", "0")
         ).strip().lower() in {"1", "true", "yes", "on"}
+        # A股热榜参数（可通过环境变量在线调参）
+        self.cn_norm_min = float(os.getenv("CN_HEAT_NORM_MIN", "0.60"))
+        self.cn_norm_fallback_min = float(os.getenv("CN_HEAT_NORM_FALLBACK_MIN", "0.50"))
+        self.cn_near_limit_low = float(os.getenv("CN_HEAT_NEAR_LIMIT_LOW", "0.97"))
+        self.cn_near_limit_high = float(os.getenv("CN_HEAT_NEAR_LIMIT_HIGH", "1.03"))
+        self.cn_gem_bonus = float(os.getenv("CN_HEAT_GEM_BONUS", "1.10"))
+        self.cn_turnover_fetch_cap = int(os.getenv("CN_HEAT_TURNOVER_FETCH_CAP", "220"))
+
+        w_pct = float(os.getenv("CN_HEAT_W_PCT", "0.45"))
+        w_amount = float(os.getenv("CN_HEAT_W_AMOUNT", "0.30"))
+        w_turnover = float(os.getenv("CN_HEAT_W_TURNOVER", "0.25"))
+        w_sum = max(1e-9, w_pct + w_amount + w_turnover)
+        self.cn_w_pct = w_pct / w_sum
+        self.cn_w_amount = w_amount / w_sum
+        self.cn_w_turnover = w_turnover / w_sum
+
+    def _build_cn_turnover_factor(self, filtered: pd.DataFrame) -> pd.Series:
+        """
+        构建A股换手率因子：
+        1) 优先使用行情原始换手率
+        2) 缺失时使用近似换手率 amount / circ_mv * 100 回填
+        最终使用 log1p 后的百分位做评分。
+        """
+        if filtered.empty:
+            return pd.Series(dtype=float)
+
+        work = filtered.copy()
+        work["turnover"] = pd.to_numeric(work.get("turnover", 0), errors="coerce").fillna(0.0)
+        work["turnover_effective"] = work["turnover"].clip(lower=0.0)
+
+        missing_idx = work.index[work["turnover_effective"] <= 0].tolist()
+        if missing_idx:
+            # 仅对候选池中缺失换手率的标的补拉市值，避免全市场逐个请求过慢
+            symbols = []
+            for i in missing_idx[: self.cn_turnover_fetch_cap]:
+                symbol = str(work.at[i, "symbol"]).strip()
+                if symbol:
+                    symbols.append((i, symbol))
+
+            def _fetch_one(item):
+                idx, symbol = item
+                metrics = get_cn_market_metrics(symbol)
+                circ_mv_100m = float((metrics or {}).get("circ_mv_100m", 0) or 0)
+                if circ_mv_100m <= 0:
+                    return idx, 0.0
+                amount = float(work.at[idx, "amount"] or 0)
+                turnover_approx = (amount / (circ_mv_100m * 1e8)) * 100.0
+                return idx, max(turnover_approx, 0.0)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+                futures = [ex.submit(_fetch_one, item) for item in symbols]
+                for f in concurrent.futures.as_completed(futures):
+                    try:
+                        idx, approx = f.result()
+                        if approx > 0:
+                            work.at[idx, "turnover_effective"] = approx
+                    except Exception:
+                        continue
+
+        return np.log1p(work["turnover_effective"]).rank(pct=True)
 
     def _get_news_and_reason(self, symbol: str, name: str, pct_chg: float, market: str) -> str:
         """获取个股最新消息，并交给 LLM 极简归因"""
@@ -154,13 +220,10 @@ class MarketHeatMap:
         
         if market == 'CN':
             # ────────────────────────────────────────────────────────────────
-            # A股热榜算法（无换手率模式）：百分位排名归一化综合评分
-            #
-            # 对于不同板块归一化涨幅：
-            #   主板 → 除以10, 创业板/科创 → 除以20, 北交所 → 除以30
-            # 入池门槛：归一化涨幅 >= 0.70（同一尺度下可横向比较）
-            # 评分 = 归一化涨幅百分位(0.70) + 成交额对数百分位(0.30)
-            # 说明：当前A股链路换手率不可用，临时不纳入评分以避免“假因子”
+            # A股热榜算法（三因子模式）：
+            # 1) 归一化涨幅（按板块涨停幅度归一）
+            # 2) log(成交额) 百分位
+            # 3) 换手率百分位（缺失时用市值近似回填）
             # ────────────────────────────────────────────────────────────────
 
             # 各板块涨停限制（用于归一化涨幅）
@@ -168,25 +231,28 @@ class MarketHeatMap:
             limits[filtered["symbol"].str.startswith(("30", "688"))] = 20.0
             limits[filtered["symbol"].str.startswith(("8", "4"))] = 30.0
 
-            # 归一化涨幅（把主板10%涨停 与 创业板20%涨停 等价视为1.0）
             normalized_pct = filtered["pct_chg"] / limits
 
-            # 入池门槛：归一化涨幅 >= 0.70
-            pool_mask = normalized_pct >= 0.70
+            # 入池门槛（可配置）：归一化涨幅 >= 0.60
+            pool_mask = normalized_pct >= self.cn_norm_min
             filtered = filtered[pool_mask].copy()
             limits = limits.loc[filtered.index]
             normalized_pct = normalized_pct.loc[filtered.index]
 
-            # 弱市降级：归一化门槛放宽到 0.55（避免空榜）
+            # 弱市降级（可配置）：默认放宽到 0.50
             if filtered.empty:
-                logger.warning("CN: normalized_pct>=0.70 无满足标的，降级到 >=0.55")
+                logger.warning(
+                    "CN: normalized_pct>=%.2f 无满足标的，降级到 >=%.2f",
+                    self.cn_norm_min,
+                    self.cn_norm_fallback_min,
+                )
                 fallback_mask = (renamed_df["amount"] >= min_amount)
                 fallback_df = renamed_df[fallback_mask].copy()
                 fallback_limits = pd.Series(10.0, index=fallback_df.index)
                 fallback_limits[fallback_df["symbol"].str.startswith(("30", "688"))] = 20.0
                 fallback_limits[fallback_df["symbol"].str.startswith(("8", "4"))] = 30.0
                 fallback_norm = fallback_df["pct_chg"] / fallback_limits
-                fallback_pool = fallback_norm >= 0.55
+                fallback_pool = fallback_norm >= self.cn_norm_fallback_min
                 filtered = fallback_df[fallback_pool].copy()
                 limits = fallback_limits.loc[filtered.index]
                 normalized_pct = fallback_norm.loc[filtered.index]
@@ -199,43 +265,44 @@ class MarketHeatMap:
                 logger.warning("CN: 最终候选池为空，跳过热榜")
                 return []
 
-            # 抹平涨停板之间的微小差价 (例如 19.98%, 19.99%, 10.03%)
-            # 将接近甚至略微超过涨停价 (0.96~1.05倍) 的标的，归一化强度全部强制锁定为 1.0
-            # 这样它们的 rank_pct 得分完全一致，排序主要交给成交额因子
-            mask = (normalized_pct >= 0.96) & (normalized_pct <= 1.05)
+            # 近涨停抹平，避免 19.98%/19.99% 这类噪声干扰排序
+            mask = (normalized_pct >= self.cn_near_limit_low) & (normalized_pct <= self.cn_near_limit_high)
             normalized_pct.loc[mask] = 1.0
             normalized_pct = normalized_pct.clip(0, 1.2)
 
-            # 百分位排名（0~1，越大越靠前）
             rank_pct = normalized_pct.rank(pct=True)
             rank_amount = np.log1p(filtered["amount"]).rank(pct=True)
+            rank_turnover = self._build_cn_turnover_factor(filtered)
 
-            # 综合评分：涨幅强度35% + 流动性65%
             filtered = filtered.copy()
             filtered["heat_score"] = (
-                rank_pct * 0.35 +
-                rank_amount * 0.65
+                rank_pct * self.cn_w_pct +
+                rank_amount * self.cn_w_amount +
+                rank_turnover * self.cn_w_turnover
             )
 
-            # 需求2: 创业板(30x)/科创板(688x) 且涨幅 > 10% → heat_score × 1.2
+            # 创业板/科创板 且涨幅 >10% 轻量加成
             bonus_mask = (
                 filtered["symbol"].str.startswith(("30", "688")) &
                 (filtered["pct_chg"] > 10.0)
             )
             if bonus_mask.any():
-                filtered.loc[bonus_mask, "heat_score"] *= 1.2
+                filtered.loc[bonus_mask, "heat_score"] *= self.cn_gem_bonus
                 logger.info(
-                    "CN热榜: 创业板/科创板涨幅>10%%加成1.2x，命中 %d 支: %s",
+                    "CN热榜: 创业板/科创板涨幅>10%%加成%.2fx，命中 %d 支",
+                    self.cn_gem_bonus,
                     bonus_mask.sum(),
-                    filtered.loc[bonus_mask, "symbol"].tolist(),
                 )
 
             sorted_df = filtered.sort_values(by="heat_score", ascending=False)
             logger.info(
-                "CN热榜(无换手率): 候选=%s 最高涨幅=%.2f%% 最低涨幅=%.2f%%",
+                "CN热榜(三因子): 候选=%s 最高涨幅=%.2f%% 最低涨幅=%.2f%% 权重[pct/amount/turnover]=[%.2f/%.2f/%.2f]",
                 len(filtered),
                 filtered["pct_chg"].max(),
                 filtered["pct_chg"].min(),
+                self.cn_w_pct,
+                self.cn_w_amount,
+                self.cn_w_turnover,
             )
         else:
             # HK / US：同样改用百分位归一化
@@ -302,7 +369,9 @@ class MarketHeatMap:
                         cap = data.get('marketCapitalization', 0)
                         # Finnhub 市值单位是百万美元 (Million USD)
                         if cap >= 100:
-                            return stk
+                            enriched = dict(stk)
+                            enriched["market_cap_100m_usd"] = round(float(cap) / 100.0, 2)
+                            return enriched
                         return None
                     except Exception as e:
                         logger.warning(f"Finnhub API error for {sym}: {e}")
@@ -315,6 +384,73 @@ class MarketHeatMap:
                 return valid_stocks[:top_n]
                 
         return candidates[:top_n]
+
+    def _enrich_market_metrics(self, market: str, stocks: List[Dict]):
+        """为推送标的补齐市值与资金流字段（当前重点支持 A 股）。"""
+        if not stocks:
+            return
+
+        if market != "CN":
+            return
+
+        trade_date = datetime.date.today().strftime("%Y%m%d")
+
+        def _fetch_one(stock: Dict):
+            symbol = str(stock.get("symbol", "")).strip()
+            if not symbol:
+                return None
+            metrics = get_cn_market_metrics(symbol)
+            flow = get_cn_fund_flow(symbol, trade_date=trade_date)
+            return stock, metrics, flow
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(stocks))) as ex:
+            futures = [ex.submit(_fetch_one, s) for s in stocks]
+            for f in concurrent.futures.as_completed(futures):
+                try:
+                    out = f.result()
+                    if not out:
+                        continue
+                    stock, metrics, flow = out
+
+                    if metrics:
+                        total_mv = float(metrics.get("total_mv_100m", 0) or 0)
+                        circ_mv = float(metrics.get("circ_mv_100m", 0) or 0)
+                        turnover = float(metrics.get("turnover_rate", 0) or 0)
+
+                        if total_mv > 0:
+                            stock["total_mv_100m"] = total_mv
+                        if circ_mv > 0:
+                            stock["circ_mv_100m"] = circ_mv
+                        if float(stock.get("turnover", 0) or 0) <= 0 and turnover > 0:
+                            stock["turnover"] = turnover
+
+                    if flow:
+                        main_inflow = float(flow.get("main_net_inflow_100m", 0) or 0)
+                        if main_inflow != 0:
+                            stock["main_net_inflow_100m"] = main_inflow
+                except Exception:
+                    continue
+
+    def _format_cap_text(self, stock: Dict, market: str) -> str:
+        if market == "CN":
+            total_mv = float(stock.get("total_mv_100m", 0) or 0)
+            circ_mv = float(stock.get("circ_mv_100m", 0) or 0)
+            mv_txt = format_mv_cn(total_mv, circ_mv)
+            return f"  🏦 {mv_txt}" if mv_txt else ""
+
+        if market == "US":
+            cap_100m = float(stock.get("market_cap_100m_usd", 0) or 0)
+            if cap_100m > 0:
+                return f"  🏦 市值:{cap_100m:.1f}亿美元"
+
+        return ""
+
+    def _format_flow_text(self, stock: Dict, market: str) -> str:
+        if market != "CN":
+            return ""
+        main_inflow = float(stock.get("main_net_inflow_100m", 0) or 0)
+        flow_txt = format_flow_cn(main_inflow)
+        return f"  💸 {flow_txt}" if flow_txt else ""
 
     def process_and_notify(self, market: str):
         """主入口：获取数据、计算热榜、获取归因、发送通知"""
@@ -409,6 +545,9 @@ class MarketHeatMap:
         # 还原回按涨幅排序 (因为 as_completed 不保证顺序)
         results.sort(key=lambda x: x['pct_chg'], reverse=True)
 
+        # 补齐市值字段（用于推送展示）
+        self._enrich_market_metrics(market, results)
+
         # 4. 先把热榜结果直接写入 DailyRank，统一“推送口径=入库口径”
         try:
             self._persist_daily_rank_from_heatmap(market, results)
@@ -458,7 +597,9 @@ class MarketHeatMap:
                 display = f"{name} ({symbol})"
             # 需求1: 推送标的加上具体价格
             price_str = f"{price:.2f}" if price else "N/A"
-            msg_lines.append(f"**{i}. {display}**  💰 现价: {price_str}  `+{pct:.2f}%`")
+            cap_text = self._format_cap_text(stock, market)
+            flow_text = self._format_flow_text(stock, market)
+            msg_lines.append(f"**{i}. {display}**  💰 现价: {price_str}  `{pct:+.2f}%`{cap_text}{flow_text}")
             if self.enable_daily_attribution:
                 reason = stock.get('reason', '')
                 msg_lines.append(f"💡 {reason}\n")

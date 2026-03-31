@@ -16,6 +16,7 @@ from modules.ingestion.sync_financial import financial_syncer
 from modules.ingestion.sync_profile import profile_syncer
 from modules.ingestion.sync_relations import relation_syncer
 from modules.analysis.heatmap import heatmap_service
+from modules.monitor.ipo_calendar_service import ipo_calendar_service
 
 logger = logging.getLogger(__name__)
 
@@ -144,10 +145,10 @@ class TaskScheduler:
             replace_existing=True
         )
 
-        # 9. 每日推送标的汇总 TXT (工作日 20:00，北京时间)
+        # 9. 每日推送标的汇总 TXT (工作日 19:00，北京时间)
         self.scheduler.add_job(
             self._job_daily_summary,
-            CronTrigger(day_of_week='mon-fri', hour=20, minute=0),
+            CronTrigger(day_of_week='mon-fri', hour=19, minute=0),
             id="daily_summary",
             name="每日推送标的汇总",
             replace_existing=True
@@ -209,6 +210,15 @@ class TaskScheduler:
             )
         else:
             logger.info("DailyRank standalone jobs disabled; heatmap pipeline will persist DailyRank directly.")
+
+        # 13.5 明日新股预告 (每天 16:30)
+        self.scheduler.add_job(
+            self._job_ipo_tomorrow,
+            CronTrigger(hour=16, minute=30),
+            id="ipo_tomorrow",
+            name="明日新股预告",
+            replace_existing=True
+        )
 
         # 14. 模拟交易到期检查 (每天 19:20 扫一波)
         self.scheduler.add_job(
@@ -377,53 +387,68 @@ class TaskScheduler:
         from modules.monitor.daily_rank_service import DailyRankService
         self._run_job("daily_rank_us", DailyRankService.sync_daily_ranks, ["US"])
 
+    def _job_ipo_tomorrow(self):
+        """Job: 明日新股预告"""
+        self._run_job("ipo_tomorrow", ipo_calendar_service.generate_and_push_tomorrow)
+
     def _job_paper_trade_check(self):
         """Job: 模拟交易到期检查"""
         from modules.paper_trading.service import PaperTradingService
         from modules.paper_trading.reviewer import PaperTradeReviewer
-        
+        from modules.monitor.notifier import Notifier
+
+        def _safe_push(chat_id: int, message_text: str):
+            # Notifier 使用同步 HTTP，适合 scheduler 线程；失败时不抛异常阻塞主流程。
+            if not chat_id or not message_text:
+                return
+            chunk_size = 3500
+            for i in range(0, len(message_text), chunk_size):
+                Notifier.send_telegram(chat_id, message_text[i:i + chunk_size])
+
         def _execute():
             expired_trades = PaperTradingService.check_expired_trades()
             if not expired_trades:
-                return {"expired_count": 0}
-            
-            from interface.telegram_bot import bot_instance, TelegramHTMLRenderer
-            import asyncio
-            import nest_asyncio
-            
-            # Apply nest_asyncio to allow nested event loops in threads if necessary
-            nest_asyncio.apply()
-            
-            success_count = 0
+                return {"expired_count": 0, "review_done": 0, "review_failed": 0, "notified_count": 0}
+
+            review_done = 0
+            review_failed = 0
+            notified_count = 0
+
             for trade in expired_trades:
                 try:
+                    PaperTradingService.mark_review_pending(trade.id, "auto_expire")
                     report = PaperTradeReviewer.generate_review(trade)
-                    trade.review_text = report
-                    from core.db import db_manager
-                    with db_manager.ledger_session() as session:
-                        session.add(trade)
-                        session.commit()
-                    
-                    if bot_instance and trade.chat_id:
-                        text = f"🚨 <b>【到期复盘】您的模拟持仓 {trade.name}({trade.symbol}) 已到达打卡时间！自动平仓并复盘：</b>\n\n{report}"
-                        html_text = TelegramHTMLRenderer.render(text)
-                        
-                        loop = asyncio.get_event_loop()
-                        if len(html_text) > 4000:
-                            coro1 = bot_instance.app.bot.send_message(chat_id=trade.chat_id, text=html_text[:4000], parse_mode="HTML")
-                            coro2 = bot_instance.app.bot.send_message(chat_id=trade.chat_id, text=html_text[4000:], parse_mode="HTML")
-                            loop.run_until_complete(coro1)
-                            loop.run_until_complete(coro2)
-                        else:
-                            coro = bot_instance.app.bot.send_message(chat_id=trade.chat_id, text=html_text, parse_mode="HTML")
-                            loop.run_until_complete(coro)
-                        success_count += 1
+
+                    if str(report).strip().startswith("❌"):
+                        PaperTradingService.save_review_failure(trade.id, report, "auto_expire")
+                        review_failed += 1
+                        continue
+
+                    saved = PaperTradingService.save_review_success(trade.id, report, "auto_expire")
+                    if saved:
+                        review_done += 1
+
+                    if trade.chat_id:
+                        text = (
+                            f"🚨 【到期复盘】您的模拟持仓 {trade.name}({trade.symbol}) 已到达打卡时间！"
+                            f"自动平仓并复盘：\n\n{report}"
+                        )
+                        _safe_push(trade.chat_id, text)
+                        notified_count += 1
                 except Exception as e:
-                    logger.error(f"Failed to process and notify expired trade {trade.symbol}: {e}")
-            
-            return {"expired_count": len(expired_trades), "notified_count": success_count}
-            
+                    PaperTradingService.save_review_failure(trade.id, f"auto_expire_exception: {e}", "auto_expire")
+                    logger.error("Failed to process expired trade %s: %s", trade.symbol, e, exc_info=True)
+                    review_failed += 1
+
+            return {
+                "expired_count": len(expired_trades),
+                "review_done": review_done,
+                "review_failed": review_failed,
+                "notified_count": notified_count,
+            }
+
         self._run_job("paper_trade_check", _execute)
+
 
 # 全局单例
 task_scheduler = TaskScheduler()

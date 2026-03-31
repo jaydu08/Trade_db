@@ -86,7 +86,7 @@ Trade_db/
 |---|---|---|
 | `dailyrank` | date, market, rank_type, symbol, name, price, change_pct, amount, turnover_rate | 每日榜单 |
 | `watchlistalert` | symbol, name, market, alert_reason, price, change_pct, status | 异动预警记录 |
-| `papertrade` | symbol, name, market, entry_date, entry_price, status, exit_price, pnl_pct | AI 模拟投研复盘 |
+| `papertrade` | symbol, name, market, entry_date, entry_price, status, exit_price, pnl_pct, review_status, review_attempts, review_error, review_source, last_reviewed_at | AI 模拟投研复盘（含状态机与失败追踪） |
 
 ### 3.3 `vector_store`（ChromaDB，语义知识库）
 
@@ -113,14 +113,20 @@ Trade_db/
 |---|---|---|
 | `sync_news` | 每 10 分钟 | 同步财联社/Google News到ChromaDB |
 | `monitor_scan` | **每 1 分钟** | 自选股异动监控 → Telegram推送 |
-| `commodity_scan` | 每天 08:00 | 大宗商品每日固定战报 → Telegram推送 |
-| `cn_heatmap` | 每天 18:30 | A股热门榜单 → Telegram推送 |
-| `hk_heatmap` | 每天 18:30 | 港股热门榜单 → Telegram推送 |
-| `us_heatmap` | 每天 08:00 | 美股热门榜单 → Telegram推送 |
-| `report_7d` | 每周五 18:00 | 7日监控战报（标的胜率追踪）→ Telegram推送 |
-| `report_30d`| 每月最后一天 18:30 | 30日监控战报（标的胜率追踪）→ Telegram推送 |
+| `commodity_scan` | 周二至周六 08:00 | 大宗商品每日固定战报 → Telegram推送 |
+| `cn_heatmap` | 工作日 18:30 | A股热门榜单 → Telegram推送 |
+| `hk_heatmap` | 工作日 18:30 | 港股热门榜单 → Telegram推送 |
+| `us_heatmap` | 周二至周六 08:00 | 美股热门榜单 → Telegram推送 |
 | `sync_reports` | 每天 18:00 | 同步行业研报到ChromaDB |
 | `sync_fundamentals` | 每天 02:00 | 全量财务数据+公司画像更新 |
+| `trend_7d` | 每周日 10:00 | 7日趋势简报推送 |
+| `trend_30d` | 每月最后一天 11:00 | 30日趋势简报推送 |
+| `daily_summary` | 工作日 19:00 | 每日推送标的汇总TXT |
+| `trend_pool_refresh_cn_hk` | 工作日 19:10 | 趋势池日线补齐(A/H) |
+| `trend_pool_refresh_cn_hk_retry` | 工作日 21:10 | 趋势池日线补齐(A/H)重试 |
+| `trend_pool_refresh_us_cf` | 周二至周六 08:10 | 趋势池日线补齐(US/CF) |
+| `trend_pool_refresh_us_cf_retry` | 周二至周六 10:10 | 趋势池日线补齐(US/CF)重试 |
+| `ipo_tomorrow` | 每天 16:30 | 次日新股预告推送（A/H/US） |
 | `paper_trade_check` | 每天 19:20 | 模拟交易到期检查与自动平仓复盘推送 |
 
 ---
@@ -200,14 +206,25 @@ ak.futures_display_main_sina()（拉取全市场约 80+ 个实物主力合约）
 
 ### 5.4 热门榜单（`MarketHeatMap`）
 
-**CN 热榜筛选规则：**
-- 涨幅 ≥ 3%，成交额 ≥ 5000万
-- 过滤一字板（涨幅接近限制且换手率 < 1%）
-- 热度评分 = 归一化涨幅 × log(成交额/千万) × 换手率
+**CN 热榜（当前版本：三因子评分）**
+- 候选池：`成交额 >= 5000万`，并按板块涨停幅度做归一化涨幅过滤
+  - 主板按 10%，创业板/科创板按 20%，北交所按 30%
+- 入池阈值：
+  - 常态：`normalized_pct >= 0.60`
+  - 弱市降级：`normalized_pct >= 0.50`
+- 近涨停抹平：`0.97~1.03` 统一视作 `1.0`，避免 19.98/19.99 这类噪声
+- 换手率因子：
+  - 优先使用实时换手率
+  - 缺失时用近似换手率回填：`amount / (circ_mv_100m * 1e8) * 100`
+- 最终评分（默认）：
+  - `heat_score = 0.45*rank_pct + 0.30*rank_log_amount + 0.25*rank_turnover`
+  - 三个权重支持环境变量，并在程序内自动归一化
+- 结构性加成：创业板/科创板且涨幅 >10%，默认 `1.10x`
 
-**HK/US 热榜筛选规则：**
+**HK/US 热榜筛选规则**
 - 涨幅 ≥ 5%，成交额过滤仙股
-- 热度评分 = 涨幅 × log(成交额/百万) × 换手率
+- 评分 = 涨幅百分位 + 成交额百分位 + 换手率百分位
+- US 额外：去权证、同底层杠杆ETF去重；可用 Finnhub 做市值过滤
 
 ### 5.5 ReAct Agent（`ReactAgent`）
 
@@ -218,6 +235,26 @@ ak.futures_display_main_sina()（拉取全市场约 80+ 个实物主力合约）
 | `SEARCH: 关键词` | `Tools.web_search` | 并发多搜索引擎聚合（SearXNG/Tavily/Bocha） |
 | `QUOTE: 代码或名称` | `Tools.get_quote` | 多源行情（Finnhub → AkShare → Tushare） |
 | `DB: 关键词` | `Tools.database_search` | ChromaDB 公司画像语义搜索 |
+
+
+### 5.6 模拟交易与复盘（`PaperTradingService` + `PaperTradeReviewer`）
+
+**交互命令：**
+- `/buy 代码 [天数] [逻辑]`：建仓并进入跟踪
+- `/sell 代码`：平仓并立即触发复盘
+- `/review 代码`：手动复盘最近一笔交易记录
+- `/holds`：查看当前持仓
+
+**复盘状态机：**
+- `PENDING`：待复盘
+- `DONE`：复盘成功
+- `FAILED`：复盘失败（记录 `review_error`）
+
+**可靠性改进：**
+- `/sell` 与 `/review` 都会持久化复盘结果，不再“只推送不落库”
+- 自动到期复盘任务失败不会阻断调度主流程
+- 复盘记录保留 `review_attempts/review_source/last_reviewed_at` 便于追踪
+
 
 ---
 
@@ -276,11 +313,24 @@ TAVILY_API_KEY=...
 # 可选行情补充
 FINNHUB_TOKEN=...
 TUSHARE_TOKEN=...
+
+# A股 Heatmap 三因子参数（可选）
+CN_HEAT_W_PCT=0.45
+CN_HEAT_W_AMOUNT=0.30
+CN_HEAT_W_TURNOVER=0.25
+CN_HEAT_NORM_MIN=0.60
+CN_HEAT_NORM_FALLBACK_MIN=0.50
+CN_HEAT_NEAR_LIMIT_LOW=0.97
+CN_HEAT_NEAR_LIMIT_HIGH=1.03
+CN_HEAT_GEM_BONUS=1.10
+CN_HEAT_TURNOVER_FETCH_CAP=220
 ```
 
 ---
 
 ## 九、快速启动
+
+> 单实例说明：同一个 Telegram Bot Token 必须只运行一个进程，否则会出现 `409 Conflict`。
 
 ```bash
 # 1. 安装依赖

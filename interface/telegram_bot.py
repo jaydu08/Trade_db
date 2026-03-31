@@ -343,29 +343,39 @@ class TelegramBot:
         if not context.args:
             await update.message.reply_text("用法: /sell 腾讯")
             return
-            
+
         query = context.args[0]
         await update.message.reply_text(f"🔍 正在处理平仓并准备复盘数据: {query}...")
-        
+
         from modules.paper_trading.service import PaperTradingService
         from modules.paper_trading.reviewer import PaperTradeReviewer
         chat_id = update.effective_chat.id
-        
+
         is_success, msg, trade = await asyncio.to_thread(
             PaperTradingService.close_position, query, chat_id
         )
         await update.message.reply_text(msg)
-        
+
         if is_success and trade:
             report_msg = await update.message.reply_text("⏳ 正在生成六维度 AI 回测研报，请稍候...")
+            await asyncio.to_thread(PaperTradingService.mark_review_pending, trade.id, "sell")
             report = await asyncio.to_thread(PaperTradeReviewer.generate_review, trade)
-            
-            trade.review_text = report
-            from core.db import db_manager
-            with db_manager.ledger_session() as session:
-                session.add(trade)
-                session.commit()
-                
+
+            if str(report).strip().startswith("❌"):
+                await asyncio.to_thread(
+                    PaperTradingService.save_review_failure,
+                    trade.id,
+                    report,
+                    "sell",
+                )
+            else:
+                await asyncio.to_thread(
+                    PaperTradingService.save_review_success,
+                    trade.id,
+                    report,
+                    "sell",
+                )
+
             report_html = TelegramHTMLRenderer.render(report)
             if len(report_html) > 4000:
                 await report_msg.edit_text(report_html[:4000], parse_mode="HTML")
@@ -398,22 +408,23 @@ class TelegramBot:
         if not context.args:
             await update.message.reply_text("用法: /review 腾讯")
             return
-            
+
         query = context.args[0]
         await update.message.reply_text(f"🔍 正在寻找交易记录: {query}...")
-        
+
         from modules.monitor.resolver import SymbolResolver
         from modules.paper_trading.reviewer import PaperTradeReviewer
+        from modules.paper_trading.service import PaperTradingService
         from core.db import db_manager
         from domain.ledger.paper_trade import PaperTrade
         from sqlmodel import select
-        
+
         resolved = SymbolResolver.resolve(query)
         if not resolved:
             await update.message.reply_text("未识别到该标的。")
             return
         symbol, _, name = resolved
-        
+
         chat_id = update.effective_chat.id
         with db_manager.ledger_session() as session:
             stmt = select(PaperTrade).where(
@@ -421,20 +432,37 @@ class TelegramBot:
                 PaperTrade.chat_id == chat_id
             ).order_by(PaperTrade.created_at.desc())
             trade = session.exec(stmt).first()
-            
+
         if not trade:
             await update.message.reply_text(f"未找到 {name}({symbol}) 的模拟交易记录。")
             return
-            
+
         report_msg = await update.message.reply_text("⏳ 正在生成 AI 复盘研报，请稍候...")
+        await asyncio.to_thread(PaperTradingService.mark_review_pending, trade.id, "review")
         report = await asyncio.to_thread(PaperTradeReviewer.generate_review, trade)
+
+        if str(report).strip().startswith("❌"):
+            await asyncio.to_thread(
+                PaperTradingService.save_review_failure,
+                trade.id,
+                report,
+                "review",
+            )
+        else:
+            await asyncio.to_thread(
+                PaperTradingService.save_review_success,
+                trade.id,
+                report,
+                "review",
+            )
+
         report_html = TelegramHTMLRenderer.render(report)
         if len(report_html) > 4000:
             await report_msg.edit_text(report_html[:4000], parse_mode="HTML")
             await update.message.reply_text(report_html[4000:], parse_mode="HTML")
         else:
             await report_msg.edit_text(report_html, parse_mode="HTML")
-            
+
     async def cmd_quote(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """查询行情 (Agent 版)"""
         if not await self._check_auth(update): return
