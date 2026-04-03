@@ -398,7 +398,7 @@ class IPOCalendarService:
                     continue
 
     @staticmethod
-    def build_tomorrow_report() -> str:
+    def _collect_tomorrow_items() -> Dict:
         tomorrow = IPOCalendarService._tomorrow_shanghai()
 
         cn = IPOCalendarService._fetch_cn(tomorrow)
@@ -414,7 +414,10 @@ class IPOCalendarService:
             logger.warning("IPO AI enrich pipeline failed but ignored: %s", e)
 
         total = sum(len(v) for v in all_items.values())
+        return {"tomorrow": tomorrow, "all_items": all_items, "total": total}
 
+    @staticmethod
+    def _render_tomorrow_report(tomorrow: dt.date, all_items: Dict[str, List[IPOItem]], total: int) -> str:
         lines = [f"🆕 明日新股预告 ({tomorrow.strftime('%Y-%m-%d')})", f"覆盖市场: A股 / 港股 / 美股 | 共 {total} 只", ""]
 
         for mkt in ["CN", "HK", "US"]:
@@ -445,10 +448,25 @@ class IPOCalendarService:
         return "\n".join(lines).strip()
 
     @staticmethod
+    def build_tomorrow_report() -> str:
+        payload = IPOCalendarService._collect_tomorrow_items()
+        return IPOCalendarService._render_tomorrow_report(
+            payload["tomorrow"], payload["all_items"], payload["total"]
+        )
+
+    @staticmethod
     def generate_and_push_tomorrow() -> Dict:
-        msg = IPOCalendarService.build_tomorrow_report()
+        payload = IPOCalendarService._collect_tomorrow_items()
+        total = int(payload.get("total", 0) or 0)
+        if total <= 0:
+            logger.info("No IPO listing for tomorrow, skip ipo_tomorrow push.")
+            return {"ok": True, "skipped": True, "reason": "no_ipo_tomorrow"}
+
+        msg = IPOCalendarService._render_tomorrow_report(
+            payload["tomorrow"], payload["all_items"], total
+        )
         Notifier.broadcast(msg)
-        return {"ok": True, "length": len(msg)}
+        return {"ok": True, "length": len(msg), "total": total}
 
 
 ipo_calendar_service = IPOCalendarService()

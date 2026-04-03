@@ -2,6 +2,8 @@ import os
 import sys
 import logging
 import asyncio
+import atexit
+import fcntl
 from dotenv import load_dotenv
 
 # Load env
@@ -23,11 +25,52 @@ from core.scheduler import task_scheduler
 from interface.telegram_bot import create_bot
 from modules.monitor.repository import WatchlistRepository
 
+
+
+def _acquire_single_instance_lock():
+    """防止重复启动导致定时任务和推送重复执行。"""
+    lock_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(lock_dir, exist_ok=True)
+    lock_path = os.path.join(lock_dir, "trade_db.lock")
+
+    fp = open(lock_path, "w")
+    try:
+        fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        logger.error("Another Trade_db instance is already running, exiting.")
+        try:
+            fp.close()
+        except Exception:
+            pass
+        return None
+
+    fp.seek(0)
+    fp.truncate()
+    fp.write(str(os.getpid()))
+    fp.flush()
+
+    def _release():
+        try:
+            fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            fp.close()
+        except Exception:
+            pass
+
+    atexit.register(_release)
+    return fp
+
 def main():
     """
     Main Entry Point
     """
     logger.info("Starting Trade_db System...")
+
+    lock_fp = _acquire_single_instance_lock()
+    if lock_fp is None:
+        return
     
     # 1. Init DB
     db_manager.init_meta_db()

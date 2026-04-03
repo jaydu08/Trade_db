@@ -30,6 +30,9 @@ class MarketHeatMap:
         self.enable_daily_attribution = str(
             os.getenv("ENABLE_HEATMAP_ATTRIBUTION", "0")
         ).strip().lower() in {"1", "true", "yes", "on"}
+        self.enable_market_brief = str(
+            os.getenv("ENABLE_HEATMAP_MARKET_BRIEF", "1")
+        ).strip().lower() in {"1", "true", "yes", "on"}
         # A股热榜参数（可通过环境变量在线调参）
         self.cn_norm_min = float(os.getenv("CN_HEAT_NORM_MIN", "0.60"))
         self.cn_norm_fallback_min = float(os.getenv("CN_HEAT_NORM_FALLBACK_MIN", "0.50"))
@@ -138,6 +141,41 @@ class MarketHeatMap:
         except Exception as e:
             logger.warning(f"Failed to get reason for {symbol}: {e}")
             return "分析原因失败"
+
+    def _get_market_brief(self, market: str) -> str:
+        """获取市场级别简析（联网搜索 + LLM），失败时返回空字符串。"""
+        query_map = {
+            "CN": "A股 今天 收盘 盘后 复盘 主线 板块 资金 情绪",
+            "HK": "港股 今天 收盘 复盘 恒指 恒生科技 资金流向",
+            "US": "US stock market today close recap sectors movers macro",
+        }
+        query = query_map.get(market)
+        if not query:
+            return ""
+
+        try:
+            ctx = Tools.web_search(query)
+        except Exception as e:
+            logger.warning("Heatmap market brief search failed for %s: %s", market, e)
+            return ""
+
+        if not ctx or "未返回有效结果" in ctx:
+            return ""
+
+        prompt = f"""
+你是交易员盘后快讯助手。请根据以下检索内容，输出 1-2 句市场简析，总字数不超过 70 字，聚焦当日主线、资金风格和风险点。
+
+市场: {market}
+检索内容:
+{ctx[:2500]}
+"""
+        try:
+            summary = simple_prompt(prompt, temperature=0.2)
+            summary = str(summary or "").replace("`", "").strip()
+            return summary[:120]
+        except Exception as e:
+            logger.warning("Heatmap market brief LLM failed for %s: %s", market, e)
+            return ""
 
     def _persist_daily_rank_from_heatmap(self, market: str, results: List[Dict]):
         """将热榜结果直接写入 DailyRank（口径统一为 heatmap 结果）"""
@@ -583,6 +621,14 @@ class MarketHeatMap:
         if market == 'CN' and cn_total_amount > 0:
             vol_str = f"{cn_total_amount/1e8:.0f} 亿" if cn_total_amount < 1e12 else f"{cn_total_amount/1e12:.2f} 万亿"
             msg_lines.append(f"📊 全市场成交额: **{vol_str}**")
+
+        if self.enable_market_brief:
+            try:
+                brief = self._get_market_brief(market)
+                if brief:
+                    msg_lines.append(f"🧭 市场简析: {brief}")
+            except Exception as e:
+                logger.warning("Build market brief failed for %s: %s", market, e)
 
         msg_lines.append("")
         
