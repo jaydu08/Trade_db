@@ -5,6 +5,16 @@
 # 进入项目根目录
 cd "$(dirname "$0")"
 
+# 如果已安装 systemd 服务，默认禁止手工 run.sh，避免重复实例
+if systemctl list-unit-files 2>/dev/null | grep -q ^trade_db.service; then
+    if [ "${MANUAL_RUN:-0}" != "1" ]; then
+        echo "⚠️ 检测到 trade_db.service 已安装。"
+        echo "为避免重复进程，请使用: systemctl start trade_db.service"
+        echo "如需强制手工启动，请执行: MANUAL_RUN=1 ./run.sh"
+        exit 1
+    fi
+fi
+
 # 确保日志目录存在
 mkdir -p logs
 

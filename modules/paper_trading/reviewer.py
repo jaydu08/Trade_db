@@ -4,21 +4,33 @@ Paper Trading Reviewer
 """
 import datetime
 import logging
+import os
 import traceback
 from typing import List, Optional
 
 import pandas as pd
 
-from core.db import get_collection
 from core.llm import simple_prompt
 from domain.ledger.paper_trade import PaperTrade
 from modules.ingestion.akshare_client import akshare_client
+from modules.monitor.news_intel import get_symbol_news_events, summarize_symbol_news
 
 logger = logging.getLogger(__name__)
 
 
 class PaperTradeReviewer:
-    """提供深度的 AI 多维度复盘分析"""
+    """提供紧凑的 AI 交易复盘短评"""
+
+    REVIEW_MAX_CHARS = int(os.getenv("PAPER_REVIEW_MAX_CHARS", "100"))
+
+    @staticmethod
+    def _compact_review(raw: str) -> str:
+        """仅做文本清洗，不做截断。"""
+        text = str(raw or "").replace("\r", " ").replace("\n", " ").strip()
+        text = text.replace("**", "").replace("`", "").replace("###", "").replace("##", "").replace("#", "")
+        while "  " in text:
+            text = text.replace("  ", " ")
+        return text
 
     @staticmethod
     def _fetch_historical_kbars(
@@ -127,7 +139,6 @@ class PaperTradeReviewer:
                 return None
 
             if market == "US":
-                # US 指数接口历史稳定性较差，按优先级多路回退。
                 for idx in [".INX", ".IXIC", ".DJI"]:
                     df = akshare_client._safe_call(["index_us_stock_sina"], symbol=idx)
                     pct = PaperTradeReviewer._calc_pct_from_df(df)
@@ -141,64 +152,46 @@ class PaperTradeReviewer:
         return None
 
     @staticmethod
-    def _is_related_symbol(meta_symbols, symbol: str) -> bool:
-        if meta_symbols is None:
-            return False
-        symbol = str(symbol or "").upper()
-        if isinstance(meta_symbols, list):
-            return symbol in {str(x).upper() for x in meta_symbols}
-        raw = str(meta_symbols).upper()
-        parts = {x.strip() for x in raw.replace(";", ",").split(",") if x.strip()}
-        return symbol in parts or symbol in raw
-
-    @staticmethod
     def _fetch_related_events(symbol: str, start_date: datetime.date) -> str:
-        """从 ChromaDB 中拉取建仓后的异动事件，支持严格+宽松双通道回退。"""
+        """从 market_events 拉取建仓后的相关新闻，优先定向新闻。"""
         symbol = str(symbol or "").strip()
         if not symbol:
             return "暂无相关专有事件记录。"
 
         try:
-            collection = get_collection("market_events")
-            docs: List[str] = []
-
-            # 严格通道：where 精确匹配
-            strict = collection.query(
-                query_texts=[symbol],
-                n_results=10,
-                where={"related_symbols": symbol},
-            )
-
-            if strict and strict.get("documents"):
-                for doc, meta in zip(strict["documents"][0], strict.get("metadatas", [[]])[0]):
-                    evt_date = str((meta or {}).get("event_date", ""))
-                    if evt_date >= str(start_date):
-                        docs.append(f"[{evt_date}] {doc}")
-
-            # 宽松回退：无 where 检索后在 metadata 层做包含过滤
-            if not docs:
-                relaxed = collection.query(query_texts=[symbol], n_results=20)
-                if relaxed and relaxed.get("documents"):
-                    for doc, meta in zip(relaxed["documents"][0], relaxed.get("metadatas", [[]])[0]):
-                        meta = meta or {}
-                        if not PaperTradeReviewer._is_related_symbol(meta.get("related_symbols"), symbol):
-                            continue
-                        evt_date = str(meta.get("event_date", ""))
-                        if evt_date >= str(start_date):
-                            docs.append(f"[{evt_date}] {doc}")
-
-            if not docs:
+            events = get_symbol_news_events(symbol=symbol, start_date=start_date, max_items=24)
+            if not events:
                 return "暂无相关专有事件记录。"
 
-            return "\n".join(docs[:10])
+            def _source_tag(src: str) -> str:
+                src = str(src or "")
+                if src.startswith("targeted_news"):
+                    return "定向"
+                if src == "monitor_scan":
+                    return "异动"
+                if src == "news_stream":
+                    return "新闻"
+                return "事件"
+
+            events.sort(key=lambda x: (0 if str(x.get("source", "")).startswith("targeted_news") else 1, x.get("date")))
+            events = list(reversed(events))
+
+            lines: List[str] = []
+            for e in events[:12]:
+                d = str(e.get("date", ""))
+                tag = _source_tag(str(e.get("source", "")))
+                headline = str(e.get("headline", "")).strip() or str(e.get("document", "")).strip()[:88]
+                lines.append(f"[{d}][{tag}] {headline}")
+
+            return "\n".join(lines) if lines else "暂无相关专有事件记录。"
         except Exception as e:
-            logger.error(f"Failed to fetch ChromaDB events for {symbol}: {e}")
+            logger.error(f"Failed to fetch events for {symbol}: {e}")
             return "事件检索失败。"
 
     @staticmethod
     def generate_review(trade: PaperTrade) -> str:
         """
-        核心方法：拼装上下文片段并向 LLM 提问，生成 6 大维度的复盘研报
+        核心方法：生成交易复盘短评（默认 100 字内）。
         """
         end_date = trade.exit_date or datetime.date.today()
         hold_days = (end_date - trade.entry_date).days or 1
@@ -224,40 +217,31 @@ class PaperTradeReviewer:
             max_drawdown = round(((lowest - trade.entry_price) / trade.entry_price) * 100, 2)
 
         index_pct = PaperTradeReviewer._fetch_market_index(trade.market, trade.entry_date, end_date)
-        index_text = f"{index_pct}%" if index_pct is not None else "未获取到有效指数数据"
-
+        index_text = f"{index_pct}%" if index_pct is not None else "指数缺失"
         events = PaperTradeReviewer._fetch_related_events(trade.symbol, trade.entry_date)
+        news_meta = summarize_symbol_news(trade.symbol, lookback_days=max(3, min(30, hold_days)))
+        news_signal = f"新闻强度:{news_meta.get('intensity_score', 0)} 新闻数:{news_meta.get('total', 0)}"
 
-        prompt = f"""你是一位铁面无私、目光如炬的顶尖对冲基金风控官与交易教练。
-你的任务是对基金经理（用户）的一笔模拟交易进行深度的【六维度回测复盘研报】。
+        max_chars = max(30, PaperTradeReviewer.REVIEW_MAX_CHARS)
+        prompt = f"""你是交易教练。请基于以下数据输出【单段中文短评】，严格要求：
+1) 总长度不超过{max_chars}字；
+2) 仅1句话，不换行，不要Markdown；
+3) 必须包含：评级(S/A/B/C/F) + 核心结论 + 1条动作建议；
+4) 禁止客套话与解释过程。
 
-【交易快照】
-- 标的: {trade.name} ({trade.symbol} - {trade.market})
-- 持仓期: {trade.entry_date} 至 {end_date} (共 {hold_days} 天)
-- 成本价: {trade.entry_price}
-- 平仓/现价: {current_price}
-- 最终盈亏: {pnl_pct}%
-- 建仓初始逻辑: {trade.entry_reason if trade.entry_reason else "无"}
-- 期间标的最大浮盈: {max_profit}%, 最大浮亏: {max_drawdown}%
-- 同期大盘基准表现: {index_text}
-- 期间底层新闻/异动:
-{events}
-
-【要求】
-请直接输出一篇排版精美、使用 Markdown 语法的干货复盘研报，必须且且仅包含以下标题框架：
-📈 交易策略复盘：(初始逻辑是否得到印证？这笔交易进出场是否科学？)
-🌪️ 持仓波动分析：(是否经历了巨大的浮亏过山车？盈亏比如何？)
-📊 标的基本面：(这期间是否有影响估值的核心财报/基本面转变？)
-📰 关联事件与题材：(拉动或重挫股价的实质内核到底是什么？)
-🧭 市场主线与风格：(有没有跑赢大盘？同期资金是拥挤在这个板块还是流向了别处？)
-💡 AI 回测结论：(冷醒毒舌的综合评价。例如：S级神操作、B级及格但靠运气、F级盲目赌博。加上最核心的一句建议。)
-
-只返回这6个标题的内容，拒绝任何客套话。
+交易快照：
+标的:{trade.name}({trade.symbol}-{trade.market})
+持仓:{hold_days}天 成本:{trade.entry_price} 现价:{current_price} 盈亏:{pnl_pct}%
+最大浮盈:{max_profit}% 最大浮亏:{max_drawdown}% 大盘:{index_text}
+建仓逻辑:{trade.entry_reason if trade.entry_reason else '无'}
+新闻信号:{news_signal}
+事件:{events}
 """
 
         try:
-            logger.info(f"Generating review for {trade.symbol}...")
-            return simple_prompt(prompt)
+            logger.info(f"Generating compact review for {trade.symbol}...")
+            raw = simple_prompt(prompt)
+            return PaperTradeReviewer._compact_review(raw)
         except Exception as e:
             logger.error(f"AI review generation failed: {traceback.format_exc()}")
             return f"❌ 复盘分析生成失败: {e}"

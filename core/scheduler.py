@@ -58,7 +58,7 @@ class TaskScheduler:
         # 这里简化为全天运行，或者设置更细致的 Trigger
         self.scheduler.add_job(
             self._job_sync_news,
-            IntervalTrigger(minutes=10),
+            IntervalTrigger(minutes=int(os.getenv("NEWS_SYNC_INTERVAL_MINUTES", "120") or 120)),
             id="sync_news",
             name="实时新闻监控",
             replace_existing=True
@@ -91,10 +91,10 @@ class TaskScheduler:
             replace_existing=True
         )
         
-        # 4. CN 热度榜单 (工作日 18:30，留时间发酵盘后新闻)
+        # 4. CN 热度榜单 (工作日 18:35，错开港股避免OOM)
         self.scheduler.add_job(
             self._job_cn_heatmap,
-            CronTrigger(day_of_week='mon-fri', hour=18, minute=30),
+            CronTrigger(day_of_week='mon-fri', hour=18, minute=35),
             id="cn_heatmap",
             name="A股热门榜单",
             replace_existing=True
@@ -250,7 +250,7 @@ class TaskScheduler:
 
     def _job_sync_news(self):
         """Job: 同步新闻"""
-        self._run_job("sync_news", news_syncer.sync_news_stream, limit=20)
+        self._run_job("sync_news", news_syncer.sync_news_stream, limit=int(os.getenv("NEWS_TARGET_MAX_SYMBOLS", "24") or 24))
 
     def _job_sync_reports(self):
         """Job: 同步研报"""

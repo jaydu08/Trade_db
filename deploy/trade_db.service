@@ -10,7 +10,7 @@ WorkingDirectory=/root/Trade_db
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=/root/Trade_db
 ExecStart=/root/.pyenv/versions/3.12.12/bin/python3 /root/Trade_db/main.py
-Restart=always
+Restart=on-failure
 RestartSec=5
 StandardOutput=append:/root/Trade_db/logs/system_run.log
 StandardError=append:/root/Trade_db/logs/system_run.log

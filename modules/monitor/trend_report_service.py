@@ -28,12 +28,14 @@ class TrendReportService:
         price = s.get("current_price", 0)
         ret = s.get("return_pct", 0)
         symbol = s.get("symbol", "")
+        news_cnt = int(s.get("news_count", 0) or 0)
+        news_text = f" 📰{news_cnt}条/3d" if news_cnt > 0 else ""
 
         if market == "US":
             display_symbol = str(symbol).split(".")[-1].strip() if symbol else symbol
             cap_100m = float(s.get("market_cap_100m_usd", 0) or 0)
             cap_text = f" 市值:{cap_100m:.1f}亿美元" if cap_100m > 0 else ""
-            return f"{i}. ({display_symbol}) 现价:{price} {ret:+.2f}%{cap_text}"
+            return f"{i}. ({display_symbol}) 现价:{price} {ret:+.2f}%{cap_text}{news_text}"
 
         if market == "CN":
             total_mv = float(s.get("total_mv_100m", 0) or 0)
@@ -43,9 +45,9 @@ class TrendReportService:
             flow_txt = format_flow_cn(main_inflow)
             cap_text = f" {mv_txt}" if mv_txt else ""
             flow_text = f" {flow_txt}" if flow_txt else ""
-            return f"{i}. {s.get('name','')}({symbol}) 现价:{price} {ret:+.2f}%{cap_text}{flow_text}"
+            return f"{i}. {s.get('name','')}({symbol}) 现价:{price} {ret:+.2f}%{cap_text}{flow_text}{news_text}"
 
-        return f"{i}. {s.get('name','')}({symbol}) 现价:{price} {ret:+.2f}%"
+        return f"{i}. {s.get('name','')}({symbol}) 现价:{price} {ret:+.2f}%{news_text}"
 
     @staticmethod
     def _refresh_market_prices(market: str, stks: List[dict]) -> None:

@@ -6,6 +6,15 @@ cd "$(dirname "$0")"
 PIDFILE="logs/trade_db.pid"
 PROC_REGEX="[p]ython3?.*Trade_db/main\.py"
 
+# 优先停止 systemd 服务（如存在）
+if systemctl list-unit-files 2>/dev/null | grep -q ^trade_db.service; then
+    if systemctl is-active --quiet trade_db.service; then
+        echo "🛑 正在停止 systemd 服务 trade_db.service..."
+        systemctl stop trade_db.service || true
+        sleep 1
+    fi
+fi
+
 if [ -f "$PIDFILE" ]; then
     PID=$(cat "$PIDFILE")
     

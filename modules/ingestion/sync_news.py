@@ -1,185 +1,252 @@
-
 """
-Sync News - 实时新闻监听
+Sync News - 定向新闻采集（低频）
+仅采集两类标的新闻：
+1) trend/heatmap 相关标的
+2) 自选观察 + 模拟持仓（ACTIVE）标的
 """
-import logging
+import datetime as dt
 import hashlib
-from datetime import datetime
-import pandas as pd
-from typing import Dict
+import logging
+import os
+from typing import Dict, List, Tuple
 
-from core.db import get_collection
-from core.llm import get_llm_client
-import akshare as ak
+from sqlmodel import select
+
+from core.db import get_collection, get_ledger_session
+from domain.ledger.analytics import TrendSeedPool, DailyRank
+from domain.ledger.paper_trade import PaperTrade
+from modules.monitor.repository import WatchlistRepository
+from modules.ingestion.data_factory import data_manager
 
 logger = logging.getLogger(__name__)
 
+
 class NewsSyncer:
-    """
-    实时新闻监听器
-    """
+    """定向新闻采集器（不使用 LLM，降低成本）"""
+
     def __init__(self):
-        self.llm = get_llm_client()
         self.collection = get_collection("market_events")
+        self.max_symbols = int(os.getenv("NEWS_TARGET_MAX_SYMBOLS", "24") or 24)
+        self.limit_per_source = int(os.getenv("NEWS_LIMIT_PER_SOURCE", "2") or 2)
+        self.search_timeout = int(os.getenv("NEWS_SEARCH_TIMEOUT", "12") or 12)
+        self.trend_lookback_days = int(os.getenv("NEWS_TREND_LOOKBACK_DAYS", "2") or 2)
+        self.rank_lookback_days = int(os.getenv("NEWS_RANK_LOOKBACK_DAYS", "1") or 1)
 
-    def fetch_latest_news(self) -> pd.DataFrame:
-        """获取最新的 7x24 小时快讯"""
-        logger.info("Fetching latest news...")
+    @staticmethod
+    def _norm_market(market: str) -> str:
+        m = str(market or "").upper().strip()
+        return m if m in {"CN", "HK", "US", "CF"} else "CN"
+
+    @staticmethod
+    def _market_text(market: str) -> str:
+        return {
+            "CN": "A股",
+            "HK": "港股",
+            "US": "美股",
+            "CF": "商品期货",
+        }.get(market, market)
+
+    def _collect_trend_heatmap_symbols(self) -> List[Dict[str, str]]:
+        """场景1：trend池 + heatmap(日榜 DailyRank)"""
+        out: List[Dict[str, str]] = []
+        today = dt.date.today()
+        trend_cutoff = today - dt.timedelta(days=max(0, self.trend_lookback_days))
+        rank_cutoff = today - dt.timedelta(days=max(0, self.rank_lookback_days))
+
+        with get_ledger_session() as session:
+            trend_rows = session.exec(
+                select(TrendSeedPool)
+                .where(TrendSeedPool.date >= trend_cutoff)
+                .order_by(TrendSeedPool.date.desc())
+            ).all()
+
+            for r in trend_rows:
+                out.append(
+                    {
+                        "symbol": str(r.symbol or "").strip(),
+                        "name": str(r.name or "").strip(),
+                        "market": self._norm_market(r.market),
+                        "scene": "trend_heatmap",
+                    }
+                )
+
+            rank_rows = session.exec(
+                select(DailyRank)
+                .where(DailyRank.date >= rank_cutoff)
+                .order_by(DailyRank.date.desc())
+            ).all()
+
+            for r in rank_rows:
+                out.append(
+                    {
+                        "symbol": str(r.symbol or "").strip(),
+                        "name": str(r.name or "").strip(),
+                        "market": self._norm_market(r.market),
+                        "scene": "trend_heatmap",
+                    }
+                )
+
+        return out
+
+    def _collect_watch_hold_symbols(self) -> List[Dict[str, str]]:
+        """场景2：自选观察 + 模拟持仓 ACTIVE"""
+        out: List[Dict[str, str]] = []
+
+        watch_data = WatchlistRepository().load_all()
+        for _, item in (watch_data or {}).items():
+            if not item or not item.get("is_active", True):
+                continue
+            out.append(
+                {
+                    "symbol": str(item.get("symbol", "")).strip(),
+                    "name": str(item.get("name", "")).strip(),
+                    "market": self._norm_market(item.get("market", "CN")),
+                    "scene": "watch_hold",
+                }
+            )
+
+        with get_ledger_session() as session:
+            active_trades = session.exec(
+                select(PaperTrade).where(PaperTrade.status == "ACTIVE")
+            ).all()
+            for t in active_trades:
+                out.append(
+                    {
+                        "symbol": str(t.symbol or "").strip(),
+                        "name": str(t.name or "").strip(),
+                        "market": self._norm_market(t.market),
+                        "scene": "watch_hold",
+                    }
+                )
+
+        return out
+
+    def _build_targets(self, limit: int) -> List[Dict[str, str]]:
+        raw = self._collect_watch_hold_symbols() + self._collect_trend_heatmap_symbols()
+        merged: Dict[Tuple[str, str], Dict[str, str]] = {}
+
+        for item in raw:
+            symbol = str(item.get("symbol", "")).strip()
+            market = self._norm_market(item.get("market"))
+            if not symbol:
+                continue
+            key = (market, symbol)
+            if key not in merged:
+                merged[key] = {
+                    "symbol": symbol,
+                    "name": str(item.get("name", "")).strip(),
+                    "market": market,
+                    "scene": str(item.get("scene", "")).strip() or "unknown",
+                }
+            else:
+                # 优先保留带名称条目，场景合并
+                if not merged[key].get("name") and item.get("name"):
+                    merged[key]["name"] = str(item.get("name", "")).strip()
+                prev_scene = merged[key].get("scene", "")
+                scene = str(item.get("scene", "")).strip()
+                if scene and scene not in prev_scene:
+                    merged[key]["scene"] = f"{prev_scene},{scene}" if prev_scene else scene
+
+        # 优先自选/持仓，再 trend/heatmap
+        items = list(merged.values())
+        items.sort(key=lambda x: (0 if "watch_hold" in x.get("scene", "") else 1, x["market"], x["symbol"]))
+
+        hard_limit = max(1, min(int(limit or self.max_symbols), self.max_symbols))
+        return items[:hard_limit]
+
+    def _build_query(self, item: Dict[str, str]) -> str:
+        symbol = item["symbol"]
+        name = item.get("name", "")
+        market = item.get("market", "CN")
+        mtxt = self._market_text(market)
+        base = f"{symbol} {name} {mtxt}"
+        if market == "US":
+            return f"{base} stock news earnings guidance SEC filing"
+        if market == "HK":
+            return f"{base} 股票 新闻 公告 盈利预告 资金流向"
+        return f"{base} 股票 新闻 公告 业绩 资金流向"
+
+    def _store_event(self, item: Dict[str, str], news_text: str) -> bool:
+        if not news_text:
+            return False
+        if "所有搜索引擎均未返回有效结果" in news_text or "本地未配置任何有效的搜索引擎" in news_text:
+            return False
+
+        symbol = item["symbol"]
+        market = item["market"]
+        scene = item.get("scene", "unknown")
+        event_date = dt.date.today().isoformat()
+
+        digest = hashlib.md5(f"{event_date}|{market}|{symbol}|{news_text[:500]}".encode("utf-8", errors="ignore")).hexdigest()[:12]
+        doc_id = f"evt_news_{event_date}_{market}_{symbol}_{digest}"
+
+        doc_text = (
+            f"【定向新闻】{item.get('name', '')}({symbol}-{market})\n"
+            f"场景: {scene}\n"
+            f"{news_text[:5000]}"
+        )
+
+        metadata = {
+            "event_type": "news",
+            "event_date": event_date,
+            "impact": "neutral",
+            "impact_score": 0.5,
+            "source": f"targeted_news:{scene}",
+            "related_symbols": symbol,
+            "market": market,
+            "doc_version": 1,
+            "created_at": str(dt.datetime.utcnow()),
+        }
+
         try:
-            # 财联社 7x24
-            # ak.stock_telegraph_cls(symbol="全部") or similar
-            # ak.stock_info_global_cls()?
-            
-            # 备选: 新浪 7x24
-            # ak.stock_news_live_sina() is not available?
-            # ak.js_news(timestamp=...)
-            
-            # Let's try `stock_zh_a_new_em` (个股新闻) or `stock_info_global_cls`
-            # For "events", we want global macro or industry news.
-            
-            # Using `stock_telegraph_cls` if available
-            if hasattr(ak, "stock_telegraph_cls"):
-                df = ak.stock_telegraph_cls()
-                return df
-            
-            # Fallback to Sina
-            # ak.stock_js_news_sina()?
-            
-            # Let's try to find a working news function
-            news_funcs = [f for f in dir(ak) if "news" in f and ("sina" in f or "cls" in f or "cctv" in f)]
-            if news_funcs:
-                # Prioritize CCTV for major events, or Sina for speed
-                # Let's pick `stock_news_live_sina` if exists, else first one
-                target = "stock_news_live_sina"
-                if target in news_funcs:
-                    return getattr(ak, target)()
-                else:
-                    # Try to call the first one that looks promising
-                    for func_name in news_funcs:
-                        try:
-                            df = getattr(ak, func_name)()
-                            if not df.empty:
-                                return df
-                        except:
-                            continue
-                            
-            return pd.DataFrame()
+            self.collection.add(ids=[doc_id], documents=[doc_text], metadatas=[metadata])
+            return True
         except Exception as e:
-            logger.warning(f"Failed to fetch news: {e}")
-            return pd.DataFrame()
-
-    def analyze_event(self, content: str) -> dict:
-        """
-        利用 LLM 分析新闻事件的影响
-        """
-        prompt = f"""
-        请分析以下新闻快讯，判断其对资本市场的影响。
-        
-        新闻内容: {content}
-        
-        请提取:
-        1. 事件类型 (policy/earnings/product/market/news)
-        2. 相关行业 (如: 半导体, 新能源)
-        3. 影响方向 (positive/negative/neutral)
-        4. 影响评分 (0.0 - 1.0, 1.0为重磅)
-        
-        以 JSON 格式输出: {{ "event_type": "", "industries": [], "impact": "", "score": 0.5 }}
-        """
-        try:
-            res = self.llm.simple_prompt(prompt, temperature=0.1)
-            import json
-            if "```json" in res:
-                res = res.split("```json")[1].split("```")[0]
-            elif "```" in res:
-                res = res.split("```")[1].split("```")[0]
-            return json.loads(res.strip())
-        except Exception:
-            return {}
+            # 重复 id / 临时写入失败时跳过，不影响主流程
+            logger.warning("Store targeted news failed for %s-%s: %s", market, symbol, e)
+            return False
 
     def sync_news_stream(self, limit: int = 20) -> Dict[str, int]:
         """
-        同步新闻流并分析
+        定向新闻同步（低频）
+        - 不做 LLM 分析
+        - 仅定向标的搜索并入 market_events
         """
         result = {
-            "fetched": 0,
-            "analyzed": 0,
-            "synced": 0,
+            "targets": 0,
+            "searched": 0,
+            "stored": 0,
             "skipped": 0,
             "errors": 0,
         }
-        df = self.fetch_latest_news()
-        if df.empty:
-            logger.warning("No news fetched.")
+
+        targets = self._build_targets(limit)
+        result["targets"] = len(targets)
+        if not targets:
+            logger.info("No target symbols for targeted news sync.")
             return result
 
-        result["fetched"] = len(df)
-        logger.info(f"Fetched {len(df)} news items. Analyzing top {limit}...")
-        
-        # Process latest N
-        # Sina columns usually: content, time...
-        # Need to check columns
-        content_col = None
-        for col in df.columns:
-            if "内容" in col or "content" in col or "title" in col:
-                content_col = col
-                break
-        
-        if not content_col:
-            logger.warning(f"No content column found in news dataframe: {list(df.columns)}")
-            result["errors"] += 1
-            return result
+        logger.info("Targeted news sync started: targets=%s", len(targets))
 
-        count = 0
-        for _, row in df.iterrows():
-            if count >= limit: break
-            
-            content = row[content_col]
-            if not content or len(str(content)) < 10: continue
-            
-            # Analysis
-            analysis = self.analyze_event(str(content))
-            result["analyzed"] += 1
-            
-            if analysis:
-                if self._store_event(str(content), analysis):
-                    result["synced"] += 1
+        for item in targets:
+            query = self._build_query(item)
+            try:
+                news_text = data_manager.search(
+                    query,
+                    limit_per_source=self.limit_per_source,
+                    timeout=self.search_timeout,
+                )
+                result["searched"] += 1
+                if self._store_event(item, str(news_text or "")):
+                    result["stored"] += 1
                 else:
-                    result["errors"] += 1
-                count += 1
-            else:
-                result["skipped"] += 1
+                    result["skipped"] += 1
+            except Exception as e:
+                result["errors"] += 1
+                logger.warning("Targeted news search failed for %s-%s: %s", item.get("market"), item.get("symbol"), e)
 
+        logger.info("Targeted news sync done: %s", result)
         return result
 
-    def _store_event(self, content: str, analysis: dict) -> bool:
-        """存入向量库"""
-        now = datetime.utcnow().isoformat()
-        # Use content hash as ID
-        doc_id = f"evt_{hashlib.md5(content.encode()).hexdigest()[:10]}"
-        
-        text = f"【市场事件】{content} (影响: {analysis.get('impact')} {analysis.get('score')})"
-        
-        meta = {
-            "event_type": analysis.get("event_type", "news"),
-            "event_date": datetime.now().strftime("%Y-%m-%d"),
-            "impact": analysis.get("impact", "neutral"),
-            "impact_score": float(analysis.get("score", 0.5)),
-            "source": "news_stream",
-            # Chroma metadata list support is tricky, join them
-            "industries": ",".join(analysis.get("industries", [])),
-            "created_at": now
-        }
-        
-        try:
-            self.collection.add(
-                ids=[doc_id],
-                documents=[text],
-                metadatas=[meta]
-            )
-            logger.info(f"Stored event: {content[:20]}... ({analysis.get('impact')})")
-            return True
-        except Exception as e:
-            logger.warning(f"Vector store failed: {e}")
-            return False
 
 news_syncer = NewsSyncer()

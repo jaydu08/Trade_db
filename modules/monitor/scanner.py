@@ -13,6 +13,7 @@ from core.db import get_collection
 import hashlib
 # Import Tools to use the enhanced web_search
 from core.agent import Tools 
+from modules.monitor.news_intel import build_fallback_reason, summarize_symbol_news
 
 logger = logging.getLogger(__name__)
 
@@ -358,12 +359,24 @@ class MonitorService:
             except Exception as llm_e:
                 logger.error(f"LLM Structured output failed: {llm_e}")
                 fallback_prompt = f"{user_prompt}\n直接给出1句话原因，不要任何其他字。"
-                reason_text = simple_prompt(fallback_prompt)
+                reason_text = ""
+                try:
+                    reason_text = simple_prompt(fallback_prompt)
+                except Exception as e2:
+                    logger.warning(f"LLM simple fallback failed for {symbol}: {e2}")
+
+                cleaned_reason = str(reason_text or "").strip()
+                if not cleaned_reason:
+                    cleaned_reason = build_fallback_reason(symbol, lookback_days=3)
+                news_meta = summarize_symbol_news(symbol, lookback_days=3)
+                news_tag = f"📰 **新闻强度**: {news_meta.get('intensity_score', 0)} ({news_meta.get('total', 0)}条/3d)"
+
                 analysis_text = (
                     f"🚨 **{direction}预警** | {name} ({symbol})\n"
                     f"💰 **现价**: {price}  **幅度**: {pct}%\n"
                     f"─────────────────\n"
-                    f"⚡ **核心归因**: {reason_text.strip()}"
+                    f"⚡ **核心归因**: {cleaned_reason}\n"
+                    f"{news_tag}"
                 )
 
             # 3. Send single consolidated report

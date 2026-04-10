@@ -11,6 +11,7 @@ from modules.ingestion.akshare_client import akshare_client
 from core.llm import simple_prompt
 from core.agent import Tools
 from modules.monitor.notifier import Notifier
+from modules.monitor.news_intel import summarize_symbol_news
 from modules.ingestion.market_cap import (
     get_cn_market_metrics,
     get_cn_fund_flow,
@@ -40,6 +41,8 @@ class MarketHeatMap:
         self.cn_near_limit_high = float(os.getenv("CN_HEAT_NEAR_LIMIT_HIGH", "1.03"))
         self.cn_gem_bonus = float(os.getenv("CN_HEAT_GEM_BONUS", "1.10"))
         self.cn_turnover_fetch_cap = int(os.getenv("CN_HEAT_TURNOVER_FETCH_CAP", "220"))
+        self.heat_w_news = float(os.getenv("HEATMAP_W_NEWS", "0.12"))
+        self.heat_news_lookback_days = int(os.getenv("HEATMAP_NEWS_LOOKBACK_DAYS", "3") or 3)
 
         w_pct = float(os.getenv("CN_HEAT_W_PCT", "0.45"))
         w_amount = float(os.getenv("CN_HEAT_W_AMOUNT", "0.30"))
@@ -419,9 +422,48 @@ class MarketHeatMap:
                     res = list(ex.map(_check_cap, candidates))
                     
                 valid_stocks = [s for s in res if s is not None]
-                return valid_stocks[:top_n]
-                
-        return candidates[:top_n]
+                ranked = self._apply_news_intensity_rank(valid_stocks)
+                return ranked[:top_n]
+
+        ranked = self._apply_news_intensity_rank(candidates)
+        return ranked[:top_n]
+
+    def _apply_news_intensity_rank(self, stocks: List[Dict]) -> List[Dict]:
+        """对候选标的叠加新闻强度分，作为热度排序附加因子。"""
+        if not stocks:
+            return stocks
+
+        lookback = max(1, int(self.heat_news_lookback_days or 3))
+        weight = max(0.0, min(0.5, float(self.heat_w_news or 0)))
+
+        def _fetch(stock: Dict):
+            symbol = str(stock.get("symbol", "")).strip()
+            if not symbol:
+                return stock, {"intensity_score": 0.0, "total": 0}
+            meta = summarize_symbol_news(symbol, lookback_days=lookback, max_items=18)
+            return stock, meta
+
+        workers = min(10, len(stocks))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+            pairs = list(ex.map(_fetch, stocks))
+
+        base_scores = pd.Series([float((st or {}).get("heat_score", 0) or 0) for st, _ in pairs])
+        base_rank = base_scores.rank(pct=True) if base_scores.nunique() > 1 else pd.Series([0.5] * len(pairs))
+
+        enriched: List[Dict] = []
+        for i, (stock, meta) in enumerate(pairs):
+            news_strength = float((meta or {}).get("intensity_score", 0) or 0)
+            news_count = int((meta or {}).get("total", 0) or 0)
+            stock["news_strength"] = round(news_strength, 3)
+            stock["news_count_3d"] = news_count
+            if weight > 0:
+                stock["heat_score_v2"] = round((1 - weight) * float(base_rank.iloc[i]) + weight * news_strength, 4)
+            else:
+                stock["heat_score_v2"] = round(float(base_rank.iloc[i]), 4)
+            enriched.append(stock)
+
+        enriched.sort(key=lambda x: (float(x.get("heat_score_v2", 0) or 0), float(x.get("pct_chg", 0) or 0)), reverse=True)
+        return enriched
 
     def _enrich_market_metrics(self, market: str, stocks: List[Dict]):
         """为推送标的补齐市值与资金流字段（当前重点支持 A 股）。"""
@@ -645,7 +687,9 @@ class MarketHeatMap:
             price_str = f"{price:.2f}" if price else "N/A"
             cap_text = self._format_cap_text(stock, market)
             flow_text = self._format_flow_text(stock, market)
-            msg_lines.append(f"**{i}. {display}**  💰 现价: {price_str}  `{pct:+.2f}%`{cap_text}{flow_text}")
+            news_cnt = int(stock.get("news_count_3d", 0) or 0)
+            news_text = f"  📰 {news_cnt}条/3d" if news_cnt > 0 else ""
+            msg_lines.append(f"**{i}. {display}**  💰 现价: {price_str}  `{pct:+.2f}%`{cap_text}{flow_text}{news_text}")
             if self.enable_daily_attribution:
                 reason = stock.get('reason', '')
                 msg_lines.append(f"💡 {reason}\n")

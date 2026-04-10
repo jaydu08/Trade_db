@@ -10,6 +10,7 @@ from typing import List, Dict, Tuple, Optional
 
 from core.db import get_ledger_session
 from domain.ledger.analytics import TrendSeedPool, DailyRank, TrendDailyBar
+from modules.monitor.news_intel import summarize_symbol_news
 
 logger = logging.getLogger(__name__)
 
@@ -880,7 +881,9 @@ class TrendCalculator:
                 grouped[key]["reason_records"].append((r["date"], r["daily_reason"].strip()))
                 
         items = list(grouped.values())
-        
+        news_boost = float(os.getenv("TREND_NEWS_BOOST", "0.18") or 0.18)
+        news_lookback_days = int(os.getenv("TREND_NEWS_LOOKBACK_DAYS", str(max(3, min(days, 10)))) or max(3, min(days, 10)))
+
         # 3. 并发查 N 日涨幅
         def _process(item: dict):
             ret, current_price, price_date = TrendCalculator._get_return(item["symbol"], item["market"], days)
@@ -893,13 +896,23 @@ class TrendCalculator:
                 item.get("reason_records", []),
                 today=dt.date.today(),
             )
+
+            news_meta = summarize_symbol_news(item.get("symbol", ""), lookback_days=news_lookback_days, max_items=18)
+            news_intensity = float(news_meta.get("intensity_score", 0) or 0)
+            news_count = int(news_meta.get("total", 0) or 0)
+            item["news_intensity"] = round(news_intensity, 3)
+            item["news_count"] = news_count
+
+            if (not aggregated_reason or aggregated_reason == "暂无新闻催化") and news_meta.get("headline"):
+                aggregated_reason = str(news_meta.get("headline", "")).strip()
+
             item["aggregated_reason"] = aggregated_reason
             item["signal_strength"] = signal_strength
 
-            # 趋势总分：在原始累计涨幅基础上，给新鲜有效信号一定加权
-            # 目标：老热点理由重复刷屏时，难以长期霸榜
+            # 趋势总分：价格趋势 * 新鲜信号 * 新闻催化强度
             freshness_factor = min(1.25, 0.85 + signal_strength * 0.18)
-            item["trend_score"] = round(ret * freshness_factor, 2)
+            news_factor = min(1.25, 0.90 + news_intensity * news_boost)
+            item["trend_score"] = round(ret * freshness_factor * news_factor, 2)
             return item
             
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:

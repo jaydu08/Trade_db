@@ -4,7 +4,7 @@
     "market": "US",
     "name": "GOOG",
     "added_at": "2026-02-21 00:29:25.455153",
-    "last_alert_at": "2026-03-03 00:00:57.125931",
+    "last_alert_at": "2026-04-01 01:23:58.684777",
     "alert_threshold_pct": 5.0,
     "is_active": true,
     "chat_id": -5201901502
@@ -14,7 +14,7 @@
     "market": "US",
     "name": "CRCL",
     "added_at": "2026-02-21 00:29:04.923017",
-    "last_alert_at": "2026-03-25 21:36:22.071003",
+    "last_alert_at": "2026-04-10 22:38:59.408304",
     "alert_threshold_pct": 5.0,
     "is_active": true,
     "chat_id": -5201901502
@@ -24,7 +24,7 @@
     "market": "US",
     "name": "NVDA",
     "added_at": "2026-02-26 10:22:30.921820",
-    "last_alert_at": "2026-03-03 00:00:58.919277",
+    "last_alert_at": "2026-04-01 00:43:02.784404",
     "alert_threshold_pct": 5.0,
     "is_active": true,
     "chat_id": -5201901502
@@ -34,7 +34,7 @@
     "market": "HK",
     "name": "智谱",
     "added_at": "2026-02-26 10:23:09.293113",
-    "last_alert_at": "2026-03-25 09:54:41.364917",
+    "last_alert_at": "2026-04-09 10:12:41.677620",
     "alert_threshold_pct": 5.0,
     "is_active": true,
     "chat_id": -5201901502
@@ -49,32 +49,12 @@
     "is_active": true,
     "chat_id": -5201901502
   },
-  "CN:600410": {
-    "symbol": "600410",
-    "market": "CN",
-    "name": "华胜天成",
-    "added_at": "2026-02-27 10:22:56.129617",
-    "last_alert_at": "2026-03-11 09:34:22.091744",
-    "alert_threshold_pct": 5.0,
-    "is_active": true,
-    "chat_id": -5201901502
-  },
   "US:HIMS": {
     "symbol": "HIMS",
     "market": "US",
     "name": "HIMS",
     "added_at": "2026-03-10 23:33:02.459394",
-    "last_alert_at": "2026-03-20 03:16:20.845384",
-    "alert_threshold_pct": 5.0,
-    "is_active": true,
-    "chat_id": -5201901502
-  },
-  "HK:06809": {
-    "symbol": "06809",
-    "market": "HK",
-    "name": "澜起科技",
-    "added_at": "2026-03-18 11:45:35.339906",
-    "last_alert_at": "2026-03-25 09:58:41.386746",
+    "last_alert_at": "2026-04-08 21:30:41.130195",
     "alert_threshold_pct": 5.0,
     "is_active": true,
     "chat_id": -5201901502
