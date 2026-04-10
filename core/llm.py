@@ -94,6 +94,7 @@ class LLMClient:
             "model": self.model,
             "messages": messages,
             "temperature": temperature or self.temperature,
+            "stream": False,  # 强制非流式响应
         }
 
         if max_tokens:

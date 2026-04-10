@@ -241,6 +241,12 @@ class PaperTradeReviewer:
         try:
             logger.info(f"Generating compact review for {trade.symbol}...")
             raw = simple_prompt(prompt)
+            
+            # 处理 LLM 返回空内容的情况
+            if not raw or not raw.strip():
+                logger.warning(f"LLM returned empty review for {trade.symbol}, using fallback")
+                return f"📊 {trade.name} 持仓{hold_days}天 盈亏{pnl_pct}% - 复盘报告生成失败（AI返回为空）"
+            
             return PaperTradeReviewer._compact_review(raw)
         except Exception as e:
             logger.error(f"AI review generation failed: {traceback.format_exc()}")
