@@ -2,12 +2,14 @@ import datetime as dt
 import logging
 import re
 import time
+import os
 from typing import Any, Dict, List
 
 from core.db import get_collection
 
 logger = logging.getLogger(__name__)
 _COLLECTION_COOLDOWN_UNTIL = 0.0
+EVENT_COLLECTION = str(os.getenv("NEWS_EVENT_COLLECTION", "market_events_lite") or "market_events_lite").strip()
 
 
 def _parse_event_date(value: Any) -> dt.date | None:
@@ -74,60 +76,45 @@ def _doc_headline(text: str, limit: int = 64) -> str:
 
 
 def get_symbol_news_events(symbol: str, start_date: dt.date, max_items: int = 24) -> List[Dict[str, Any]]:
-    """从 market_events 提取标的相关新闻事件（严格+宽松双通道）。"""
+    """从事件库提取标的相关新闻事件（metadata 直查，低内存）。"""
     global _COLLECTION_COOLDOWN_UNTIL
     sym = str(symbol or "").strip()
     if not sym:
         return []
 
-    docs: List[Dict[str, Any]] = []
-
-    # 向量库异常时进入冷却窗口，避免每个标的反复重试拖慢主流程
     if time.time() < float(_COLLECTION_COOLDOWN_UNTIL):
         return []
 
-    try:
-        collection = get_collection("market_events")
+    docs: List[Dict[str, Any]] = []
 
-        strict = collection.query(
-            query_texts=[sym],
-            n_results=max(20, max_items * 2),
+    def _collect_from_collection(name: str) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        collection = get_collection(name)
+        data = collection.get(
             where={"related_symbols": sym},
+            limit=max(40, max_items * 4),
+            include=["metadatas"],
         )
-        if strict and strict.get("documents"):
-            for doc, meta in zip(strict["documents"][0], strict.get("metadatas", [[]])[0]):
-                meta = meta or {}
-                d = _parse_event_date(meta.get("event_date"))
-                if not d or d < start_date:
-                    continue
-                docs.append(
-                    {
-                        "date": d,
-                        "source": str(meta.get("source", "")),
-                        "document": str(doc or ""),
-                        "headline": _doc_headline(doc),
-                    }
-                )
+        metas = data.get("metadatas", []) if isinstance(data, dict) else []
+        for meta in metas or []:
+            meta = meta or {}
+            d = _parse_event_date(meta.get("event_date"))
+            if not d or d < start_date:
+                continue
+            out.append(
+                {
+                    "date": d,
+                    "source": str(meta.get("source", "")),
+                    "document": "",
+                    "headline": str(meta.get("headline", "") or "").strip(),
+                }
+            )
+        return out
 
-        # 若严格通道命中很少，走宽松召回补充
-        if len(docs) < max(4, max_items // 3):
-            relaxed = collection.query(query_texts=[sym], n_results=max(30, max_items * 3))
-            if relaxed and relaxed.get("documents"):
-                for doc, meta in zip(relaxed["documents"][0], relaxed.get("metadatas", [[]])[0]):
-                    meta = meta or {}
-                    if not _is_related_symbol(meta.get("related_symbols"), sym):
-                        continue
-                    d = _parse_event_date(meta.get("event_date"))
-                    if not d or d < start_date:
-                        continue
-                    docs.append(
-                        {
-                            "date": d,
-                            "source": str(meta.get("source", "")),
-                            "document": str(doc or ""),
-                            "headline": _doc_headline(doc),
-                        }
-                    )
+    try:
+        docs.extend(_collect_from_collection(EVENT_COLLECTION))
+        if EVENT_COLLECTION != "market_events" and len(docs) < max(2, max_items // 4):
+            docs.extend(_collect_from_collection("market_events"))
     except Exception as e:
         _COLLECTION_COOLDOWN_UNTIL = time.time() + 300
         logger.warning("get_symbol_news_events failed for %s: %s | cooldown=300s", sym, e)
@@ -136,13 +123,12 @@ def get_symbol_news_events(symbol: str, start_date: dt.date, max_items: int = 24
     seen = set()
     unique_docs: List[Dict[str, Any]] = []
     for x in docs:
-        key = (str(x.get("date")), str(x.get("source")), str(x.get("document", ""))[:120])
+        key = (str(x.get("date")), str(x.get("source")), str(x.get("headline", "")))
         if key in seen:
             continue
         seen.add(key)
         unique_docs.append(x)
 
-    # 排序：优先 targeted_news，其次日期新
     unique_docs.sort(
         key=lambda x: (
             0 if str(x.get("source", "")).startswith("targeted_news") else 1,
@@ -153,7 +139,6 @@ def get_symbol_news_events(symbol: str, start_date: dt.date, max_items: int = 24
     unique_docs = sorted(unique_docs, key=lambda x: x.get("date"), reverse=True)
 
     return unique_docs[:max_items]
-
 
 def summarize_symbol_news(symbol: str, lookback_days: int = 3, max_items: int = 24) -> Dict[str, Any]:
     """输出标的新闻强度摘要，供 trend/heatmap/复盘复用。"""

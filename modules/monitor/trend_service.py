@@ -25,6 +25,7 @@ class TrendService:
     }
     POOL_RETENTION_DAYS = 60
     POOL_SYMBOL_CAPS = {"CN": 100, "US": 100, "HK": 50, "CF": 30}
+    TREND_MAX_SYMBOLS_PER_MARKET = int(os.getenv("TREND_MAX_SYMBOLS_PER_MARKET", "60") or 60)
 
     @staticmethod
     def _enforce_pool_symbol_cap(session, market: str):
@@ -669,11 +670,13 @@ class TrendCalculator:
             candidates.append(raw.split(".")[-1].strip())
 
         with get_ledger_session() as session:
+            max_rows = max(90, int(d_days) * 25)
             stmt = (
                 select(DailyRank)
                 .where(DailyRank.market == market)
                 .where(DailyRank.symbol.in_(candidates))
                 .order_by(DailyRank.date.desc())
+                .limit(max_rows)
             )
             # 在 session 生命周期内提取纯数据，避免 detached ORM 访问
             rows = [(r.date, float(r.price)) for r in session.exec(stmt).all() if r.price and r.price > 0]
@@ -710,11 +713,13 @@ class TrendCalculator:
             candidates.append(raw.split(".")[-1].strip())
 
         with get_ledger_session() as session:
+            max_rows = max(120, int(d_days) * 30)
             stmt = (
                 select(TrendDailyBar)
                 .where(TrendDailyBar.market == market)
                 .where(TrendDailyBar.symbol.in_(candidates))
                 .order_by(TrendDailyBar.date.desc())
+                .limit(max_rows)
             )
             # 在 session 生命周期内提取纯数据，避免 detached ORM 访问
             rows = [(r.date, float(r.close)) for r in session.exec(stmt).all() if r.close and r.close > 0]
@@ -881,6 +886,22 @@ class TrendCalculator:
                 grouped[key]["reason_records"].append((r["date"], r["daily_reason"].strip()))
                 
         items = list(grouped.values())
+        # 候选池限额：避免极端数据膨胀导致内存峰值
+        if TrendService.TREND_MAX_SYMBOLS_PER_MARKET > 0:
+            by_market = defaultdict(list)
+            for it in items:
+                by_market[it.get("market", "")].append(it)
+            reduced = []
+            for mkt, arr in by_market.items():
+                arr.sort(
+                    key=lambda x: (
+                        max((d for d, _ in x.get("reason_records", [])), default=cutoff),
+                        len(x.get("reason_records", [])),
+                    ),
+                    reverse=True,
+                )
+                reduced.extend(arr[: TrendService.TREND_MAX_SYMBOLS_PER_MARKET])
+            items = reduced
         news_boost = float(os.getenv("TREND_NEWS_BOOST", "0.18") or 0.18)
         news_lookback_days = int(os.getenv("TREND_NEWS_LOOKBACK_DAYS", str(max(3, min(days, 10)))) or max(3, min(days, 10)))
 
@@ -915,7 +936,9 @@ class TrendCalculator:
             item["trend_score"] = round(ret * freshness_factor * news_factor, 2)
             return item
             
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        calc_workers = int(os.getenv("TREND_CALC_WORKERS", "5") or 5)
+        calc_workers = max(1, min(calc_workers, max(1, len(items))))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=calc_workers) as executor:
             results = list(executor.map(_process, items))
             
         # 4. 按市场分组排序并取 Top 10

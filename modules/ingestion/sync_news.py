@@ -8,6 +8,7 @@ import datetime as dt
 import hashlib
 import logging
 import os
+import re
 from typing import Dict, List, Tuple
 
 from sqlmodel import select
@@ -25,7 +26,8 @@ class NewsSyncer:
     """定向新闻采集器（不使用 LLM，降低成本）"""
 
     def __init__(self):
-        self.collection = get_collection("market_events")
+        self.collection_name = str(os.getenv("NEWS_EVENT_COLLECTION", "market_events_lite") or "market_events_lite").strip()
+        self.collection = get_collection(self.collection_name)
         self.max_symbols = int(os.getenv("NEWS_TARGET_MAX_SYMBOLS", "24") or 24)
         self.limit_per_source = int(os.getenv("NEWS_LIMIT_PER_SOURCE", "2") or 2)
         self.search_timeout = int(os.getenv("NEWS_SEARCH_TIMEOUT", "12") or 12)
@@ -45,6 +47,16 @@ class NewsSyncer:
             "US": "美股",
             "CF": "商品期货",
         }.get(market, market)
+    @staticmethod
+    def _extract_headline(news_text: str) -> str:
+        text = str(news_text or "").replace("\r", "\n")
+        lines = [x.strip() for x in text.split("\n") if x.strip()]
+        for ln in lines:
+            m = re.match(r"^\d+\.\s*(.+)$", ln)
+            if m:
+                return m.group(1)[:160]
+        return (lines[0] if lines else "")[:160]
+
 
     def _collect_trend_heatmap_symbols(self) -> List[Dict[str, str]]:
         """场景1：trend池 + heatmap(日榜 DailyRank)"""
@@ -180,10 +192,13 @@ class NewsSyncer:
         digest = hashlib.md5(f"{event_date}|{market}|{symbol}|{news_text[:500]}".encode("utf-8", errors="ignore")).hexdigest()[:12]
         doc_id = f"evt_news_{event_date}_{market}_{symbol}_{digest}"
 
+        headline = self._extract_headline(news_text)
+        compact_text = str(news_text or "")[:1200]
         doc_text = (
             f"【定向新闻】{item.get('name', '')}({symbol}-{market})\n"
+            f"标题: {headline}\n"
             f"场景: {scene}\n"
-            f"{news_text[:5000]}"
+            f"{compact_text}"
         )
 
         metadata = {
@@ -193,6 +208,7 @@ class NewsSyncer:
             "impact_score": 0.5,
             "source": f"targeted_news:{scene}",
             "related_symbols": symbol,
+            "headline": headline,
             "market": market,
             "doc_version": 1,
             "created_at": str(dt.datetime.utcnow()),
@@ -245,7 +261,7 @@ class NewsSyncer:
                 result["errors"] += 1
                 logger.warning("Targeted news search failed for %s-%s: %s", item.get("market"), item.get("symbol"), e)
 
-        logger.info("Targeted news sync done: %s", result)
+        logger.info("Targeted news sync done: %s | collection=%s", result, self.collection_name)
         return result
 
 

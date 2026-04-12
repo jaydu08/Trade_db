@@ -1,5 +1,7 @@
 import logging
+import os
 import datetime as dt
+import gc
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Dict, List
@@ -19,6 +21,18 @@ logger = logging.getLogger(__name__)
 
 
 class TrendReportService:
+    @staticmethod
+    def _current_rss_mb() -> float:
+        try:
+            with open('/proc/self/status', 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        kb = float(line.split()[1])
+                        return round(kb / 1024.0, 1)
+        except Exception:
+            pass
+        return 0.0
+
     """Trend 报告组装与推送（手动 /trend 与定时推送共用）"""
 
     MARKET_NAMES = {"CN": "A股", "HK": "港股", "US": "美股", "CF": "期货"}
@@ -189,6 +203,9 @@ class TrendReportService:
             )
 
         try:
+            rss_mb = TrendReportService._current_rss_mb()
+            if rss_mb > float(os.getenv("TREND_LLM_SKIP_RSS_MB", "1500") or 1500):
+                return "主线逻辑：内存保护降级\n资金抱团：以内生价格信号为准\n独立逻辑：暂无明显独立逻辑"
             with ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(simple_prompt, prompt, temperature=0.1)
                 out = future.result(timeout=TrendReportService.LLM_TIMEOUT_SEC)
@@ -261,14 +278,16 @@ class TrendReportService:
 
             lines.append(summaries.get(market, "主线逻辑：暂无\n资金抱团：暂无\n独立逻辑：暂无明显独立逻辑"))
 
-        return "\n".join(lines).strip()
+        out = "\n".join(lines).strip()
+        gc.collect()
+        return out
 
     @staticmethod
     def generate_and_push(days: int):
         report = TrendReportService.build_report(days)
         Notifier.broadcast(report)
         logger.info(f"Trend report pushed for {days} days.")
-    LLM_TIMEOUT_SEC = 300
+    LLM_TIMEOUT_SEC = int(os.getenv("TREND_LLM_TIMEOUT_SEC", "180") or 180)
     @staticmethod
     def _is_fresh_price(market: str, price_date: str) -> bool:
         if not price_date:

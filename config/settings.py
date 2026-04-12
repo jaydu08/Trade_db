@@ -45,6 +45,7 @@ VECTOR_COLLECTIONS: Final[Dict[str, str]] = {
     "company_chunks": "公司画像库 - 多粒度存储公司信息",
     "industry_knowledge": "产业链知识库 - 产业链结构与传导逻辑",
     "market_events": "市场事件库 - 新闻/公告/政策摘要",
+    "market_events_lite": "市场事件轻量库 - 定向新闻/异动摘要",
     "entity_relation": "实体关系库 - 知识图谱事实关系",
 }
 

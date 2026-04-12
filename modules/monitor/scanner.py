@@ -384,7 +384,8 @@ class MonitorService:
             
             # 4. Store Event in Vector DB
             try:
-                collection = get_collection("market_events")
+                collection_name = str(os.getenv("NEWS_EVENT_COLLECTION", "market_events_lite") or "market_events_lite").strip()
+                collection = get_collection(collection_name)
                 
                 # Use content hash as ID
                 doc_id = f"evt_{datetime.date.today()}_{hashlib.md5(analysis_text.encode()).hexdigest()[:8]}"
@@ -412,12 +413,13 @@ class MonitorService:
                     "impact_score": score,
                     "source": "monitor_scan",
                     "related_symbols": symbol,
+                    "headline": cleaned_reason[:120] if "cleaned_reason" in locals() else "",
                     "doc_version": 1,
                     "created_at": str(datetime.datetime.utcnow())
                 }
                 
                 # Use full analysis_text as the vector document
-                doc_text = f"【异动归因】{name}({symbol}) {direction} {pct}%。\n{analysis_text}"
+                doc_text = f"【异动归因】{name}({symbol}) {direction} {pct}%。\n{analysis_text[:1200]}"
                 
                 collection.add(
                     ids=[doc_id],

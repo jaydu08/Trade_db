@@ -5,6 +5,7 @@ Task Scheduler - 核心调度系统
 import logging
 import time
 import os
+import gc
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -231,21 +232,36 @@ class TaskScheduler:
 
         logger.info(f"Registered {len(self.scheduler.get_jobs())} jobs.")
 
+    @staticmethod
+    def _current_rss_mb() -> float:
+        try:
+            with open('/proc/self/status', 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        return round(float(line.split()[1]) / 1024.0, 1)
+        except Exception:
+            pass
+        return 0.0
+
     def _run_job(self, job_id: str, func, *args, **kwargs):
         """统一任务执行包装：记录耗时、结果与异常。"""
         started = time.perf_counter()
-        logger.info("Job started: %s", job_id)
+        rss_before = self._current_rss_mb()
+        logger.info("Job started: %s | rss_mb=%s", job_id, rss_before)
         try:
             result = func(*args, **kwargs)
             duration_ms = int((time.perf_counter() - started) * 1000)
+            rss_after = self._current_rss_mb()
             if isinstance(result, dict):
-                logger.info("Job finished: %s | duration_ms=%s | result=%s", job_id, duration_ms, result)
+                logger.info("Job finished: %s | duration_ms=%s | rss_mb=%s | delta_mb=%.1f | result=%s", job_id, duration_ms, rss_after, rss_after-rss_before, result)
             else:
-                logger.info("Job finished: %s | duration_ms=%s", job_id, duration_ms)
+                logger.info("Job finished: %s | duration_ms=%s | rss_mb=%s | delta_mb=%.1f", job_id, duration_ms, rss_after, rss_after-rss_before)
+            gc.collect()
             return result
         except Exception as e:
             duration_ms = int((time.perf_counter() - started) * 1000)
-            logger.error("Job failed: %s | duration_ms=%s | error=%s", job_id, duration_ms, e, exc_info=True)
+            logger.error("Job failed: %s | duration_ms=%s | rss_mb=%s | error=%s", job_id, duration_ms, self._current_rss_mb(), e, exc_info=True)
+            gc.collect()
             return None
 
     def _job_sync_news(self):
