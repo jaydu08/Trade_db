@@ -9,13 +9,16 @@ from typing import Dict, List
 from modules.ingestion.market_cap import (
     get_cn_market_metrics,
     get_cn_fund_flow,
+    get_hk_market_metrics,
     format_mv_cn,
     format_flow_cn,
+    format_mv_hk,
 )
 
 from core.llm import simple_prompt
 from modules.monitor.notifier import Notifier
 from modules.monitor.trend_service import TrendCalculator
+from modules.monitor.industry_intel import enrich_industry_labels
 
 logger = logging.getLogger(__name__)
 
@@ -44,12 +47,21 @@ class TrendReportService:
         symbol = s.get("symbol", "")
         news_cnt = int(s.get("news_count", 0) or 0)
         news_text = f" 📰{news_cnt}条/3d" if news_cnt > 0 else ""
+        ind = str(s.get("industry_label", "") or "").strip()
+        industry_text = f" 行业:{ind}" if ind else ""
 
         if market == "US":
             display_symbol = str(symbol).split(".")[-1].strip() if symbol else symbol
             cap_100m = float(s.get("market_cap_100m_usd", 0) or 0)
             cap_text = f" 市值:{cap_100m:.1f}亿美元" if cap_100m > 0 else ""
-            return f"{i}. ({display_symbol}) 现价:{price} {ret:+.2f}%{cap_text}{news_text}"
+            return f"{i}. ({display_symbol}) 现价:{price} {ret:+.2f}%{cap_text}{industry_text}{news_text}"
+
+        if market == "HK":
+            cap_hkd = float(s.get("market_cap_100m_hkd", 0) or 0)
+            cap_usd = float(s.get("market_cap_100m_usd", 0) or 0)
+            mv_txt = format_mv_hk(cap_hkd, cap_usd)
+            cap_text = f" {mv_txt}" if mv_txt else ""
+            return f"{i}. {s.get('name','')}({symbol}) 现价:{price} {ret:+.2f}%{cap_text}{industry_text}{news_text}"
 
         if market == "CN":
             total_mv = float(s.get("total_mv_100m", 0) or 0)
@@ -59,9 +71,9 @@ class TrendReportService:
             flow_txt = format_flow_cn(main_inflow)
             cap_text = f" {mv_txt}" if mv_txt else ""
             flow_text = f" {flow_txt}" if flow_txt else ""
-            return f"{i}. {s.get('name','')}({symbol}) 现价:{price} {ret:+.2f}%{cap_text}{flow_text}{news_text}"
+            return f"{i}. {s.get('name','')}({symbol}) 现价:{price} {ret:+.2f}%{cap_text}{flow_text}{industry_text}{news_text}"
 
-        return f"{i}. {s.get('name','')}({symbol}) 现价:{price} {ret:+.2f}%{news_text}"
+        return f"{i}. {s.get('name','')}({symbol}) 现价:{price} {ret:+.2f}%{industry_text}{news_text}"
 
     @staticmethod
     def _refresh_market_prices(market: str, stks: List[dict]) -> None:
@@ -112,7 +124,7 @@ class TrendReportService:
 
     @staticmethod
     def _enrich_market_caps(market: str, stks: List[dict]) -> None:
-        """补齐趋势推送的市值与资金流信息（当前重点支持 A 股）。"""
+        """补齐趋势推送的市值与资金流信息。"""
         if not stks:
             return
 
@@ -145,6 +157,35 @@ class TrendReportService:
                             main_inflow = float(flow.get("main_net_inflow_100m", 0) or 0)
                             if main_inflow != 0:
                                 stock["main_net_inflow_100m"] = main_inflow
+                    except Exception:
+                        continue
+            return
+
+        if market == "HK":
+            def _fetch_one(s: dict):
+                symbol = str(s.get("symbol", "")).strip()
+                if not symbol:
+                    return None
+                metrics = get_hk_market_metrics(symbol)
+                return s, metrics
+
+            with ThreadPoolExecutor(max_workers=min(8, len(stks))) as executor:
+                future_map = [executor.submit(_fetch_one, s) for s in stks]
+                for future in future_map:
+                    try:
+                        out = future.result(timeout=6)
+                        if not out:
+                            continue
+                        stock, metrics = out
+                        if not metrics:
+                            continue
+
+                        cap_hkd = float(metrics.get("market_cap_100m_hkd", 0) or 0)
+                        cap_usd = float(metrics.get("market_cap_100m_usd", 0) or 0)
+                        if cap_hkd > 0:
+                            stock["market_cap_100m_hkd"] = cap_hkd
+                        if cap_usd > 0:
+                            stock["market_cap_100m_usd"] = cap_usd
                     except Exception:
                         continue
 
@@ -241,6 +282,11 @@ class TrendReportService:
                 picked = TrendReportService._pick_market_items(market, stks)
             # 补齐市值字段（主要用于推送展示）
             TrendReportService._enrich_market_caps(market, picked)
+            # 细分行业标签（主业优先）
+            try:
+                enrich_industry_labels(picked, market)
+            except Exception as e:
+                logger.warning(f"Trend enrich industry failed for {market}: {e}")
 
             # Trend 报告只使用本地收盘价序列，避免实时行情口径波动
             selected_by_market[market] = picked

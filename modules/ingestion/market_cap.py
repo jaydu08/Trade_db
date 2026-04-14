@@ -98,6 +98,30 @@ def _to_date_str_ymd(value: str) -> str:
     return f"{d[:4]}-{d[4:6]}-{d[6:8]}"
 
 
+def _fmt_hk_symbol_candidates(symbol: str) -> list[str]:
+    """生成港股代码候选（兼容 700 / 00700 / 0700.HK）。"""
+    raw = str(symbol or "").strip().upper()
+    out = []
+
+    if raw.endswith(".HK"):
+        out.append(raw)
+        raw = raw.split(".", 1)[0]
+
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if digits:
+        d4 = digits[-4:].zfill(4)
+        d5 = digits[-5:].zfill(5)
+        out.extend([f"{d4}.HK", f"{d5}.HK"])
+
+    seen = set()
+    uniq = []
+    for x in out:
+        if x and x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    return uniq
+
+
 @cached("cn_market_metrics", ttl=300)
 def get_cn_market_metrics(symbol: str) -> Dict[str, float]:
     """从腾讯行情接口获取 A 股市值相关字段。"""
@@ -301,6 +325,59 @@ def _flow_by_rqdata(symbol: str, trade_date: str) -> Dict[str, float]:
         return {}
 
 
+@cached("hk_market_metrics", ttl=600)
+def get_hk_market_metrics(symbol: str) -> Dict[str, float]:
+    """港股市值（优先 Finnhub，失败回退 Yahoo Finance）。"""
+    candidates = _fmt_hk_symbol_candidates(symbol)
+    if not candidates:
+        return {}
+
+    key = os.getenv("FINNHUB_API_KEY", "").strip()
+    if key:
+        for sym in candidates:
+            try:
+                resp = requests.get(
+                    "https://finnhub.io/api/v1/stock/profile2",
+                    params={"symbol": sym, "token": key},
+                    timeout=6,
+                )
+                payload = resp.json() if resp is not None else {}
+                cap_m = _to_float((payload or {}).get("marketCapitalization"))
+                if cap_m <= 0:
+                    continue
+
+                ccy = str((payload or {}).get("currency", "")).strip().upper()
+                out = {
+                    "provider": "finnhub",
+                    "symbol": sym,
+                }
+                if ccy == "USD":
+                    out["market_cap_100m_usd"] = round(cap_m / 100.0, 4)
+                else:
+                    out["market_cap_100m_hkd"] = round(cap_m / 100.0, 4)
+                return out
+            except Exception as e:
+                logger.debug("Finnhub HK market cap failed for %s: %s", sym, e)
+
+    try:
+        from modules.ingestion.yfinance_client import yfinance_client
+
+        for sym in candidates:
+            data = yfinance_client.get_financials(sym)
+            cap = _to_float((data or {}).get("market_cap"))
+            if cap <= 0:
+                continue
+            return {
+                "provider": "yfinance",
+                "symbol": sym,
+                "market_cap_100m_hkd": round(cap / 100000000.0, 4),
+            }
+    except Exception as e:
+        logger.debug("Yahoo HK market cap fallback failed for %s: %s", symbol, e)
+
+    return {}
+
+
 @cached("cn_fund_flow", ttl=600)
 def get_cn_fund_flow(symbol: str, trade_date: Optional[str] = None) -> Dict[str, float]:
     """A 股主力净流入（亿元），多源回退：Tushare -> JoinQuant -> RQData。"""
@@ -330,6 +407,14 @@ def format_mv_cn(total_mv_100m: float, circ_mv_100m: float) -> Optional[str]:
         return f"总市值:{total_mv_100m:.0f}亿"
     if circ_mv_100m > 0:
         return f"流通市值:{circ_mv_100m:.0f}亿"
+    return None
+
+
+def format_mv_hk(market_cap_100m_hkd: float, market_cap_100m_usd: float = 0.0) -> Optional[str]:
+    if market_cap_100m_hkd > 0:
+        return f"市值:{market_cap_100m_hkd:.1f}亿港元"
+    if market_cap_100m_usd > 0:
+        return f"市值:{market_cap_100m_usd:.1f}亿美元"
     return None
 
 

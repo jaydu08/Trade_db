@@ -191,6 +191,9 @@ ak.futures_display_main_sina()（拉取全市场约 80+ 个实物主力合约）
 
 ### 5.3 每日榜单（`DailyRankService`）
 
+补充：每日 19:00 汇总 TXT（`daily_summary`）的股票行已与推送口径对齐，统一输出
+`现价 | 涨幅 | 市值`，并支持 A/H/US 三市场市值展示。
+
 **数据流：**
 ```
 检查 _should_sync_today()（CN/HK跳过周末，US跳过周日/周一北京时间）
@@ -208,7 +211,7 @@ ak.futures_display_main_sina()（拉取全市场约 80+ 个实物主力合约）
 
 ### 5.4 热门榜单（`MarketHeatMap` + 新闻强度重排）
 
-**CN 热榜（当前版本：三因子评分）**
+**CN 热榜（当前版本：五因子评分 + 市场状态切换）**
 - 候选池：`成交额 >= 5000万`，并按板块涨停幅度做归一化涨幅过滤
   - 主板按 10%，创业板/科创板按 20%，北交所按 30%
 - 入池阈值：
@@ -218,16 +221,26 @@ ak.futures_display_main_sina()（拉取全市场约 80+ 个实物主力合约）
 - 换手率因子：
   - 优先使用实时换手率
   - 缺失时用近似换手率回填：`amount / (circ_mv_100m * 1e8) * 100`
-- 最终评分（默认）：
-  - `heat_score = 0.45*rank_pct + 0.30*rank_log_amount + 0.25*rank_turnover`
-  - 三个权重支持环境变量，并在程序内自动归一化
+- 市值因子：
+  - 候选池内按成交额优先抓取总市值（腾讯接口），`log1p` 后做百分位评分
+  - 目标是提高大票趋势线标的权重，而非硬性过滤
+- 趋势延续因子：
+  - 综合近 5/10 日动量 + 近阶段新高特征（来自 `TrendDailyBar`）
+- 最终评分（默认）= 五因子加权：
+  - `rank_pct + rank_log_amount + rank_turnover + rank_mcap + rank_trend`
+  - 震荡市默认：`0.16/0.30/0.20/0.24/0.10`
+  - 趋势市默认：`0.22/0.28/0.20/0.18/0.12`
+  - 程序会基于上涨占比与中位涨幅自动切换权重
   - 可叠加新闻强度重排：`heat_score_v2 = (1-HEATMAP_W_NEWS)*rank(heat_score)+HEATMAP_W_NEWS*news_intensity`
 - 结构性加成：创业板/科创板且涨幅 >10%，默认 `1.10x`
 
 **HK/US 热榜筛选规则**
 - 涨幅 ≥ 5%，成交额过滤仙股
 - 评分 = 涨幅百分位 + 成交额百分位 + 换手率百分位
-- US 额外：去权证、同底层杠杆ETF去重；可用 Finnhub 做市值过滤
+- HK/US 市值补齐：
+  - HK：`Finnhub profile2` 优先，`Yahoo Finance` 兜底，展示 `市值:xx亿港元`
+  - US：`Finnhub profile2`（百万美元口径）
+- US 额外：去权证、同底层杠杆ETF去重；并做市值过滤
 
 ### 5.5 ReAct Agent（`ReactAgent`）
 
@@ -288,7 +301,7 @@ ak.futures_display_main_sina()（拉取全市场约 80+ 个实物主力合约）
 | `SearXNGProvider` | 搜索 | `localhost:8080`（本地部署） |
 | `TavilyProvider` | 搜索 | `TAVILY_API_KEY` 环境变量 |
 | `BochaProvider` | 搜索 | `BOCHA_API_KEY` 环境变量 |
-| `FinnhubProvider` | 行情 | `FINNHUB_TOKEN` 环境变量 |
+| `FinnhubProvider` | 行情 | `FINNHUB_API_KEY` 环境变量 |
 | `AkShareProvider` | 行情 | 免费，内置 |
 | `TushareProvider` | 行情 | `TUSHARE_TOKEN` 环境变量 |
 
@@ -315,7 +328,7 @@ BOCHA_API_KEY=...
 TAVILY_API_KEY=...
 
 # 可选行情补充
-FINNHUB_TOKEN=...
+FINNHUB_API_KEY=...
 TUSHARE_TOKEN=...
 
 # 定向新闻同步（建议）
@@ -334,16 +347,33 @@ HEATMAP_NEWS_LOOKBACK_DAYS=3
 TREND_NEWS_BOOST=0.18
 TREND_NEWS_LOOKBACK_DAYS=7
 
-# A股 Heatmap 三因子参数（可选）
-CN_HEAT_W_PCT=0.45
-CN_HEAT_W_AMOUNT=0.30
-CN_HEAT_W_TURNOVER=0.25
+# A股 Heatmap 五因子参数（可选）
 CN_HEAT_NORM_MIN=0.60
 CN_HEAT_NORM_FALLBACK_MIN=0.50
 CN_HEAT_NEAR_LIMIT_LOW=0.97
 CN_HEAT_NEAR_LIMIT_HIGH=1.03
 CN_HEAT_GEM_BONUS=1.10
 CN_HEAT_TURNOVER_FETCH_CAP=220
+CN_HEAT_MCAP_FETCH_CAP=260
+CN_HEAT_TREND_LOOKBACK_DAYS=20
+
+# A股 Heatmap 市场状态切换阈值（可选）
+CN_HEAT_REGIME_POS_RATIO=0.60
+CN_HEAT_REGIME_MEDIAN_PCT=1.00
+
+# 震荡市权重（pct/amount/turnover/mcap/trend）
+CN_HEAT_W_PCT_RANGE=0.16
+CN_HEAT_W_AMOUNT_RANGE=0.30
+CN_HEAT_W_TURNOVER_RANGE=0.20
+CN_HEAT_W_MCAP_RANGE=0.24
+CN_HEAT_W_TREND_RANGE=0.10
+
+# 趋势市权重（pct/amount/turnover/mcap/trend）
+CN_HEAT_W_PCT_TREND=0.22
+CN_HEAT_W_AMOUNT_TREND=0.28
+CN_HEAT_W_TURNOVER_TREND=0.20
+CN_HEAT_W_MCAP_TREND=0.18
+CN_HEAT_W_TREND_TREND=0.12
 ```
 
 ---

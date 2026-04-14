@@ -12,11 +12,14 @@ from core.llm import simple_prompt
 from core.agent import Tools
 from modules.monitor.notifier import Notifier
 from modules.monitor.news_intel import summarize_symbol_news
+from modules.monitor.industry_intel import enrich_industry_labels
 from modules.ingestion.market_cap import (
     get_cn_market_metrics,
     get_cn_fund_flow,
+    get_hk_market_metrics,
     format_mv_cn,
     format_flow_cn,
+    format_mv_hk,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,13 +47,170 @@ class MarketHeatMap:
         self.heat_w_news = float(os.getenv("HEATMAP_W_NEWS", "0.12"))
         self.heat_news_lookback_days = int(os.getenv("HEATMAP_NEWS_LOOKBACK_DAYS", "3") or 3)
 
-        w_pct = float(os.getenv("CN_HEAT_W_PCT", "0.45"))
-        w_amount = float(os.getenv("CN_HEAT_W_AMOUNT", "0.30"))
-        w_turnover = float(os.getenv("CN_HEAT_W_TURNOVER", "0.25"))
-        w_sum = max(1e-9, w_pct + w_amount + w_turnover)
-        self.cn_w_pct = w_pct / w_sum
-        self.cn_w_amount = w_amount / w_sum
-        self.cn_w_turnover = w_turnover / w_sum
+        self.cn_mcap_fetch_cap = int(os.getenv("CN_HEAT_MCAP_FETCH_CAP", "260"))
+        self.cn_trend_lookback_days = int(os.getenv("CN_HEAT_TREND_LOOKBACK_DAYS", "20"))
+        self.cn_regime_pos_ratio = float(os.getenv("CN_HEAT_REGIME_POS_RATIO", "0.60"))
+        self.cn_regime_median_pct = float(os.getenv("CN_HEAT_REGIME_MEDIAN_PCT", "1.00"))
+
+        # 震荡市：降低涨幅权重、提高大票与成交额权重
+        self.cn_weights_range = self._normalize_weights({
+            "pct": float(os.getenv("CN_HEAT_W_PCT_RANGE", "0.16")),
+            "amount": float(os.getenv("CN_HEAT_W_AMOUNT_RANGE", "0.30")),
+            "turnover": float(os.getenv("CN_HEAT_W_TURNOVER_RANGE", "0.20")),
+            "mcap": float(os.getenv("CN_HEAT_W_MCAP_RANGE", "0.24")),
+            "trend": float(os.getenv("CN_HEAT_W_TREND_RANGE", "0.10")),
+        })
+
+        # 趋势市：仍保留低涨幅权重，但提高趋势延续参与度
+        self.cn_weights_trend = self._normalize_weights({
+            "pct": float(os.getenv("CN_HEAT_W_PCT_TREND", "0.22")),
+            "amount": float(os.getenv("CN_HEAT_W_AMOUNT_TREND", "0.28")),
+            "turnover": float(os.getenv("CN_HEAT_W_TURNOVER_TREND", "0.20")),
+            "mcap": float(os.getenv("CN_HEAT_W_MCAP_TREND", "0.18")),
+            "trend": float(os.getenv("CN_HEAT_W_TREND_TREND", "0.12")),
+        })
+
+    @staticmethod
+    def _normalize_weights(weights: Dict[str, float]) -> Dict[str, float]:
+        clean = {k: max(0.0, float(v or 0.0)) for k, v in weights.items()}
+        s = sum(clean.values())
+        if s <= 1e-9:
+            n = max(1, len(clean))
+            return {k: 1.0 / n for k in clean}
+        return {k: v / s for k, v in clean.items()}
+
+    def _pick_cn_weight_profile(self, all_df: pd.DataFrame) -> Dict[str, float]:
+        """按市场状态切换权重：趋势市 vs 震荡市。"""
+        if all_df is None or all_df.empty:
+            return self.cn_weights_range
+
+        pct = pd.to_numeric(all_df.get("pct_chg", 0), errors="coerce").fillna(0.0)
+        pos_ratio = float((pct > 0).mean()) if len(pct) else 0.0
+        median_pct = float(pct.median()) if len(pct) else 0.0
+
+        if pos_ratio >= self.cn_regime_pos_ratio and median_pct >= self.cn_regime_median_pct:
+            return self.cn_weights_trend
+        return self.cn_weights_range
+
+    def _build_cn_market_cap_factor(self, filtered: pd.DataFrame) -> pd.Series:
+        """构建A股市值因子：总市值越大得分越高（log后百分位）。"""
+        if filtered.empty:
+            return pd.Series(dtype=float)
+
+        work = filtered.copy()
+        out = pd.Series(0.5, index=work.index, dtype=float)
+
+        symbols = []
+        top_idx = work.sort_values(by="amount", ascending=False).head(self.cn_mcap_fetch_cap).index
+        for idx in top_idx:
+            sym = str(work.at[idx, "symbol"]).strip()
+            if sym:
+                symbols.append((idx, sym))
+
+        if not symbols:
+            return out
+
+        def _fetch_one(item):
+            idx, symbol = item
+            metrics = get_cn_market_metrics(symbol)
+            total_mv_100m = float((metrics or {}).get("total_mv_100m", 0) or 0)
+            return idx, max(total_mv_100m, 0.0)
+
+        mcap_vals = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+            futures = [ex.submit(_fetch_one, item) for item in symbols]
+            for f in concurrent.futures.as_completed(futures):
+                try:
+                    idx, mv = f.result()
+                    if mv > 0:
+                        mcap_vals[idx] = mv
+                except Exception:
+                    continue
+
+        if not mcap_vals:
+            return out
+
+        mcap_series = pd.Series(mcap_vals, dtype=float)
+        out.loc[mcap_series.index] = np.log1p(mcap_series).rank(pct=True)
+        return out
+
+    def _build_cn_trend_continuity_factor(self, filtered: pd.DataFrame) -> pd.Series:
+        """构建趋势延续因子：综合5/10日动量 + 近阶段新高特征。"""
+        if filtered.empty:
+            return pd.Series(dtype=float)
+
+        out = pd.Series(0.5, index=filtered.index, dtype=float)
+        symbol_df = filtered.sort_values(by="amount", ascending=False).head(max(200, self.cn_mcap_fetch_cap))
+        symbols = [str(x).strip() for x in symbol_df.get("symbol", []).tolist() if str(x).strip()]
+        if not symbols:
+            return out
+
+        hist_by_symbol = {sym: [] for sym in symbols}
+        start_date = datetime.date.today() - datetime.timedelta(days=max(12, self.cn_trend_lookback_days))
+
+        try:
+            from sqlmodel import select
+            from core.db import db_manager
+            from domain.ledger.analytics import TrendDailyBar
+
+            with db_manager.ledger_session() as session:
+                rows = session.exec(
+                    select(TrendDailyBar).where(
+                        TrendDailyBar.market == "CN",
+                        TrendDailyBar.date >= start_date,
+                        TrendDailyBar.symbol.in_(symbols),
+                    )
+                ).all()
+
+            for r in rows:
+                c = float(getattr(r, "close", 0) or 0)
+                h = float(getattr(r, "high", 0) or 0)
+                if c > 0:
+                    hist_by_symbol.setdefault(r.symbol, []).append((r.date, c, h if h > 0 else c))
+        except Exception:
+            return out
+
+        raw_scores = {}
+        for idx, row in filtered.iterrows():
+            symbol = str(row.get("symbol", "")).strip()
+            curr = float(row.get("price", 0) or 0)
+            hist = sorted(hist_by_symbol.get(symbol, []), key=lambda x: x[0])
+            closes = [x[1] for x in hist if x[1] > 0]
+            highs = [x[2] for x in hist if x[2] > 0]
+
+            if curr <= 0 and closes:
+                curr = closes[-1]
+            if curr <= 0:
+                raw_scores[idx] = 0.0
+                continue
+
+            seq = closes[-20:]
+            if (not seq) or abs(curr - seq[-1]) / max(seq[-1], 1e-9) > 1e-3:
+                seq = seq + [curr]
+
+            ret5 = (seq[-1] / seq[-6] - 1.0) if len(seq) >= 6 and seq[-6] > 0 else 0.0
+            ret10 = (seq[-1] / seq[-11] - 1.0) if len(seq) >= 11 and seq[-11] > 0 else ret5
+
+            recent_high = 0.0
+            if highs:
+                recent_high = max(highs[-20:])
+            if seq:
+                recent_high = max(recent_high, max(seq[-20:]))
+
+            breakout = 1.0 if recent_high > 0 and seq[-1] >= recent_high * 0.995 else 0.0
+            momentum = 0.6 * ret5 + 0.4 * ret10
+            raw_scores[idx] = momentum + 0.08 * breakout
+
+        if not raw_scores:
+            return out
+
+        raw = pd.Series(raw_scores, dtype=float)
+        if raw.nunique(dropna=True) <= 1:
+            out.loc[raw.index] = 0.5
+            return out
+
+        out.loc[raw.index] = raw.rank(pct=True)
+        return out
 
     def _build_cn_turnover_factor(self, filtered: pd.DataFrame) -> pd.Series:
         """
@@ -261,7 +421,7 @@ class MarketHeatMap:
         
         if market == 'CN':
             # ────────────────────────────────────────────────────────────────
-            # A股热榜算法（三因子模式）：
+            # A股热榜算法（五因子模式）：
             # 1) 归一化涨幅（按板块涨停幅度归一）
             # 2) log(成交额) 百分位
             # 3) 换手率百分位（缺失时用市值近似回填）
@@ -314,12 +474,19 @@ class MarketHeatMap:
             rank_pct = normalized_pct.rank(pct=True)
             rank_amount = np.log1p(filtered["amount"]).rank(pct=True)
             rank_turnover = self._build_cn_turnover_factor(filtered)
+            rank_mcap = self._build_cn_market_cap_factor(filtered)
+            rank_trend = self._build_cn_trend_continuity_factor(filtered)
+
+            w = self._pick_cn_weight_profile(renamed_df)
+            regime = "trend" if w == self.cn_weights_trend else "range"
 
             filtered = filtered.copy()
             filtered["heat_score"] = (
-                rank_pct * self.cn_w_pct +
-                rank_amount * self.cn_w_amount +
-                rank_turnover * self.cn_w_turnover
+                rank_pct * w["pct"] +
+                rank_amount * w["amount"] +
+                rank_turnover * w["turnover"] +
+                rank_mcap * w["mcap"] +
+                rank_trend * w["trend"]
             )
 
             # 创业板/科创板 且涨幅 >10% 轻量加成
@@ -337,13 +504,16 @@ class MarketHeatMap:
 
             sorted_df = filtered.sort_values(by="heat_score", ascending=False)
             logger.info(
-                "CN热榜(三因子): 候选=%s 最高涨幅=%.2f%% 最低涨幅=%.2f%% 权重[pct/amount/turnover]=[%.2f/%.2f/%.2f]",
+                "CN热榜(五因子): regime=%s 候选=%s 最高涨幅=%.2f%% 最低涨幅=%.2f%% 权重[pct/amount/turnover/mcap/trend]=[%.2f/%.2f/%.2f/%.2f/%.2f]",
+                regime,
                 len(filtered),
                 filtered["pct_chg"].max(),
                 filtered["pct_chg"].min(),
-                self.cn_w_pct,
-                self.cn_w_amount,
-                self.cn_w_turnover,
+                w["pct"],
+                w["amount"],
+                w["turnover"],
+                w["mcap"],
+                w["trend"],
             )
         else:
             # HK / US：同样改用百分位归一化
@@ -466,56 +636,89 @@ class MarketHeatMap:
         return enriched
 
     def _enrich_market_metrics(self, market: str, stocks: List[Dict]):
-        """为推送标的补齐市值与资金流字段（当前重点支持 A 股）。"""
+        """为推送标的补齐市值与资金流字段。"""
         if not stocks:
             return
 
-        if market != "CN":
+        if market == "CN":
+            trade_date = datetime.date.today().strftime("%Y%m%d")
+
+            def _fetch_one(stock: Dict):
+                symbol = str(stock.get("symbol", "")).strip()
+                if not symbol:
+                    return None
+                metrics = get_cn_market_metrics(symbol)
+                flow = get_cn_fund_flow(symbol, trade_date=trade_date)
+                return stock, metrics, flow
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(stocks))) as ex:
+                futures = [ex.submit(_fetch_one, s) for s in stocks]
+                for f in concurrent.futures.as_completed(futures):
+                    try:
+                        out = f.result()
+                        if not out:
+                            continue
+                        stock, metrics, flow = out
+
+                        if metrics:
+                            total_mv = float(metrics.get("total_mv_100m", 0) or 0)
+                            circ_mv = float(metrics.get("circ_mv_100m", 0) or 0)
+                            turnover = float(metrics.get("turnover_rate", 0) or 0)
+
+                            if total_mv > 0:
+                                stock["total_mv_100m"] = total_mv
+                            if circ_mv > 0:
+                                stock["circ_mv_100m"] = circ_mv
+                            if float(stock.get("turnover", 0) or 0) <= 0 and turnover > 0:
+                                stock["turnover"] = turnover
+
+                        if flow:
+                            main_inflow = float(flow.get("main_net_inflow_100m", 0) or 0)
+                            if main_inflow != 0:
+                                stock["main_net_inflow_100m"] = main_inflow
+                    except Exception:
+                        continue
             return
 
-        trade_date = datetime.date.today().strftime("%Y%m%d")
+        if market == "HK":
+            def _fetch_one(stock: Dict):
+                symbol = str(stock.get("symbol", "")).strip()
+                if not symbol:
+                    return None
+                metrics = get_hk_market_metrics(symbol)
+                return stock, metrics
 
-        def _fetch_one(stock: Dict):
-            symbol = str(stock.get("symbol", "")).strip()
-            if not symbol:
-                return None
-            metrics = get_cn_market_metrics(symbol)
-            flow = get_cn_fund_flow(symbol, trade_date=trade_date)
-            return stock, metrics, flow
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(stocks))) as ex:
+                futures = [ex.submit(_fetch_one, s) for s in stocks]
+                for f in concurrent.futures.as_completed(futures):
+                    try:
+                        out = f.result()
+                        if not out:
+                            continue
+                        stock, metrics = out
+                        if not metrics:
+                            continue
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(stocks))) as ex:
-            futures = [ex.submit(_fetch_one, s) for s in stocks]
-            for f in concurrent.futures.as_completed(futures):
-                try:
-                    out = f.result()
-                    if not out:
+                        cap_hkd = float(metrics.get("market_cap_100m_hkd", 0) or 0)
+                        cap_usd = float(metrics.get("market_cap_100m_usd", 0) or 0)
+                        if cap_hkd > 0:
+                            stock["market_cap_100m_hkd"] = cap_hkd
+                        if cap_usd > 0:
+                            stock["market_cap_100m_usd"] = cap_usd
+                    except Exception:
                         continue
-                    stock, metrics, flow = out
-
-                    if metrics:
-                        total_mv = float(metrics.get("total_mv_100m", 0) or 0)
-                        circ_mv = float(metrics.get("circ_mv_100m", 0) or 0)
-                        turnover = float(metrics.get("turnover_rate", 0) or 0)
-
-                        if total_mv > 0:
-                            stock["total_mv_100m"] = total_mv
-                        if circ_mv > 0:
-                            stock["circ_mv_100m"] = circ_mv
-                        if float(stock.get("turnover", 0) or 0) <= 0 and turnover > 0:
-                            stock["turnover"] = turnover
-
-                    if flow:
-                        main_inflow = float(flow.get("main_net_inflow_100m", 0) or 0)
-                        if main_inflow != 0:
-                            stock["main_net_inflow_100m"] = main_inflow
-                except Exception:
-                    continue
 
     def _format_cap_text(self, stock: Dict, market: str) -> str:
         if market == "CN":
             total_mv = float(stock.get("total_mv_100m", 0) or 0)
             circ_mv = float(stock.get("circ_mv_100m", 0) or 0)
             mv_txt = format_mv_cn(total_mv, circ_mv)
+            return f"  🏦 {mv_txt}" if mv_txt else ""
+
+        if market == "HK":
+            cap_hkd = float(stock.get("market_cap_100m_hkd", 0) or 0)
+            cap_usd = float(stock.get("market_cap_100m_usd", 0) or 0)
+            mv_txt = format_mv_hk(cap_hkd, cap_usd)
             return f"  🏦 {mv_txt}" if mv_txt else ""
 
         if market == "US":
@@ -628,6 +831,12 @@ class MarketHeatMap:
         # 补齐市值字段（用于推送展示）
         self._enrich_market_metrics(market, results)
 
+        # 细分行业标签（主业优先）
+        try:
+            enrich_industry_labels(results, market)
+        except Exception as e:
+            logger.warning(f"Failed to enrich industry labels ({market}): {e}")
+
         # 4. 先把热榜结果直接写入 DailyRank，统一“推送口径=入库口径”
         try:
             self._persist_daily_rank_from_heatmap(market, results)
@@ -689,7 +898,9 @@ class MarketHeatMap:
             flow_text = self._format_flow_text(stock, market)
             news_cnt = int(stock.get("news_count_3d", 0) or 0)
             news_text = f"  📰 {news_cnt}条/3d" if news_cnt > 0 else ""
-            msg_lines.append(f"**{i}. {display}**  💰 现价: {price_str}  `{pct:+.2f}%`{cap_text}{flow_text}{news_text}")
+            ind = str(stock.get("industry_label", "") or "").strip()
+            ind_text = f"  🏭 行业:{ind}" if ind else ""
+            msg_lines.append(f"**{i}. {display}**  💰 现价: {price_str}  `{pct:+.2f}%`{cap_text}{flow_text}{ind_text}{news_text}")
             if self.enable_daily_attribution:
                 reason = stock.get('reason', '')
                 msg_lines.append(f"💡 {reason}\n")

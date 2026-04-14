@@ -14,7 +14,12 @@ from sqlmodel import select, Session
 from core.db import db_manager
 from domain.ledger.analytics import TrendDailyBar
 from modules.monitor.notifier import Notifier
-from modules.ingestion.market_cap import get_cn_market_metrics, format_mv_cn
+from modules.ingestion.market_cap import (
+    get_cn_market_metrics,
+    get_hk_market_metrics,
+    format_mv_cn,
+    format_mv_hk,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,13 +51,14 @@ class DailySummaryService:
         logger.info("生成每日推送汇总: %s", target_date)
 
         cn_mv_cache = {}
+        hk_mv_cache = {}
         us_mv_cache = {}
         finnhub_key = os.getenv("FINNHUB_API_KEY", "").strip()
 
         def _format_market_cap(market: str, symbol: str) -> str:
             symbol = str(symbol or "").strip()
             if not symbol:
-                return "N/A"
+                return "市值:N/A"
 
             if market == "CN":
                 if symbol not in cn_mv_cache:
@@ -61,14 +67,28 @@ class DailySummaryService:
                         total_mv = float((metrics or {}).get("total_mv_100m", 0) or 0)
                         circ_mv = float((metrics or {}).get("circ_mv_100m", 0) or 0)
                         mv_txt = format_mv_cn(total_mv, circ_mv)
-                        cn_mv_cache[symbol] = mv_txt or "N/A"
+                        cn_mv_cache[symbol] = f"市值:{mv_txt}" if mv_txt else "市值:N/A"
                     except Exception:
-                        cn_mv_cache[symbol] = "N/A"
+                        cn_mv_cache[symbol] = "市值:N/A"
                 return cn_mv_cache[symbol]
+
+            if market == "HK":
+                if symbol not in hk_mv_cache:
+                    hk_mv_cache[symbol] = "市值:N/A"
+                    try:
+                        metrics = get_hk_market_metrics(symbol)
+                        cap_hkd = float((metrics or {}).get("market_cap_100m_hkd", 0) or 0)
+                        cap_usd = float((metrics or {}).get("market_cap_100m_usd", 0) or 0)
+                        mv_txt = format_mv_hk(cap_hkd, cap_usd)
+                        if mv_txt:
+                            hk_mv_cache[symbol] = mv_txt
+                    except Exception:
+                        pass
+                return hk_mv_cache[symbol]
 
             if market == "US":
                 if symbol not in us_mv_cache:
-                    us_mv_cache[symbol] = "N/A"
+                    us_mv_cache[symbol] = "市值:N/A"
                     if finnhub_key:
                         try:
                             payload = requests.get(
@@ -78,12 +98,12 @@ class DailySummaryService:
                             ).json()
                             cap_musd = float((payload or {}).get("marketCapitalization", 0) or 0)
                             if cap_musd > 0:
-                                us_mv_cache[symbol] = f"{cap_musd/100.0:.2f}亿美元"
+                                us_mv_cache[symbol] = f"市值:{cap_musd/100.0:.2f}亿美元"
                         except Exception:
                             pass
                 return us_mv_cache[symbol]
 
-            return "N/A"
+            return "市值:N/A"
 
         # 涨幅统一从 open/close 反算
         def _bar_pct(b: TrendDailyBar) -> float:
@@ -174,7 +194,7 @@ class DailySummaryService:
                     f"  {i:>2}. {r.name} ({r.symbol})"
                     f" | 现价: {price_str}"
                     f" | 涨幅: {pct_str}"
-                    f" | 市值: {mv_str}"
+                    f" | {mv_str}"
                 )
             lines.append("")
 
