@@ -2,6 +2,7 @@ import os
 import re
 import time
 import logging
+import requests
 from typing import Dict, List, Tuple
 
 from sqlmodel import select
@@ -102,6 +103,137 @@ def _candidate_symbols(symbol: str, market: str) -> List[str]:
     return out
 
 
+def _finnhub_candidates(symbol: str, market: str) -> List[str]:
+    s = str(symbol or "").strip().upper()
+    if not s:
+        return []
+
+    out: List[str] = []
+    if market == "US":
+        out.append(s.split(".")[-1] if "." in s else s)
+    elif market == "HK":
+        raw = s.split(".", 1)[0] if s.endswith(".HK") else s
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if digits:
+            out.append(f"{digits[-4:].zfill(4)}.HK")
+            out.append(f"{digits[-5:].zfill(5)}.HK")
+    elif market == "CN":
+        raw = s.lower()
+        if raw.startswith(("sh", "sz", "bj")) and len(raw) >= 8:
+            code = raw[2:]
+        else:
+            code = s
+        code = "".join(ch for ch in code if ch.isdigit())
+        if code:
+            if code.startswith(("6", "9")):
+                out.append(f"{code}.SS")
+            else:
+                out.append(f"{code}.SZ")
+
+    uniq = []
+    seen = set()
+    for x in out:
+        if x and x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    return uniq
+
+
+def _hk_profile_candidates(symbol: str) -> List[str]:
+    raw = str(symbol or "").strip().upper()
+    if not raw:
+        return []
+    if raw.endswith(".HK"):
+        raw = raw.split(".", 1)[0]
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if not digits:
+        return []
+    out = [digits[-5:].zfill(5), digits[-4:].zfill(4).zfill(5)]
+    uniq = []
+    seen = set()
+    for x in out:
+        if x and x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    return uniq
+
+
+def _fetch_hk_industry_via_akshare(symbol: str) -> str:
+    try:
+        from modules.ingestion.akshare_client import akshare_client
+    except Exception:
+        return ""
+
+    for code in _hk_profile_candidates(symbol):
+        try:
+            df = akshare_client.get_stock_profile_hk(code)
+            if df is None or getattr(df, "empty", True):
+                continue
+            row = df.iloc[0]
+            for col in ("所属行业", "行业", "industry"):
+                if col in df.columns:
+                    val = row.get(col)
+                    label = _normalize_external_label(val)
+                    if label:
+                        return label
+        except Exception:
+            continue
+    return ""
+
+
+def _normalize_external_label(text: str) -> str:
+    t = str(text or "").strip()
+    if not t:
+        return ""
+    lower = t.lower()
+
+    mapping = [
+        ("半导体", ["semiconductor", "chip", "integrated circuit"]),
+        ("科技", ["technology", "tech"]),
+        ("软件服务", ["software", "saas", "internet software"]),
+        ("互联网平台", ["internet", "interactive media", "online media"]),
+        ("云计算", ["cloud", "data center"]),
+        ("通信设备", ["communication", "telecom", "network"]),
+        ("消费电子", ["consumer electronics", "electronic components"]),
+        ("电动车", ["auto", "automotive", "ev", "electric vehicle"]),
+        ("医疗健康", ["healthcare", "biotech", "pharma", "medical"]),
+        ("金融", ["bank", "insurance", "financial"]),
+        ("能源", ["energy", "oil", "gas", "coal"]),
+    ]
+    for zh, kws in mapping:
+        if any(k in lower for k in kws):
+            return zh
+    return t[:24]
+
+
+def _fetch_external_industry(symbol: str, market: str) -> str:
+    m = str(market or "").upper()
+
+    if m == "HK":
+        hk_label = _fetch_hk_industry_via_akshare(symbol)
+        if hk_label:
+            return hk_label
+
+    key = os.getenv("FINNHUB_API_KEY", "").strip()
+    if not key:
+        return ""
+
+    for sym in _finnhub_candidates(symbol, m):
+        try:
+            resp = requests.get(
+                "https://finnhub.io/api/v1/stock/profile2",
+                params={"symbol": sym, "token": key},
+                timeout=5,
+            )
+            data = resp.json() if resp is not None else {}
+            label = _normalize_external_label((data or {}).get("finnhubIndustry", ""))
+            if label:
+                return label
+        except Exception:
+            continue
+    return ""
+
+
 def _score_rules(text: str, weight: float, scores: Dict[str, float]) -> None:
     t = str(text or "").lower()
     if not t:
@@ -185,7 +317,7 @@ def _pick_best_label(profile_text: str, industries: List[str], concepts: List[st
 
 
 def _cache_key(symbol: str, market: str) -> str:
-    return f"industry_v2:{market}:{symbol}"
+    return f"industry_v5:{market}:{symbol}"
 
 
 def _get_cached(symbol: str, market: str) -> Dict[str, str] | None:
@@ -320,6 +452,11 @@ def resolve_industry_label(symbol: str, market: str) -> Dict[str, str]:
         if label and label != "综合":
             best = {"label": label[:24], "source": source}
             break
+
+    if best.get("label") in {"", "综合"}:
+        ext = _fetch_external_industry(raw_symbol, market)
+        if ext:
+            best = {"label": ext[:24], "source": "external"}
 
     _set_cached(raw_symbol, market, best)
     return best
