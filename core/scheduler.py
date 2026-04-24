@@ -6,6 +6,8 @@ import logging
 import time
 import os
 import gc
+import datetime as dt
+from zoneinfo import ZoneInfo
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -18,6 +20,7 @@ from modules.ingestion.sync_profile import profile_syncer
 from modules.ingestion.sync_relations import relation_syncer
 from modules.analysis.heatmap import heatmap_service
 from modules.monitor.ipo_calendar_service import ipo_calendar_service
+from modules.monitor.us_premarket_scanner_service import us_premarket_scanner_service
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +119,22 @@ class TaskScheduler:
             CronTrigger(day_of_week='tue-sat', hour=8, minute=0),
             id="us_heatmap",
             name="美股热门榜单",
+            replace_existing=True
+        )
+
+        # 5.1 美股盘前猎手（北京时间 20:00/21:00 双触发，函数内按纽约时间08:00守卫）
+        self.scheduler.add_job(
+            self._job_us_premarket_hunter,
+            CronTrigger(day_of_week="mon-fri", hour=20, minute=0),
+            id="us_premarket_hunter_2000",
+            name="美股盘前猎手(20:00)",
+            replace_existing=True
+        )
+        self.scheduler.add_job(
+            self._job_us_premarket_hunter,
+            CronTrigger(day_of_week="mon-fri", hour=21, minute=0),
+            id="us_premarket_hunter_2100",
+            name="美股盘前猎手(21:00)",
             replace_existing=True
         )
         
@@ -283,6 +302,23 @@ class TaskScheduler:
     def _job_us_heatmap(self):
         """Job: 生成美股热门榜单"""
         self._run_job("us_heatmap", heatmap_service.process_and_notify, "US")
+
+
+    @staticmethod
+    def _is_us_premarket_slot() -> bool:
+        """仅在纽约时间工作日08:00触发盘前任务，自动兼容DST。"""
+        try:
+            now_ny = dt.datetime.now(ZoneInfo("America/New_York"))
+            return now_ny.weekday() < 5 and now_ny.hour == 8
+        except Exception:
+            return False
+
+    def _job_us_premarket_hunter(self):
+        """Job: 美股盘前猎手"""
+        if not self._is_us_premarket_slot():
+            logger.info("Skip us_premarket_hunter: not in NY 08:00 slot")
+            return
+        self._run_job("us_premarket_hunter", us_premarket_scanner_service.scan_and_notify)
 
     def _job_monitor_scan(self):
         """Job: 自选股异动扫描"""

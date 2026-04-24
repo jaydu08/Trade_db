@@ -52,6 +52,7 @@ Trade_db/
 │   │   ├── news_intel.py      # 新闻情报层（新闻强度分/兜底归因）
 │   │   ├── repository.py      # watchlist.json 读写（线程安全单例）
 │   │   └── resolver.py        # 股票代码识别（规则匹配+联网搜索）
+│   │   ├── us_premarket_scanner_service.py # 美股盘前猎手（盘前异动扫描推送）
 │   ├── analysis/
 │   │   └── heatmap.py         # 热门榜单生成+LLM归因+Telegram推送
 │   └── probing/
@@ -118,6 +119,7 @@ Trade_db/
 | `cn_heatmap` | 工作日 18:35 | A股热门榜单 → Telegram推送 |
 | `hk_heatmap` | 工作日 18:30 | 港股热门榜单 → Telegram推送 |
 | `us_heatmap` | 周二至周六 08:00 | 美股热门榜单 → Telegram推送 |
+| `us_premarket_hunter` | 工作日 20:00/21:00 | 美股盘前猎手（函数内按纽约08:00守卫，自动兼容DST） |
 | `sync_reports` | 每天 18:00 | 同步行业研报到ChromaDB |
 | `sync_fundamentals` | 每天 02:00 | 全量财务数据+公司画像更新 |
 | `trend_7d` | 每周日 10:00 | 7日趋势简报推送 |
@@ -230,7 +232,7 @@ ak.futures_display_main_sina()（拉取全市场约 80+ 个实物主力合约）
   - `rank_pct + rank_log_amount + rank_turnover + rank_mcap + rank_trend`
   - 震荡市默认：`0.16/0.30/0.20/0.24/0.10`
   - 趋势市默认：`0.22/0.28/0.20/0.18/0.12`
-  - 程序会基于上涨占比与中位涨幅自动切换权重
+  - 程序会基于"上涨占比>=60%"且"全市场成交额>=近7日均量*1.05"自动切换权重
   - 可叠加新闻强度重排：`heat_score_v2 = (1-HEATMAP_W_NEWS)*rank(heat_score)+HEATMAP_W_NEWS*news_intensity`
 - 结构性加成：创业板/科创板且涨幅 >10%，默认 `1.10x`
 
@@ -241,6 +243,18 @@ ak.futures_display_main_sina()（拉取全市场约 80+ 个实物主力合约）
   - HK：`Finnhub profile2` 优先，`Yahoo Finance` 兜底，展示 `市值:xx亿港元`
   - US：`Finnhub profile2`（百万美元口径）
 - US 额外：去权证、同底层杠杆ETF去重；并做市值过滤
+- 美股超大市值提权：>500亿美金 *1.3，>1000亿 *1.6，>3000亿 *2.0
+
+
+### 5.4.1 美股盘前猎手（`USPremarketScannerService`）
+
+- 扫描时点：北京时间 20:00/21:00 双触发，函数内仅在纽约时间工作日 08:00 执行（防重复且自动兼容夏令时）
+- 数据源：Yahoo quote 接口（`preMarketPrice` / `preMarketVolume` / `preMarketChangePercent` / `marketCap`）
+- 入池门槛：
+  - 盘前成交额 `preMarketPrice * preMarketVolume > 500万 USD`
+  - `abs(盘前涨跌幅) > 5%`
+  - `总市值 > 10亿 USD`
+- 输出：按盘前成交额与波动排序，推送 Top 5 至 Telegram
 
 ### 5.5 ReAct Agent（`ReactAgent`）
 

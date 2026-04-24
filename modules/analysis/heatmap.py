@@ -6,6 +6,7 @@ from typing import List, Dict
 
 import pandas as pd
 import numpy as np
+import requests
 
 from modules.ingestion.akshare_client import akshare_client
 from core.llm import simple_prompt
@@ -44,13 +45,19 @@ class MarketHeatMap:
         self.cn_near_limit_high = float(os.getenv("CN_HEAT_NEAR_LIMIT_HIGH", "1.03"))
         self.cn_gem_bonus = float(os.getenv("CN_HEAT_GEM_BONUS", "1.10"))
         self.cn_turnover_fetch_cap = int(os.getenv("CN_HEAT_TURNOVER_FETCH_CAP", "220"))
+        self.cn_hard_amount_min = float(os.getenv("CN_HARD_AMOUNT_MIN", "200000000"))
+        self.cn_hard_total_mv_100m_min = float(os.getenv("CN_HARD_TOTAL_MV_100M_MIN", "50"))
+        self.hk_hard_amount_min = float(os.getenv("HK_HARD_AMOUNT_MIN", "500000000"))
+        self.us_hard_mcap_musd_min = float(os.getenv("US_HARD_MCAP_MUSD_MIN", "1000"))
+        self.fomo_upper_shadow_pct = float(os.getenv("FOMO_UPPER_SHADOW_PCT", "0.03"))
+        self.fomo_penalty_factor = float(os.getenv("FOMO_PENALTY_FACTOR", "0.95"))
         self.heat_w_news = float(os.getenv("HEATMAP_W_NEWS", "0.12"))
         self.heat_news_lookback_days = int(os.getenv("HEATMAP_NEWS_LOOKBACK_DAYS", "3") or 3)
 
         self.cn_mcap_fetch_cap = int(os.getenv("CN_HEAT_MCAP_FETCH_CAP", "260"))
         self.cn_trend_lookback_days = int(os.getenv("CN_HEAT_TREND_LOOKBACK_DAYS", "20"))
         self.cn_regime_pos_ratio = float(os.getenv("CN_HEAT_REGIME_POS_RATIO", "0.60"))
-        self.cn_regime_median_pct = float(os.getenv("CN_HEAT_REGIME_MEDIAN_PCT", "1.00"))
+        self.cn_regime_amount_ratio = float(os.getenv("CN_HEAT_REGIME_AMOUNT_RATIO", "1.05"))
 
         # 震荡市：降低涨幅权重、提高大票与成交额权重
         self.cn_weights_range = self._normalize_weights({
@@ -79,16 +86,61 @@ class MarketHeatMap:
             return {k: 1.0 / n for k in clean}
         return {k: v / s for k, v in clean.items()}
 
+    def _load_cn_market_amount_regime(self) -> Dict[str, float]:
+        """读取A股全市场近7个交易日成交额，用于趋势市量能确认。"""
+        try:
+            from sqlmodel import select
+            from core.db import db_manager
+            from domain.ledger.analytics import TrendDailyBar
+
+            start_date = datetime.date.today() - datetime.timedelta(days=30)
+            amount_by_date: Dict[datetime.date, float] = {}
+
+            with db_manager.ledger_session() as session:
+                rows = session.exec(
+                    select(TrendDailyBar).where(
+                        TrendDailyBar.market == "CN",
+                        TrendDailyBar.date >= start_date,
+                    )
+                ).all()
+
+            for r in rows:
+                d = getattr(r, "date", None)
+                amt = float(getattr(r, "amount", 0) or 0)
+                if d and amt > 0:
+                    amount_by_date[d] = amount_by_date.get(d, 0.0) + amt
+
+            if not amount_by_date:
+                return {"today": 0.0, "avg7": 0.0}
+
+            ordered = sorted(amount_by_date.items(), key=lambda x: x[0])
+            vals = [float(v or 0.0) for _, v in ordered if float(v or 0.0) > 0]
+            if not vals:
+                return {"today": 0.0, "avg7": 0.0}
+
+            today_amount = vals[-1]
+            prev = vals[-8:-1] if len(vals) >= 8 else vals[:-1]
+            avg7 = float(sum(prev) / len(prev)) if prev else 0.0
+            return {"today": today_amount, "avg7": avg7}
+        except Exception:
+            return {"today": 0.0, "avg7": 0.0}
+
     def _pick_cn_weight_profile(self, all_df: pd.DataFrame) -> Dict[str, float]:
-        """按市场状态切换权重：趋势市 vs 震荡市。"""
+        """按市场状态切换权重：趋势市=上涨占比+量能共振；否则震荡/缩量。"""
         if all_df is None or all_df.empty:
             return self.cn_weights_range
 
         pct = pd.to_numeric(all_df.get("pct_chg", 0), errors="coerce").fillna(0.0)
         pos_ratio = float((pct > 0).mean()) if len(pct) else 0.0
-        median_pct = float(pct.median()) if len(pct) else 0.0
 
-        if pos_ratio >= self.cn_regime_pos_ratio and median_pct >= self.cn_regime_median_pct:
+        regime_amount = self._load_cn_market_amount_regime()
+        today_amount = float(regime_amount.get("today", 0) or 0)
+        avg7_amount = float(regime_amount.get("avg7", 0) or 0)
+
+        trend_by_breadth = pos_ratio >= self.cn_regime_pos_ratio
+        trend_by_amount = avg7_amount > 0 and today_amount >= avg7_amount * self.cn_regime_amount_ratio
+
+        if trend_by_breadth and trend_by_amount:
             return self.cn_weights_trend
         return self.cn_weights_range
 
@@ -382,6 +434,178 @@ class MarketHeatMap:
 
         logger.info("DailyRank synced from heatmap: market=%s rows=%s date=%s", market, len(rows), today)
 
+    def _load_recent_avg_amount_map(self, market: str, symbols: List[str], lookback_days: int = 12) -> Dict[str, float]:
+        if not symbols:
+            return {}
+        try:
+            from sqlmodel import select
+            from core.db import db_manager
+            from domain.ledger.analytics import TrendDailyBar
+
+            start_date = datetime.date.today() - datetime.timedelta(days=max(6, int(lookback_days or 12)))
+            with db_manager.ledger_session() as session:
+                rows = session.exec(
+                    select(TrendDailyBar).where(
+                        TrendDailyBar.market == market,
+                        TrendDailyBar.date >= start_date,
+                        TrendDailyBar.symbol.in_(symbols),
+                    )
+                ).all()
+
+            hist = {s: [] for s in symbols}
+            for r in rows:
+                amt = float(getattr(r, "amount", 0) or 0)
+                if amt > 0:
+                    hist.setdefault(str(r.symbol), []).append(amt)
+
+            out = {}
+            for sym, arr in hist.items():
+                if arr:
+                    out[sym] = float(sum(arr[-5:]) / max(1, len(arr[-5:])))
+            return out
+        except Exception:
+            return {}
+
+    def _apply_fomo_penalty(self, market: str, frame: pd.DataFrame) -> pd.DataFrame:
+        if frame is None or frame.empty:
+            return frame
+
+        work = frame.copy()
+        if "open" not in work.columns:
+            work["open"] = 0.0
+        if "high" not in work.columns:
+            work["high"] = 0.0
+        if "volume" not in work.columns:
+            work["volume"] = 0.0
+
+        work["open"] = pd.to_numeric(work.get("open", 0), errors="coerce").fillna(0.0)
+        work["high"] = pd.to_numeric(work.get("high", 0), errors="coerce").fillna(0.0)
+        work["volume"] = pd.to_numeric(work.get("volume", 0), errors="coerce").fillna(0.0)
+        work["amount"] = pd.to_numeric(work.get("amount", 0), errors="coerce").fillna(0.0)
+        work["price"] = pd.to_numeric(work.get("price", 0), errors="coerce").fillna(0.0)
+
+        symbols = [str(x).strip() for x in work.get("symbol", []).tolist() if str(x).strip()]
+        ma5_map = self._load_recent_avg_amount_map(market, symbols, lookback_days=12)
+
+        fomo_flags = []
+        for _, row in work.iterrows():
+            top = max(float(row.get("open", 0) or 0), float(row.get("price", 0) or 0))
+            high = float(row.get("high", 0) or 0)
+            upper_shadow_pct = ((high - top) / top) if (top > 0 and high > top) else 0.0
+
+            sym = str(row.get("symbol", "") or "").strip()
+            liq_today = float(row.get("volume", 0) or 0)
+            if liq_today <= 0:
+                liq_today = float(row.get("amount", 0) or 0)
+            liq_ma5 = float(ma5_map.get(sym, 0) or 0)
+
+            is_fomo = bool(upper_shadow_pct > self.fomo_upper_shadow_pct and liq_ma5 > 0 and liq_today > liq_ma5)
+            fomo_flags.append(is_fomo)
+
+        work["fomo_flag"] = fomo_flags
+        if "heat_score" in work.columns:
+            work.loc[work["fomo_flag"], "heat_score"] = work.loc[work["fomo_flag"], "heat_score"] * self.fomo_penalty_factor
+        return work
+
+    def _apply_cn_hard_funnel(self, frame: pd.DataFrame, amount_floor: float) -> pd.DataFrame:
+        if frame is None or frame.empty:
+            return pd.DataFrame()
+
+        floor = max(float(amount_floor or 0), float(self.cn_hard_amount_min or 0))
+        work = frame[pd.to_numeric(frame.get("amount", 0), errors="coerce").fillna(0.0) >= floor].copy()
+        if work.empty:
+            return work
+
+        idx_syms = []
+        for idx, row in work.iterrows():
+            sym = str(row.get("symbol", "")).strip()
+            if sym:
+                idx_syms.append((idx, sym))
+
+        if not idx_syms:
+            return pd.DataFrame()
+
+        total_mv_map = {}
+
+        def _fetch_one(item):
+            idx, sym = item
+            m = get_cn_market_metrics(sym)
+            return idx, float((m or {}).get("total_mv_100m", 0) or 0)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(idx_syms))) as ex:
+            futures = [ex.submit(_fetch_one, it) for it in idx_syms]
+            for f in concurrent.futures.as_completed(futures):
+                try:
+                    idx, mv = f.result()
+                    if mv > 0:
+                        total_mv_map[idx] = mv
+                except Exception:
+                    continue
+
+        if not total_mv_map:
+            return pd.DataFrame()
+
+        work["total_mv_100m"] = work.index.to_series().map(total_mv_map).fillna(0.0)
+        work = work[work["total_mv_100m"] >= float(self.cn_hard_total_mv_100m_min or 0)].copy()
+        return work
+
+    def _apply_hk_hard_funnel(self, frame: pd.DataFrame) -> pd.DataFrame:
+        if frame is None or frame.empty:
+            return pd.DataFrame()
+        return frame[pd.to_numeric(frame.get("amount", 0), errors="coerce").fillna(0.0) >= float(self.hk_hard_amount_min or 0)].copy()
+
+    def _apply_us_hard_funnel(self, frame: pd.DataFrame) -> pd.DataFrame:
+        if frame is None or frame.empty:
+            return pd.DataFrame()
+
+        finnhub_key = os.getenv("FINNHUB_API_KEY", "").strip()
+        if not finnhub_key:
+            logger.warning("US hard funnel skipped all: FINNHUB_API_KEY missing")
+            return pd.DataFrame()
+
+        work = frame.copy()
+        idx_syms = []
+        for idx, row in work.iterrows():
+            sym = str(row.get("symbol", "")).split(".")[-1].strip()
+            if sym:
+                idx_syms.append((idx, sym))
+
+        if not idx_syms:
+            return pd.DataFrame()
+
+        cap_map = {}
+
+        def _fetch_cap(item):
+            idx, sym = item
+            try:
+                u = f"https://finnhub.io/api/v1/stock/profile2?symbol={sym}&token={finnhub_key}"
+                r = requests.get(u, timeout=2)
+                data = r.json() if r is not None else {}
+                cap = float((data or {}).get("marketCapitalization", 0) or 0)
+                return idx, cap
+            except Exception:
+                return idx, 0.0
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, len(idx_syms))) as ex:
+            futures = [ex.submit(_fetch_cap, it) for it in idx_syms]
+            for f in concurrent.futures.as_completed(futures):
+                try:
+                    idx, cap = f.result()
+                    if cap > 0:
+                        cap_map[idx] = cap
+                except Exception:
+                    continue
+
+        if not cap_map:
+            return pd.DataFrame()
+
+        work["market_cap_musd"] = work.index.to_series().map(cap_map).fillna(0.0)
+        work = work[work["market_cap_musd"] >= float(self.us_hard_mcap_musd_min or 0)].copy()
+        if work.empty:
+            return work
+        work["market_cap_100m_usd"] = work["market_cap_musd"] / 100.0
+        return work
+
     def _generate_heatmap(self, df: pd.DataFrame, market: str, top_n: int = 10, min_amount: float = 50000000) -> List[Dict]:
         """从行情 DataFrame 中选出榜单"""
         if df.empty:
@@ -394,7 +618,10 @@ class MarketHeatMap:
             "最新价": "price",
             "涨跌幅": "pct_chg",
             "换手率": "turnover",
-            "成交额": "amount"
+            "成交额": "amount",
+            "开盘": "open",
+            "最高": "high",
+            "成交量": "volume"
         }
         
         # 兼容不同市场的字段名差异
@@ -406,20 +633,34 @@ class MarketHeatMap:
                 logger.error(f"Missing column '{col}' in '{market}' data.")
                 return []
                 
-        # 换手率列可能不存在(部分美股)，容错处理
+        # 部分字段可能不存在，容错处理
         if "turnover" not in renamed_df.columns:
             renamed_df["turnover"] = 0.0
+        if "open" not in renamed_df.columns:
+            renamed_df["open"] = 0.0
+        if "high" not in renamed_df.columns:
+            renamed_df["high"] = 0.0
+        if "volume" not in renamed_df.columns:
+            renamed_df["volume"] = 0.0
 
         # 数据清洗: 过滤空值和非数字
         renamed_df = renamed_df.dropna(subset=required_cols)
         renamed_df["pct_chg"] = pd.to_numeric(renamed_df["pct_chg"], errors='coerce').fillna(0)
         renamed_df["amount"] = pd.to_numeric(renamed_df["amount"], errors='coerce').fillna(0)
         renamed_df["turnover"] = pd.to_numeric(renamed_df["turnover"], errors='coerce').fillna(0)
+        renamed_df["open"] = pd.to_numeric(renamed_df["open"], errors='coerce').fillna(0)
+        renamed_df["high"] = pd.to_numeric(renamed_df["high"], errors='coerce').fillna(0)
+        renamed_df["volume"] = pd.to_numeric(renamed_df["volume"], errors='coerce').fillna(0)
 
         # 过滤成交额太小的仙股 (默认 5000 万)
         filtered = renamed_df[renamed_df["amount"] >= min_amount].copy()
         
         if market == 'CN':
+            filtered = self._apply_cn_hard_funnel(renamed_df, min_amount)
+            if filtered.empty:
+                logger.warning("CN hard funnel produced no candidates")
+                return []
+
             # ────────────────────────────────────────────────────────────────
             # A股热榜算法（五因子模式）：
             # 1) 归一化涨幅（按板块涨停幅度归一）
@@ -447,8 +688,7 @@ class MarketHeatMap:
                     self.cn_norm_min,
                     self.cn_norm_fallback_min,
                 )
-                fallback_mask = (renamed_df["amount"] >= min_amount)
-                fallback_df = renamed_df[fallback_mask].copy()
+                fallback_df = filtered.copy()
                 fallback_limits = pd.Series(10.0, index=fallback_df.index)
                 fallback_limits[fallback_df["symbol"].str.startswith(("30", "688"))] = 20.0
                 fallback_limits[fallback_df["symbol"].str.startswith(("8", "4"))] = 30.0
@@ -458,7 +698,6 @@ class MarketHeatMap:
                 limits = fallback_limits.loc[filtered.index]
                 normalized_pct = fallback_norm.loc[filtered.index]
 
-            filtered = filtered[filtered["amount"] >= min_amount].copy()
             limits = limits.loc[filtered.index]
             normalized_pct = normalized_pct.loc[filtered.index]
 
@@ -502,6 +741,7 @@ class MarketHeatMap:
                     bonus_mask.sum(),
                 )
 
+            filtered = self._apply_fomo_penalty("CN", filtered)
             sorted_df = filtered.sort_values(by="heat_score", ascending=False)
             logger.info(
                 "CN热榜(五因子): regime=%s 候选=%s 最高涨幅=%.2f%% 最低涨幅=%.2f%% 权重[pct/amount/turnover/mcap/trend]=[%.2f/%.2f/%.2f/%.2f/%.2f]",
@@ -518,6 +758,11 @@ class MarketHeatMap:
         else:
             # HK / US：同样改用百分位归一化
             filtered = filtered[filtered["pct_chg"] >= 5.0].copy()
+
+            if market == 'HK':
+                filtered = self._apply_hk_hard_funnel(filtered)
+            elif market == 'US':
+                filtered = self._apply_us_hard_funnel(filtered)
 
             if filtered.empty:
                 return []
@@ -536,6 +781,14 @@ class MarketHeatMap:
                 rank_amount * 0.30 +
                 rank_turnover * 0.20
             )
+
+            if market == 'US' and "market_cap_musd" in filtered.columns:
+                mult = np.where(filtered["market_cap_musd"] >= 300000.0, 2.0,
+                                np.where(filtered["market_cap_musd"] >= 100000.0, 1.6,
+                                         np.where(filtered["market_cap_musd"] >= 50000.0, 1.3, 1.0)))
+                filtered["heat_score"] = filtered["heat_score"] * mult
+
+            filtered = self._apply_fomo_penalty(market, filtered)
             sorted_df = filtered.sort_values(by="heat_score", ascending=False)
 
             # 美股特定：去除权证类 + 同底层杠杆ETF去重（留成交额最大的一个）
@@ -567,34 +820,6 @@ class MarketHeatMap:
         # 先取初筛 Top 50（多取一些供下游过滤）
         candidates = sorted_df.head(50).to_dict(orient="records")
         
-        if market == 'US':
-            import os, requests, concurrent.futures
-            finnhub_key = os.getenv("FINNHUB_API_KEY", "")
-            if finnhub_key:
-                def _check_cap(stk):
-                    sym = stk.get('symbol', '').split('.')[-1]
-                    try:
-                        u = f"https://finnhub.io/api/v1/stock/profile2?symbol={sym}&token={finnhub_key}"
-                        r = requests.get(u, timeout=2)
-                        data = r.json()
-                        cap = data.get('marketCapitalization', 0)
-                        # Finnhub 市值单位是百万美元 (Million USD)
-                        if cap >= 100:
-                            enriched = dict(stk)
-                            enriched["market_cap_100m_usd"] = round(float(cap) / 100.0, 2)
-                            return enriched
-                        return None
-                    except Exception as e:
-                        logger.warning(f"Finnhub API error for {sym}: {e}")
-                        return stk # 网络报错时谨慎放行
-                        
-                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
-                    res = list(ex.map(_check_cap, candidates))
-                    
-                valid_stocks = [s for s in res if s is not None]
-                ranked = self._apply_news_intensity_rank(valid_stocks)
-                return ranked[:top_n]
-
         ranked = self._apply_news_intensity_rank(candidates)
         return ranked[:top_n]
 
@@ -900,7 +1125,8 @@ class MarketHeatMap:
             news_text = f"  📰 {news_cnt}条/3d" if news_cnt > 0 else ""
             ind = str(stock.get("industry_label", "") or "").strip()
             ind_text = f"  🏭 行业:{ind}" if ind else ""
-            msg_lines.append(f"**{i}. {display}**  💰 现价: {price_str}  `{pct:+.2f}%`{cap_text}{flow_text}{ind_text}{news_text}")
+            fomo_text = "  ⚠️ [高位派发疑似]" if bool(stock.get("fomo_flag", False)) else ""
+            msg_lines.append(f"**{i}. {display}**  💰 现价: {price_str}  `{pct:+.2f}%`{cap_text}{flow_text}{ind_text}{news_text}{fomo_text}")
             if self.enable_daily_attribution:
                 reason = stock.get('reason', '')
                 msg_lines.append(f"💡 {reason}\n")
