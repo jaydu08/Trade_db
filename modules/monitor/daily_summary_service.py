@@ -6,7 +6,6 @@ Daily Summary Service - 每日推送标的汇总服务
 import logging
 import datetime
 import os
-import requests
 from typing import List, Dict
 
 from sqlmodel import select, Session
@@ -20,6 +19,8 @@ from modules.ingestion.market_cap import (
     format_mv_cn,
     format_mv_hk,
 )
+from modules.ingestion.us_market_cap import get_us_market_metrics
+
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,6 @@ class DailySummaryService:
         cn_mv_cache = {}
         hk_mv_cache = {}
         us_mv_cache = {}
-        finnhub_key = os.getenv("FINNHUB_API_KEY", "").strip()
 
         def _format_market_cap(market: str, symbol: str) -> str:
             symbol = str(symbol or "").strip()
@@ -89,18 +89,13 @@ class DailySummaryService:
             if market == "US":
                 if symbol not in us_mv_cache:
                     us_mv_cache[symbol] = "市值:N/A"
-                    if finnhub_key:
-                        try:
-                            payload = requests.get(
-                                "https://finnhub.io/api/v1/stock/profile2",
-                                params={"symbol": symbol.split(".")[-1], "token": finnhub_key},
-                                timeout=8,
-                            ).json()
-                            cap_musd = float((payload or {}).get("marketCapitalization", 0) or 0)
-                            if cap_musd > 0:
-                                us_mv_cache[symbol] = f"市值:{cap_musd/100.0:.2f}亿美元"
-                        except Exception:
-                            pass
+                    try:
+                        metrics = get_us_market_metrics(symbol)
+                        cap_100m = float((metrics or {}).get("market_cap_100m_usd", 0) or 0)
+                        if cap_100m > 0:
+                            us_mv_cache[symbol] = f"市值:{cap_100m:.2f}亿美元"
+                    except Exception:
+                        pass
                 return us_mv_cache[symbol]
 
             return "市值:N/A"

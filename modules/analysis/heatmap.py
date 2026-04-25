@@ -22,6 +22,8 @@ from modules.ingestion.market_cap import (
     format_flow_cn,
     format_mv_hk,
 )
+from modules.ingestion.us_market_cap import get_us_market_metrics
+
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,7 @@ class MarketHeatMap:
         self.cn_hard_total_mv_100m_min = float(os.getenv("CN_HARD_TOTAL_MV_100M_MIN", "50"))
         self.hk_hard_amount_min = float(os.getenv("HK_HARD_AMOUNT_MIN", "500000000"))
         self.us_hard_mcap_musd_min = float(os.getenv("US_HARD_MCAP_MUSD_MIN", "1000"))
+        self.us_mcap_fetch_cap = int(os.getenv("US_HEAT_MCAP_FETCH_CAP", "160"))
         self.fomo_upper_shadow_pct = float(os.getenv("FOMO_UPPER_SHADOW_PCT", "0.03"))
         self.fomo_penalty_factor = float(os.getenv("FOMO_PENALTY_FACTOR", "0.95"))
         self.heat_w_news = float(os.getenv("HEATMAP_W_NEWS", "0.12"))
@@ -542,11 +545,17 @@ class MarketHeatMap:
                 except Exception:
                     continue
 
-        if not total_mv_map:
-            return pd.DataFrame()
-
+       # 市值获取失败（0）不剔除，仅不参与市值因子加权；
+        # 仅对"成功拿到市值"的标的执行市值硬过滤。
         work["total_mv_100m"] = work.index.to_series().map(total_mv_map).fillna(0.0)
-        work = work[work["total_mv_100m"] >= float(self.cn_hard_total_mv_100m_min or 0)].copy()
+        known_mask = work["total_mv_100m"] > 0
+        floor = float(self.cn_hard_total_mv_100m_min or 0)
+        work = work[(~known_mask) | (work["total_mv_100m"] >= floor)].copy()
+
+        logger.info(
+            "CN hard funnel: candidates=%s known_mv=%s kept=%s floor_100m=%.0f",
+            len(frame), int(known_mask.sum()), len(work), floor,
+        )
         return work
 
     def _apply_hk_hard_funnel(self, frame: pd.DataFrame) -> pd.DataFrame:
@@ -558,52 +567,47 @@ class MarketHeatMap:
         if frame is None or frame.empty:
             return pd.DataFrame()
 
-        finnhub_key = os.getenv("FINNHUB_API_KEY", "").strip()
-        if not finnhub_key:
-            logger.warning("US hard funnel skipped all: FINNHUB_API_KEY missing")
-            return pd.DataFrame()
-
         work = frame.copy()
+        if "amount" in work.columns:
+            work = work.sort_values(by="amount", ascending=False)
+
         idx_syms = []
-        for idx, row in work.iterrows():
+        for idx, row in work.head(max(1, int(self.us_mcap_fetch_cap or 160))).iterrows():
             sym = str(row.get("symbol", "")).split(".")[-1].strip()
             if sym:
                 idx_syms.append((idx, sym))
-
-        if not idx_syms:
-            return pd.DataFrame()
 
         cap_map = {}
 
         def _fetch_cap(item):
             idx, sym = item
-            try:
-                u = f"https://finnhub.io/api/v1/stock/profile2?symbol={sym}&token={finnhub_key}"
-                r = requests.get(u, timeout=2)
-                data = r.json() if r is not None else {}
-                cap = float((data or {}).get("marketCapitalization", 0) or 0)
-                return idx, cap
-            except Exception:
-                return idx, 0.0
+            m = get_us_market_metrics(sym)
+            cap = float((m or {}).get("market_cap_musd", 0) or 0)
+            return idx, cap
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, len(idx_syms))) as ex:
-            futures = [ex.submit(_fetch_cap, it) for it in idx_syms]
-            for f in concurrent.futures.as_completed(futures):
-                try:
-                    idx, cap = f.result()
-                    if cap > 0:
-                        cap_map[idx] = cap
-                except Exception:
-                    continue
+        if idx_syms:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(idx_syms))) as ex:
+                futures = [ex.submit(_fetch_cap, it) for it in idx_syms]
+                for f in concurrent.futures.as_completed(futures):
+                    try:
+                        idx, cap = f.result()
+                        if cap > 0:
+                            cap_map[idx] = cap
+                    except Exception:
+                        continue
 
-        if not cap_map:
-            return pd.DataFrame()
-
+        # 市值获取失败（0）不剔除，仅不给超大市值加权；
+        # 仅对“成功拿到市值”的标的执行市值硬过滤。
         work["market_cap_musd"] = work.index.to_series().map(cap_map).fillna(0.0)
-        work = work[work["market_cap_musd"] >= float(self.us_hard_mcap_musd_min or 0)].copy()
-        if work.empty:
-            return work
+        known_mask = work["market_cap_musd"] > 0
+        floor = float(self.us_hard_mcap_musd_min or 0)
+        work = work[(~known_mask) | (work["market_cap_musd"] >= floor)].copy()
         work["market_cap_100m_usd"] = work["market_cap_musd"] / 100.0
+
+        logger.info(
+            "US hard funnel: candidates=%s known_cap=%s kept=%s floor_musd=%.0f",
+            len(frame), int(known_mask.sum()), len(work), floor,
+        )
         return work
 
     def _generate_heatmap(self, df: pd.DataFrame, market: str, top_n: int = 10, min_amount: float = 50000000) -> List[Dict]:

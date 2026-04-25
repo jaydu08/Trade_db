@@ -14,7 +14,7 @@
     "market": "US",
     "name": "CRCL",
     "added_at": "2026-02-21 00:29:04.923017",
-    "last_alert_at": "2026-04-10 22:38:59.408304",
+    "last_alert_at": "2026-04-22 21:30:56.997856",
     "alert_threshold_pct": 5.0,
     "is_active": true,
     "chat_id": -5201901502
@@ -24,7 +24,7 @@
     "market": "US",
     "name": "NVDA",
     "added_at": "2026-02-26 10:22:30.921820",
-    "last_alert_at": "2026-04-01 00:43:02.784404",
+    "last_alert_at": "2026-04-24 23:35:04.289144",
     "alert_threshold_pct": 5.0,
     "is_active": true,
     "chat_id": -5201901502
@@ -34,7 +34,7 @@
     "market": "HK",
     "name": "智谱",
     "added_at": "2026-02-26 10:23:09.293113",
-    "last_alert_at": "2026-04-09 10:12:41.677620",
+    "last_alert_at": "2026-04-23 10:07:57.021865",
     "alert_threshold_pct": 5.0,
     "is_active": true,
     "chat_id": -5201901502
@@ -54,7 +54,7 @@
     "market": "US",
     "name": "HIMS",
     "added_at": "2026-03-10 23:33:02.459394",
-    "last_alert_at": "2026-04-08 21:30:41.130195",
+    "last_alert_at": "2026-04-24 21:31:04.190493",
     "alert_threshold_pct": 5.0,
     "is_active": true,
     "chat_id": -5201901502

@@ -350,6 +350,7 @@ def get_hk_market_metrics(symbol: str) -> Dict[str, float]:
                 out = {
                     "provider": "finnhub",
                     "symbol": sym,
+                    "finnhub_industry": str((payload or {}).get("finnhubIndustry", "") or ""),
                 }
                 if ccy == "USD":
                     out["market_cap_100m_usd"] = round(cap_m / 100.0, 4)

@@ -14,6 +14,7 @@ from modules.ingestion.market_cap import (
     format_flow_cn,
     format_mv_hk,
 )
+from modules.ingestion.us_market_cap import get_us_market_metrics
 
 from core.llm import simple_prompt
 from modules.monitor.notifier import Notifier
@@ -186,6 +187,30 @@ class TrendReportService:
                             stock["market_cap_100m_hkd"] = cap_hkd
                         if cap_usd > 0:
                             stock["market_cap_100m_usd"] = cap_usd
+                    except Exception:
+                        continue
+
+        if market == "US":
+            def _fetch_one(s: dict):
+                symbol = str(s.get("symbol", "")).strip()
+                if not symbol:
+                    return None
+                metrics = get_us_market_metrics(symbol)
+                return s, metrics
+
+            with ThreadPoolExecutor(max_workers=min(8, len(stks))) as executor:
+                future_map = [executor.submit(_fetch_one, s) for s in stks]
+                for future in future_map:
+                    try:
+                        out = future.result(timeout=6)
+                        if not out:
+                            continue
+                        stock, metrics = out
+                        if not metrics:
+                            continue
+                        cap_100m = float(metrics.get("market_cap_100m_usd", 0) or 0)
+                        if cap_100m > 0:
+                            stock["market_cap_100m_usd"] = cap_100m
                     except Exception:
                         continue
 

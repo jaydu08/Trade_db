@@ -21,7 +21,7 @@
 ```
 Trade_db/
 ├── main.py                    # 系统入口：初始化DB → 启动调度器 → 启动 Telegram Bot
-├── run.sh / stop.sh           # 后台进程管理脚本
+├── run.sh / stop.sh / restart.sh  # 进程管理脚本（自动感知 systemd）
 ├── config/
 │   └── settings.py            # 全局常量（路径、LLM参数、市场常量等）
 ├── core/
@@ -37,12 +37,16 @@ Trade_db/
 │   ├── ingestion/
 │   │   ├── akshare_client.py  # AkShare封装（重试装饰器+DiskCache）
 │   │   ├── data_factory.py    # DataManager：并发多源搜索路由（SearXNG/Tavily/Bocha）
+│   │   ├── market_cap.py      # A股/港股市值与资金流（多源回退）
+│   │   ├── us_market_cap.py   # 美股市值（Finnhub → Yahoo Finance → DiskCache）
+│   │   ├── yfinance_client.py # Yahoo Finance 兜底
 │   │   ├── sync_news.py       # 定向新闻同步（trend/heatmap + 自选/持仓）→ ChromaDB
 │   │   ├── sync_reports.py    # 研报同步 → ChromaDB
 │   │   ├── sync_financial.py  # 财务数据同步 → SQLite
 │   │   ├── sync_profile.py    # 公司画像向量化 → ChromaDB
 │   │   ├── sync_relations.py  # 供应链关系提取（LLM）→ ChromaDB
-│   │   └── sync_asset.py      # 股票资产列表同步 → meta.db
+│   │   ├── sync_asset.py      # 股票资产列表同步 → meta.db
+│   │   └── providers/         # 多源行情 Provider（Finnhub / AkShare / Tushare）
 │   ├── monitor/
 │   │   ├── scanner.py         # 个股异动监控（MonitorService）
 │   │   ├── commodity_scanner.py  # 大宗商品异动监控（CommodityScanner）
@@ -52,7 +56,12 @@ Trade_db/
 │   │   ├── news_intel.py      # 新闻情报层（新闻强度分/兜底归因）
 │   │   ├── repository.py      # watchlist.json 读写（线程安全单例）
 │   │   └── resolver.py        # 股票代码识别（规则匹配+联网搜索）
-│   │   ├── us_premarket_scanner_service.py # 美股盘前猎手（盘前异动扫描推送）
+│   │   ├── us_premarket_scanner_service.py # 美股盘前猎手
+│   │   ├── trend_service.py        # Trend 种子池与日线管理
+│   │   ├── trend_report_service.py # Trend 报告组装与推送
+│   │   ├── daily_summary_service.py # 每日标的汇总TXT
+│   │   ├── daily_rank_service.py   # 每日榜单抓取与持久化
+│   │   └── ipo_calendar_service.py # 次日新股预告
 │   ├── analysis/
 │   │   └── heatmap.py         # 热门榜单生成+LLM归因+Telegram推送
 │   └── probing/
@@ -228,6 +237,9 @@ ak.futures_display_main_sina()（拉取全市场约 80+ 个实物主力合约）
   - 目标是提高大票趋势线标的权重，而非硬性过滤
 - 趋势延续因子：
   - 综合近 5/10 日动量 + 近阶段新高特征（来自 `TrendDailyBar`）
+- FOMO 惩罚（高位派发检测）：
+  - 用上影线比率 + 成交额 vs MA5 判断疑似派发
+  - 触发时 heat_score 乘以 `FOMO_PENALTY_FACTOR`（默认 0.95）降权
 - 最终评分（默认）= 五因子加权：
   - `rank_pct + rank_log_amount + rank_turnover + rank_mcap + rank_trend`
   - 震荡市默认：`0.16/0.30/0.20/0.24/0.10`
@@ -239,9 +251,12 @@ ak.futures_display_main_sina()（拉取全市场约 80+ 个实物主力合约）
 **HK/US 热榜筛选规则**
 - 涨幅 ≥ 5%，成交额过滤仙股
 - 评分 = 涨幅百分位 + 成交额百分位 + 换手率百分位
-- HK/US 市值补齐：
-  - HK：`Finnhub profile2` 优先，`Yahoo Finance` 兜底，展示 `市值:xx亿港元`
-  - US：`Finnhub profile2`（百万美元口径）
+- HK 市值补齐：`Finnhub profile2` 优先 → `Yahoo Finance` 兜底，TTL=600s
+- **US 市值多源回退**：
+  - `get_us_market_metrics()`：Finnhub → Yahoo Finance → DiskCache（TTL=1800s）
+  - **市值获取失败不丢票**：未拿到市值的标的保留入榜，仅不给超大市值乘数
+  - 仅对"已知市值 >= 门槛"的标的执行硬过滤
+  - 市值查询量上限：默认取前 160 只候选（可配置 `US_HEAT_MCAP_FETCH_CAP`）
 - US 额外：去权证、同底层杠杆ETF去重；并做市值过滤
 - 美股超大市值提权：>500亿美金 *1.3，>1000亿 *1.6，>3000亿 *2.0
 
@@ -256,6 +271,22 @@ ak.futures_display_main_sina()（拉取全市场约 80+ 个实物主力合约）
   - `总市值 > 10亿 USD`
 - 输出：按盘前成交额与波动排序，推送 Top 5 至 Telegram
 
+### 5.4.2 市值获取多源回退与限流防护
+
+为降低 Finnhub API 免费额度压力，市值相关调用统一做以下优化：
+
+| 调用链路 | 缓存策略 | 回退源 | 说明 |
+|---|---|---|---|
+| `get_us_market_metrics()` | DiskCache TTL=1800s | Finnhub → yfinance | 硬过滤前只查 Top N 候选（默认160） |
+| `get_hk_market_metrics()` | DiskCache TTL=600s | Finnhub → yfinance | 港股市值 |
+| `FinnhubProvider.get_quote()` | DiskCache TTL=120s | — | Trend 报告 US 价格刷新，避免重复调 |
+| `industry_intel` 行业标签 | 复用 `get_*_market_metrics` 缓存 | — | 不再裸调 Finnhub 行业接口 |
+
+**关键容错设计：**
+- 市值拉取失败 **不剔除股票**，仅不给予超大市值乘数
+- 并发线程数从 12 降至 8，降低瞬时请求峰值
+- Finnhub 行业标签通过已有 `profile2` 缓存复用，零额外请求
+
 ### 5.5 ReAct Agent（`ReactAgent`）
 
 手动实现的 ReAct 循环（无需 LangChain），最多6轮工具调用：
@@ -265,7 +296,6 @@ ak.futures_display_main_sina()（拉取全市场约 80+ 个实物主力合约）
 | `SEARCH: 关键词` | `Tools.web_search` | 并发多搜索引擎聚合（SearXNG/Tavily/Bocha） |
 | `QUOTE: 代码或名称` | `Tools.get_quote` | 多源行情（Finnhub → AkShare → Tushare） |
 | `DB: 关键词` | `Tools.database_search` | ChromaDB 公司画像语义搜索 |
-
 
 ### 5.6 模拟交易与复盘（`PaperTradingService` + `PaperTradeReviewer`）
 
@@ -371,6 +401,13 @@ CN_HEAT_TURNOVER_FETCH_CAP=220
 CN_HEAT_MCAP_FETCH_CAP=260
 CN_HEAT_TREND_LOOKBACK_DAYS=20
 
+# FOMO 高位派发惩罚（可选）
+FOMO_UPPER_SHADOW_PCT=0.03     # 上影线阈值
+FOMO_PENALTY_FACTOR=0.95       # 触发后的降权乘数
+
+# US Heatmap 市值查询参数（可选）
+US_HEAT_MCAP_FETCH_CAP=160     # 最多查多少只候选股的市值
+
 # A股 Heatmap 市场状态切换阈值（可选）
 CN_HEAT_REGIME_POS_RATIO=0.60
 CN_HEAT_REGIME_MEDIAN_PCT=1.00
@@ -396,6 +433,8 @@ CN_HEAT_W_TREND_TREND=0.12
 
 > 单实例说明：同一个 Telegram Bot Token 必须只运行一个进程，否则会出现 `409 Conflict`。
 
+脚本会自动检测是否安装了 `trade_db.service`（systemd），优先使用 systemd 管理：
+
 ```bash
 # 1. 安装依赖
 pip install -r requirements.txt
@@ -404,14 +443,18 @@ pip install -r requirements.txt
 cp .env.example .env
 # 编辑 .env 填写 Token
 
-# 3. 后台启动
-sh run.sh
+# 3. 启动
+sh run.sh        # 有 systemd 则 systemctl start；无则 nohup
 
 # 4. 查看实时日志
 tail -f trade_db.log
+# 若使用 systemd：journalctl -u trade_db.service -f
 
-# 5. 停止服务
-sh stop.sh
+# 5. 重启（更新代码后用）
+sh restart.sh    # systemctl restart 或 stop+run
+
+# 6. 停止服务
+sh stop.sh       # systemctl stop 或 kill
 ```
 
 ---

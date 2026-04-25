@@ -9,6 +9,7 @@ from .base import BaseMarketProvider
 
 # Import existing clients
 from modules.ingestion.akshare_client import akshare_client
+from core.cache import cached
 
 logger = logging.getLogger(__name__)
 
@@ -76,18 +77,23 @@ class FinnhubProvider(BaseMarketProvider):
     def get_quote(self, symbol: str, market: str) -> Optional[Dict[str, Any]]:
         if not self.health_check() or market != "US":
             return None
-            
+        norm_symbol = str(symbol or "").split(".")[-1].strip().upper()
+        if not norm_symbol:
+            return None
+        return self._cached_quote(norm_symbol)
+
+    @staticmethod
+    @cached("finnhub_quote", ttl=120)
+    def _cached_quote(norm_symbol: str) -> Optional[Dict[str, Any]]:
+        api_key = os.getenv("FINNHUB_API_KEY", "").strip()
+        if not api_key:
+            return None
         try:
             import requests
-            # 兼容 EastMoney 风格代码: 105.TSEM -> TSEM
-            norm_symbol = str(symbol or "").split(".")[-1].strip().upper()
-            if not norm_symbol:
-                return None
-            url = f"https://finnhub.io/api/v1/quote?symbol={norm_symbol}&token={self.api_key}"
+            url = f"https://finnhub.io/api/v1/quote?symbol={norm_symbol}&token={api_key}"
             resp = requests.get(url, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
-                # c: Current price, d: Change, dp: Percent change
                 if data.get('c') and data.get('c') > 0:
                     return {
                         "symbol": norm_symbol,
@@ -98,5 +104,4 @@ class FinnhubProvider(BaseMarketProvider):
                     }
         except Exception as e:
             logger.error(f"Finnhub quote failed: {e}")
-            
         return None

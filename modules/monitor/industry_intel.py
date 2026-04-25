@@ -214,6 +214,13 @@ def _fetch_external_industry(symbol: str, market: str) -> str:
         if hk_label:
             return hk_label
 
+    # 优先复用已有的缓存市值接口（它们内部已调 Finnhub profile2 并带 DiskCache），
+    # 避免重复裸调 Finnhub 被限流。
+    label = _industry_from_cached_profile(symbol, m)
+    if label:
+        return label
+
+    # 兜底：直接调 Finnhub（仅在缓存市值接口未覆盖时触发）
     key = os.getenv("FINNHUB_API_KEY", "").strip()
     if not key:
         return ""
@@ -231,6 +238,31 @@ def _fetch_external_industry(symbol: str, market: str) -> str:
                 return label
         except Exception:
             continue
+    return ""
+
+
+def _industry_from_cached_profile(symbol: str, market: str) -> str:
+    """从已有的带缓存市值函数中提取 Finnhub 行业标签，避免重复 HTTP 请求。"""
+    try:
+        if market == "US":
+            from modules.ingestion.us_market_cap import get_us_market_metrics
+            metrics = get_us_market_metrics(symbol)
+            provider = str((metrics or {}).get("provider", ""))
+            # get_us_market_metrics 内部调的就是 Finnhub profile2，
+            # 但当前仅返回市值字段。若为 finnhub 提供者，说明 profile2 已调过且成功，
+            # 需在 profile2 返回中抽取 industry。这里无法获取 industry 字段，
+            # 因此改为在 us_market_cap 中一并缓存 industry 字段（见下方修改）。
+            industry = str((metrics or {}).get("finnhub_industry", "")).strip()
+            if industry:
+                return _normalize_external_label(industry)
+        elif market == "HK":
+            from modules.ingestion.market_cap import get_hk_market_metrics
+            metrics = get_hk_market_metrics(symbol)
+            industry = str((metrics or {}).get("finnhub_industry", "")).strip()
+            if industry:
+                return _normalize_external_label(industry)
+    except Exception:
+        pass
     return ""
 
 

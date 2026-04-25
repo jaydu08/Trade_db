@@ -142,23 +142,33 @@ class AkShareClient:
                         if not sym: continue
                         
                         price, pct_chg, amount, turnover = 0.0, 0.0, 0.0, 0.0
+                        open_price, high_price, volume = 0.0, 0.0, 0.0
                         
                         if market == "CN":
                             if len(parts) < 32: continue
-                            prev = float(parts[2])
-                            price = float(parts[3])
-                            amount = float(parts[9])
+                            open_price = float(parts[1] or 0)
+                            prev = float(parts[2] or 0)
+                            price = float(parts[3] or 0)
+                            high_price = float(parts[4] or 0)
+                            volume = float(parts[8] or 0)
+                            amount = float(parts[9] or 0)
                             if prev > 0: pct_chg = round((price - prev) / prev * 100, 2)
                         elif market == "HK":
                             if len(parts) < 12: continue
-                            price = float(parts[6])
-                            pct_chg = float(parts[8])
-                            amount = float(parts[11])
+                            open_price = float(parts[2] or 0) if len(parts) > 2 else 0.0
+                            high_price = float(parts[4] or 0) if len(parts) > 4 else 0.0
+                            price = float(parts[6] or 0)
+                            pct_chg = float(parts[8] or 0)
+                            amount = float(parts[11] or 0)
+                            volume = float(parts[12] or 0) if len(parts) > 12 else 0.0
                         elif market == "US":
                             if len(parts) < 11: continue
-                            price = float(parts[1])
-                            pct_chg = float(parts[2])
-                            amount = float(parts[10]) * price
+                            price = float(parts[1] or 0)
+                            pct_chg = float(parts[2] or 0)
+                            open_price = float(parts[5] or 0) if len(parts) > 5 else 0.0
+                            high_price = float(parts[6] or 0) if len(parts) > 6 else 0.0
+                            volume = float(parts[10] or 0)
+                            amount = volume * price
                             
                         results.append({
                             "代码": sym,
@@ -166,6 +176,9 @@ class AkShareClient:
                             "最新价": price,
                             "涨跌幅": pct_chg,
                             "成交额": amount,
+                            "成交量": volume,
+                            "开盘": open_price,
+                            "最高": high_price,
                             "换手率": turnover
                         })
                     except: continue
