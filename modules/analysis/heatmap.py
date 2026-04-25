@@ -54,7 +54,7 @@ class MarketHeatMap:
         self.us_mcap_fetch_cap = int(os.getenv("US_HEAT_MCAP_FETCH_CAP", "160"))
         self.fomo_upper_shadow_pct = float(os.getenv("FOMO_UPPER_SHADOW_PCT", "0.03"))
         self.fomo_penalty_factor = float(os.getenv("FOMO_PENALTY_FACTOR", "0.95"))
-        self.heat_w_news = float(os.getenv("HEATMAP_W_NEWS", "0.12"))
+        self.heat_w_news = float(os.getenv("HEATMAP_W_NEWS", "0.03"))
         self.heat_news_lookback_days = int(os.getenv("HEATMAP_NEWS_LOOKBACK_DAYS", "3") or 3)
 
         self.cn_mcap_fetch_cap = int(os.getenv("CN_HEAT_MCAP_FETCH_CAP", "260"))
@@ -64,19 +64,19 @@ class MarketHeatMap:
 
         # 震荡市：降低涨幅权重、提高大票与成交额权重
         self.cn_weights_range = self._normalize_weights({
-            "pct": float(os.getenv("CN_HEAT_W_PCT_RANGE", "0.16")),
-            "amount": float(os.getenv("CN_HEAT_W_AMOUNT_RANGE", "0.30")),
+            "pct": float(os.getenv("CN_HEAT_W_PCT_RANGE", "0.14")),
+            "amount": float(os.getenv("CN_HEAT_W_AMOUNT_RANGE", "0.26")),
             "turnover": float(os.getenv("CN_HEAT_W_TURNOVER_RANGE", "0.20")),
-            "mcap": float(os.getenv("CN_HEAT_W_MCAP_RANGE", "0.24")),
+            "mcap": float(os.getenv("CN_HEAT_W_MCAP_RANGE", "0.30")),
             "trend": float(os.getenv("CN_HEAT_W_TREND_RANGE", "0.10")),
         })
 
-        # 趋势市：仍保留低涨幅权重，但提高趋势延续参与度
+        # 趋势市：大市值权重显著提升，成交/换手适度降权，保留趋势延续参与度
         self.cn_weights_trend = self._normalize_weights({
-            "pct": float(os.getenv("CN_HEAT_W_PCT_TREND", "0.22")),
-            "amount": float(os.getenv("CN_HEAT_W_AMOUNT_TREND", "0.28")),
-            "turnover": float(os.getenv("CN_HEAT_W_TURNOVER_TREND", "0.20")),
-            "mcap": float(os.getenv("CN_HEAT_W_MCAP_TREND", "0.18")),
+            "pct": float(os.getenv("CN_HEAT_W_PCT_TREND", "0.18")),
+            "amount": float(os.getenv("CN_HEAT_W_AMOUNT_TREND", "0.22")),
+            "turnover": float(os.getenv("CN_HEAT_W_TURNOVER_TREND", "0.18")),
+            "mcap": float(os.getenv("CN_HEAT_W_MCAP_TREND", "0.30")),
             "trend": float(os.getenv("CN_HEAT_W_TREND_TREND", "0.12")),
         })
 

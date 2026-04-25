@@ -216,11 +216,11 @@ class TrendReportService:
 
     @staticmethod
     def _pick_market_items(market: str, stks: List[dict]) -> List[dict]:
-        # 港股只推前5
+        # 港股推前7
         if market == "HK":
-            return stks[:5]
-        # 其他市场做精简
-        return stks[:8]
+            return stks[:7]
+        # CN/US 推前10
+        return stks[:10]
 
     @staticmethod
     def _pick_cf_items(stks: List[dict], min_n: int = 3, max_n: int = 5) -> List[dict]:

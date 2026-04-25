@@ -11,6 +11,8 @@ from typing import List, Dict, Tuple, Optional
 from core.db import get_ledger_session
 from domain.ledger.analytics import TrendSeedPool, DailyRank, TrendDailyBar
 from modules.monitor.news_intel import summarize_symbol_news
+from modules.ingestion.market_cap import get_cn_market_metrics
+from modules.ingestion.us_market_cap import get_us_market_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -902,7 +904,7 @@ class TrendCalculator:
                 )
                 reduced.extend(arr[: TrendService.TREND_MAX_SYMBOLS_PER_MARKET])
             items = reduced
-        news_boost = float(os.getenv("TREND_NEWS_BOOST", "0.18") or 0.18)
+        news_boost = float(os.getenv("TREND_NEWS_BOOST", "0.05") or 0.05)
         news_lookback_days = int(os.getenv("TREND_NEWS_LOOKBACK_DAYS", str(max(3, min(days, 10)))) or max(3, min(days, 10)))
 
         # 3. 并发查 N 日涨幅
@@ -930,10 +932,38 @@ class TrendCalculator:
             item["aggregated_reason"] = aggregated_reason
             item["signal_strength"] = signal_strength
 
-            # 趋势总分：价格趋势 * 新鲜信号 * 新闻催化强度
+            # 市值乘数：大市值标的优先（容错：获取失败则 1.0x）
+            market = item.get("market", "")
+            mcap_mult = 1.0
+            try:
+                if market == "CN":
+                    metrics = get_cn_market_metrics(str(item.get("symbol", "")))
+                    total_mv = float((metrics or {}).get("total_mv_100m", 0) or 0)
+                    if total_mv >= 2000:
+                        mcap_mult = 1.5
+                    elif total_mv >= 500:
+                        mcap_mult = 1.3
+                    elif total_mv >= 200:
+                        mcap_mult = 1.15
+                    item["total_mv_100m"] = total_mv
+                elif market == "US":
+                    metrics = get_us_market_metrics(str(item.get("symbol", "")).split(".")[-1].strip())
+                    cap_musd = float((metrics or {}).get("market_cap_musd", 0) or 0)
+                    if cap_musd >= 300000:   # ≥3000亿美元
+                        mcap_mult = 1.5
+                    elif cap_musd >= 100000: # ≥1000亿美元
+                        mcap_mult = 1.3
+                    elif cap_musd >= 15000:  # ≥150亿美元
+                        mcap_mult = 1.15
+                    item["market_cap_musd"] = cap_musd
+            except Exception:
+                mcap_mult = 1.0
+
+            # 趋势总分：价格趋势 * 新鲜信号 * 新闻催化强度 * 市值乘数
             freshness_factor = min(1.25, 0.85 + signal_strength * 0.18)
-            news_factor = min(1.25, 0.90 + news_intensity * news_boost)
-            item["trend_score"] = round(ret * freshness_factor * news_factor, 2)
+            news_factor = min(1.10, 0.95 + news_intensity * news_boost)
+            item["trend_score"] = round(ret * freshness_factor * news_factor * mcap_mult, 2)
+            item["mcap_mult"] = mcap_mult
             return item
             
         calc_workers = int(os.getenv("TREND_CALC_WORKERS", "5") or 5)
