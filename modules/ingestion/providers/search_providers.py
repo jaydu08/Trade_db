@@ -22,9 +22,9 @@ class SearXNGProvider(BaseSearchProvider):
         urls_str = os.getenv("SEARXNG_URLS", "")
         urls = [url.strip() for url in urls_str.split(",") if url.strip()]
         fallback_urls = [
+            "https://search.sapti.me",
             "https://searx.be",
-            "https://searx.tiekoetter.com",
-            "https://priv.au",
+            "https://search.bus-hit.me",
         ]
         if not urls:
             urls = fallback_urls.copy()
@@ -164,6 +164,40 @@ class TavilyProvider(BaseSearchProvider):
             logger.warning("Tavily search failed: %s", e)
 
         return []
+
+
+class DuckDuckGoProvider(BaseSearchProvider):
+    """DuckDuckGo 免费搜索（无需 API Key）"""
+
+    def __init__(self):
+        self.cooldown_until = 0.0
+
+    @property
+    def provider_name(self) -> str:
+        return "DuckDuckGo"
+
+    def health_check(self) -> bool:
+        return True
+
+    def search(self, query: str, limit: int = 5, **kwargs) -> List[Dict[str, Any]]:
+        if time.time() < self.cooldown_until:
+            return []
+        try:
+            from ddgs import DDGS
+            raw = DDGS().text(query, max_results=limit)
+            results = []
+            for item in raw:
+                results.append({
+                    "title": item.get("title", ""),
+                    "snippet": item.get("body", ""),
+                    "url": item.get("href", ""),
+                    "date": "",
+                })
+            return results
+        except Exception as e:
+            self.cooldown_until = time.time() + 120
+            logger.warning("DuckDuckGo search failed: %s", e)
+            return []
 
 
 class BochaProvider(BaseSearchProvider):

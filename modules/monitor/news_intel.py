@@ -5,11 +5,14 @@ import time
 import os
 from typing import Any, Dict, List
 
-from core.db import get_collection
+# ChromaDB 已禁用，不再 import get_collection
+# from core.db import get_collection
 
 logger = logging.getLogger(__name__)
-_COLLECTION_COOLDOWN_UNTIL = 0.0
-EVENT_COLLECTION = str(os.getenv("NEWS_EVENT_COLLECTION", "market_events_lite") or "market_events_lite").strip()
+
+# ---- ChromaDB 全局开关 ----
+# 禁用后所有查询函数直接返空，不触发 HNSW 索引加载
+_CHROMADB_DISABLED = True
 
 
 def _parse_event_date(value: Any) -> dt.date | None:
@@ -76,14 +79,8 @@ def _doc_headline(text: str, limit: int = 64) -> str:
 
 
 def get_symbol_news_events(symbol: str, start_date: dt.date, max_items: int = 24) -> List[Dict[str, Any]]:
-    """从事件库提取标的相关新闻事件（metadata 直查，低内存）。"""
-    global _COLLECTION_COOLDOWN_UNTIL
-    sym = str(symbol or "").strip()
-    if not sym:
-        return []
-
-    if time.time() < float(_COLLECTION_COOLDOWN_UNTIL):
-        return []
+    """ChromaDB 已禁用，直接返空。"""
+    return []
 
     docs: List[Dict[str, Any]] = []
 
@@ -141,10 +138,9 @@ def get_symbol_news_events(symbol: str, start_date: dt.date, max_items: int = 24
     return unique_docs[:max_items]
 
 def summarize_symbol_news(symbol: str, lookback_days: int = 3, max_items: int = 24) -> Dict[str, Any]:
-    """输出标的新闻强度摘要，供 trend/heatmap/复盘复用。"""
-    days = max(1, int(lookback_days or 3))
-    start_date = dt.date.today() - dt.timedelta(days=days)
-    events = get_symbol_news_events(symbol=symbol, start_date=start_date, max_items=max_items)
+    """ChromaDB 已禁用，直接返回零强度。"""
+    return {"total": 0, "targeted": 0, "monitor": 0, "sources": 0,
+            "intensity_score": 0.0, "headline": ""}
 
     if not events:
         return {
@@ -188,11 +184,8 @@ def summarize_symbol_news(symbol: str, lookback_days: int = 3, max_items: int = 
 
 
 def build_fallback_reason(symbol: str, lookback_days: int = 3) -> str:
-    """LLM 不可用时，基于近端事件生成可读兜底归因。"""
-    meta = summarize_symbol_news(symbol, lookback_days=lookback_days, max_items=18)
-    total = int(meta.get("total", 0) or 0)
-    targeted = int(meta.get("targeted", 0) or 0)
-    headline = str(meta.get("headline", "")).strip()
+    """ChromaDB 已禁用，返回默认文案。"""
+    return "暂无新闻催化"
 
     if total <= 0:
         return "未检索到近端有效新闻催化，短线更可能受资金博弈或板块联动影响。"

@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 from core.cache import get_cache, set_cache
 from modules.ingestion.providers.search_providers import (
-    SearXNGProvider, TavilyProvider, BochaProvider, GoogleNewsRSSProvider
+    SearXNGProvider, DuckDuckGoProvider, GoogleNewsRSSProvider
 )
 from modules.ingestion.providers.market_providers import (
     AkShareProvider, TushareProvider, FinnhubProvider
@@ -30,9 +30,8 @@ class DataManager:
         self.search_cache_ttl = int(os.getenv("SEARCH_CACHE_TTL", "300") or 300)
 
         self.search_providers = [
-            TavilyProvider(),
+            DuckDuckGoProvider(),
             SearXNGProvider(),
-            BochaProvider(),
             GoogleNewsRSSProvider(),
         ]
         self.active_search_providers = [p for p in self.search_providers if p.health_check()]

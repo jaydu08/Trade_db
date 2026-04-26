@@ -10,7 +10,8 @@ from typing import List, Dict, Tuple, Optional
 
 from core.db import get_ledger_session
 from domain.ledger.analytics import TrendSeedPool, DailyRank, TrendDailyBar
-from modules.monitor.news_intel import summarize_symbol_news
+# ChromaDB 已禁用，新闻查询跳过
+# from modules.monitor.news_intel import summarize_symbol_news
 from modules.ingestion.market_cap import get_cn_market_metrics
 from modules.ingestion.us_market_cap import get_us_market_metrics
 
@@ -920,14 +921,10 @@ class TrendCalculator:
                 today=dt.date.today(),
             )
 
-            news_meta = summarize_symbol_news(item.get("symbol", ""), lookback_days=news_lookback_days, max_items=18)
-            news_intensity = float(news_meta.get("intensity_score", 0) or 0)
-            news_count = int(news_meta.get("total", 0) or 0)
-            item["news_intensity"] = round(news_intensity, 3)
-            item["news_count"] = news_count
-
-            if (not aggregated_reason or aggregated_reason == "暂无新闻催化") and news_meta.get("headline"):
-                aggregated_reason = str(news_meta.get("headline", "")).strip()
+            # 新闻强度已禁用（ChromaDB 关闭），跳过查询
+            news_intensity = 0.0
+            item["news_intensity"] = 0.0
+            item["news_count"] = 0
 
             item["aggregated_reason"] = aggregated_reason
             item["signal_strength"] = signal_strength

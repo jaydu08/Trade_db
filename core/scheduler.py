@@ -57,25 +57,23 @@ class TaskScheduler:
     def _register_jobs(self):
         """注册所有定时任务"""
         
-        # 1. 实时新闻监控 (每 10 分钟)
-        # 盘中时间: 09:00 - 16:00 (A股) / 全天 (美股/Crypto)
-        # 这里简化为全天运行，或者设置更细致的 Trigger
-        self.scheduler.add_job(
-            self._job_sync_news,
-            IntervalTrigger(minutes=int(os.getenv("NEWS_SYNC_INTERVAL_MINUTES", "120") or 120)),
-            id="sync_news",
-            name="实时新闻监控",
-            replace_existing=True
-        )
+        # 1. 实时新闻监控 —— 已禁用（ChromaDB 关闭，节省内存）
+        # self.scheduler.add_job(
+        #     self._job_sync_news,
+        #     IntervalTrigger(minutes=int(os.getenv("NEWS_SYNC_INTERVAL_MINUTES", "120") or 120)),
+        #     id="sync_news",
+        #     name="实时新闻监控",
+        #     replace_existing=True
+        # )
         
-        # 2. 研报同步 (每天 18:00)
-        self.scheduler.add_job(
-            self._job_sync_reports,
-            CronTrigger(hour=18, minute=0),
-            id="sync_reports",
-            name="研报同步",
-            replace_existing=True
-        )
+        # 2. 研报同步 —— 已禁用（ChromaDB 关闭，节省内存）
+        # self.scheduler.add_job(
+        #     self._job_sync_reports,
+        #     CronTrigger(hour=18, minute=0),
+        #     id="sync_reports",
+        #     name="研报同步",
+        #     replace_existing=True
+        # )
 
         # 3. 异动监控 (每 1 分钟)
         self.scheduler.add_job(

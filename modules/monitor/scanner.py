@@ -382,53 +382,25 @@ class MonitorService:
             # 3. Send single consolidated report
             Notifier.send_telegram(chat_id, analysis_text)
             
-            # 4. Store Event in Vector DB
-            try:
-                collection_name = str(os.getenv("NEWS_EVENT_COLLECTION", "market_events_lite") or "market_events_lite").strip()
-                collection = get_collection(collection_name)
-                
-                # Use content hash as ID
-                doc_id = f"evt_{datetime.date.today()}_{hashlib.md5(analysis_text.encode()).hexdigest()[:8]}"
-                
-                # Determine impact based on direction
-                impact = "positive" if "涨" in direction else "negative"
-                
-                # Confidence score: only available when structured LLM succeeded
-                score = 0.5
-                try:
-                    conf = result.confidence
-                    if "High" in conf or "高" in conf:
-                        score = 0.9
-                    elif "Medium" in conf or "中" in conf:
-                        score = 0.6
-                    elif "Low" in conf or "低" in conf:
-                        score = 0.3
-                except Exception:
-                    pass
-                    
-                meta = {
-                    "event_type": "market",
-                    "event_date": str(datetime.date.today()),
-                    "impact": impact,
-                    "impact_score": score,
-                    "source": "monitor_scan",
-                    "related_symbols": symbol,
-                    "headline": cleaned_reason[:120] if "cleaned_reason" in locals() else "",
-                    "doc_version": 1,
-                    "created_at": str(datetime.datetime.utcnow())
-                }
-                
-                # Use full analysis_text as the vector document
-                doc_text = f"【异动归因】{name}({symbol}) {direction} {pct}%。\n{analysis_text[:1200]}"
-                
-                collection.add(
-                    ids=[doc_id],
-                    documents=[doc_text],
-                    metadatas=[meta]
-                )
-                logger.info(f"Successfully stored market event for {symbol} to vector DB.")
-            except Exception as e:
-                logger.error(f"Failed to store event to vector DB for {symbol}: {e}")
+            # 4. Store Event in Vector DB — 已禁用（ChromaDB 关闭节省内存）
+            # try:
+            #     collection_name = str(os.getenv("NEWS_EVENT_COLLECTION", "market_events_lite") or "market_events_lite").strip()
+            #     collection = get_collection(collection_name)
+            #     doc_id = f"evt_{datetime.date.today()}_{hashlib.md5(analysis_text.encode()).hexdigest()[:8]}"
+            #     impact = "positive" if "涨" in direction else "negative"
+            #     score = 0.5
+            #     try:
+            #         conf = result.confidence
+            #         if "High" in conf or "高" in conf: score = 0.9
+            #         elif "Medium" in conf or "中" in conf: score = 0.6
+            #         elif "Low" in conf or "低" in conf: score = 0.3
+            #     except Exception: pass
+            #     meta = { ... }
+            #     doc_text = f"【异动归因】{name}({symbol}) {direction} {pct}%。\n{analysis_text[:1200]}"
+            #     collection.add(ids=[doc_id], documents=[doc_text], metadatas=[meta])
+            #     logger.info(f"Successfully stored market event for {symbol} to vector DB.")
+            # except Exception as e:
+            #     logger.error(f"Failed to store event to vector DB for {symbol}: {e}")
             
         except Exception as e:
             logger.error(f"Analysis failed for {symbol}: {e}")

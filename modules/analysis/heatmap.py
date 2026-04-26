@@ -49,12 +49,12 @@ class MarketHeatMap:
         self.cn_turnover_fetch_cap = int(os.getenv("CN_HEAT_TURNOVER_FETCH_CAP", "220"))
         self.cn_hard_amount_min = float(os.getenv("CN_HARD_AMOUNT_MIN", "200000000"))
         self.cn_hard_total_mv_100m_min = float(os.getenv("CN_HARD_TOTAL_MV_100M_MIN", "50"))
-        self.hk_hard_amount_min = float(os.getenv("HK_HARD_AMOUNT_MIN", "500000000"))
+        self.hk_hard_amount_min = float(os.getenv("HK_HARD_AMOUNT_MIN", "150000000"))
         self.us_hard_mcap_musd_min = float(os.getenv("US_HARD_MCAP_MUSD_MIN", "1000"))
         self.us_mcap_fetch_cap = int(os.getenv("US_HEAT_MCAP_FETCH_CAP", "160"))
         self.fomo_upper_shadow_pct = float(os.getenv("FOMO_UPPER_SHADOW_PCT", "0.03"))
         self.fomo_penalty_factor = float(os.getenv("FOMO_PENALTY_FACTOR", "0.95"))
-        self.heat_w_news = float(os.getenv("HEATMAP_W_NEWS", "0.03"))
+        self.heat_w_news = float(os.getenv("HEATMAP_W_NEWS", "0"))
         self.heat_news_lookback_days = int(os.getenv("HEATMAP_NEWS_LOOKBACK_DAYS", "3") or 3)
 
         self.cn_mcap_fetch_cap = int(os.getenv("CN_HEAT_MCAP_FETCH_CAP", "260"))
@@ -832,8 +832,18 @@ class MarketHeatMap:
         if not stocks:
             return stocks
 
-        lookback = max(1, int(self.heat_news_lookback_days or 3))
         weight = max(0.0, min(0.5, float(self.heat_w_news or 0)))
+
+        # 新闻权重为 0 时直接用 heat_score 排序，跳过新闻查询
+        if weight <= 0:
+            for stock in stocks:
+                stock["news_strength"] = 0.0
+                stock["news_count_3d"] = 0
+                stock["heat_score_v2"] = float(stock.get("heat_score", 0) or 0)
+            stocks.sort(key=lambda x: (float(x.get("heat_score_v2", 0) or 0), float(x.get("pct_chg", 0) or 0)), reverse=True)
+            return stocks
+
+        lookback = max(1, int(self.heat_news_lookback_days or 3))
 
         def _fetch(stock: Dict):
             symbol = str(stock.get("symbol", "")).strip()

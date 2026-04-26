@@ -257,7 +257,8 @@ class DatabaseManager:
         """初始化所有数据库"""
         self.init_meta_db()
         self.init_ledger_db()
-        self.init_vector_db()
+        # ChromaDB 已禁用：HNSW 索引内存开销过大（~2.5GB），3.6GB 机器上会 OOM
+        # self.init_vector_db()
         logger.info("All databases initialized")
 
     def close(self) -> None:
