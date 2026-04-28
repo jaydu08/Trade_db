@@ -514,6 +514,7 @@ class TrendService:
                             amount=amount,
                             turnover_rate=turnover_rate,
                             source=source,
+                            catalyst_tags=str(item.get("catalyst_tags", "") or ""),
                         )
                         session.add(bar)
 

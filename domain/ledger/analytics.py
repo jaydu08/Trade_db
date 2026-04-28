@@ -71,4 +71,5 @@ class TrendDailyBar(SQLModel, table=True):
     amount: float = Field(default=0.0, description="成交额")
     turnover_rate: float = Field(default=0.0, description="换手率(%)")
     source: str = Field(default="", description="来源: heatmap/commodity/daily_rank")
+    catalyst_tags: str = Field(default="", description="催化剂(马甲)标签")
     updated_at: dt.datetime = Field(default_factory=dt.datetime.utcnow)

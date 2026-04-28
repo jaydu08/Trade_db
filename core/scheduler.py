@@ -344,37 +344,31 @@ class TaskScheduler:
         self._run_job("daily_summary", DailySummaryService.generate_and_save)
 
     def _job_sync_fundamentals(self):
-        """Job: 全市场基本面与分析更新 (深水区任务)"""
+        """Job: 全市场基本面更新 (仅财务数据入 SQLite)"""
         def _execute():
             # 1. 结构化：财务数据入 SQLite
             fin_results = {}
             for market in ["CN", "HK", "US"]:
                 fin_results[market] = financial_syncer.sync_financials(market=market)
-            
-            # 2. 非结构化：画像 Chunking 入 Chroma
-            profile_results = {}
-            for market in ["CN", "HK", "US"]:
-                profile_results[market] = profile_syncer.sync_profiles_batch(market=market, skip_existing=False)
-                
-            # 3. 供应链关系提取：由于 LLM 非常慢，这里演示取 A 股热门或者限制 limit=10
-            # 实际业务中应针对池子进行增量
-            from core.db import db_manager
-            from sqlmodel import select
-            from domain.meta import Asset
-            
-            with db_manager.meta_session() as session:
-                statement = select(Asset.symbol).where(Asset.market == "CN").limit(5)
-                symbols = list(session.exec(statement).all())
-            
-            relation_synced = 0
-            for symbol in symbols:
-                relation_synced += int(relation_syncer.sync_relations_for_symbol(symbol) or 0)
+
+            # 2. 非结构化：画像 Chunking 入 Chroma — ChromaDB 已禁用，跳过
+            # profile_results = {}
+            # for market in ["CN", "HK", "US"]:
+            #     profile_results[market] = profile_syncer.sync_profiles_batch(market=market, skip_existing=False)
+
+            # 3. 供应链关系提取 — 依赖 LLM 且只跑 5 只股票，价值低，跳过
+            # from core.db import db_manager
+            # from sqlmodel import select
+            # from domain.meta import Asset
+            # with db_manager.meta_session() as session:
+            #     statement = select(Asset.symbol).where(Asset.market == "CN").limit(5)
+            #     symbols = list(session.exec(statement).all())
+            # relation_synced = 0
+            # for symbol in symbols:
+            #     relation_synced += int(relation_syncer.sync_relations_for_symbol(symbol) or 0)
 
             return {
                 "financial": fin_results,
-                "profiles": profile_results,
-                "relation_symbols": len(symbols),
-                "relation_synced": relation_synced,
             }
 
         self._run_job("sync_fundamentals", _execute)

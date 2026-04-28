@@ -49,7 +49,7 @@ class MarketHeatMap:
         self.cn_turnover_fetch_cap = int(os.getenv("CN_HEAT_TURNOVER_FETCH_CAP", "220"))
         self.cn_hard_amount_min = float(os.getenv("CN_HARD_AMOUNT_MIN", "200000000"))
         self.cn_hard_total_mv_100m_min = float(os.getenv("CN_HARD_TOTAL_MV_100M_MIN", "50"))
-        self.hk_hard_amount_min = float(os.getenv("HK_HARD_AMOUNT_MIN", "150000000"))
+        self.hk_hard_amount_min = float(os.getenv("HK_HARD_AMOUNT_MIN", "250000000"))
         self.us_hard_mcap_musd_min = float(os.getenv("US_HARD_MCAP_MUSD_MIN", "1000"))
         self.us_mcap_fetch_cap = int(os.getenv("US_HEAT_MCAP_FETCH_CAP", "160"))
         self.fomo_upper_shadow_pct = float(os.getenv("FOMO_UPPER_SHADOW_PCT", "0.03"))
@@ -597,11 +597,19 @@ class MarketHeatMap:
                         continue
 
         # 市值获取失败（0）不剔除，仅不给超大市值加权；
-        # 仅对“成功拿到市值”的标的执行市值硬过滤。
+        # 仅对"成功拿到市值"的标的执行市值硬过滤。
+        # 新增：无市值且名称像杠杆ETF产品的 → 过滤（避免新发杠杆ETF混入）
         work["market_cap_musd"] = work.index.to_series().map(cap_map).fillna(0.0)
         known_mask = work["market_cap_musd"] > 0
         floor = float(self.us_hard_mcap_musd_min or 0)
-        work = work[(~known_mask) | (work["market_cap_musd"] >= floor)].copy()
+        
+        import re as _re
+        is_leveraged = work["name"].astype(str).str.contains(
+            r'(?i)\b(2x|3x|1\.5x|bull|bear|leveraged|inverse)\b|\d[\d.]*[Xx]\s+(?:long|short|bull|bear)',
+            regex=True, na=False
+        )
+        # 保留：有市值>=floor 的 或 无市值但不是杠杆ETF的
+        work = work[(work["market_cap_musd"] >= floor) | (~known_mask & ~is_leveraged)].copy()
         work["market_cap_100m_usd"] = work["market_cap_musd"] / 100.0
 
         logger.info(
@@ -780,11 +788,26 @@ class MarketHeatMap:
             rank_turnover = filtered["turnover"].rank(pct=True) if has_turnover else pd.Series(0.5, index=filtered.index)
 
             filtered = filtered.copy()
-            filtered["heat_score"] = (
-                rank_pct    * 0.50 +
-                rank_amount * 0.30 +
-                rank_turnover * 0.20
-            )
+            if market == 'HK':
+                # 港股: 重成交额→流动性龙头优先 (amount 与市值强相关)
+                filtered["heat_score"] = (
+                    rank_pct      * 0.25 +
+                    rank_amount   * 0.50 +
+                    rank_turnover * 0.25
+                )
+            elif market == 'US':
+                # 美股: pct 45% + amount 35% + turnover 20%，叠加市值乘数双重提权大票
+                filtered["heat_score"] = (
+                    rank_pct      * 0.45 +
+                    rank_amount   * 0.35 +
+                    rank_turnover * 0.20
+                )
+            else:
+                filtered["heat_score"] = (
+                    rank_pct    * 0.50 +
+                    rank_amount * 0.30 +
+                    rank_turnover * 0.20
+                )
 
             if market == 'US' and "market_cap_musd" in filtered.columns:
                 mult = np.where(filtered["market_cap_musd"] >= 300000.0, 2.0,
@@ -795,31 +818,70 @@ class MarketHeatMap:
             filtered = self._apply_fomo_penalty(market, filtered)
             sorted_df = filtered.sort_values(by="heat_score", ascending=False)
 
-            # 美股特定：去除权证类 + 同底层杠杆ETF去重（留成交额最大的一个）
+            # 美股特定：去除权证类 + 底层存在时删除杠杆ETF + 同底层杠杆ETF去重
             if market == 'US':
                 import re as _re
-                def _us_key(row):
-                    name = str(row.get('name', ''))
-                    sym  = str(row.get('symbol', '')).split('.')[-1]
-                    # 权证/Rights → 完全排除（返回 None）
-                    if _re.search(r'(?i)\b(wt|warrant|rights|rts|units?)\b', name):
-                        return None
-                    # 杠杆ETF：提取底层ticker归为同组
-                    m = _re.search(r'\d[\d.]*[Xx]\s+(?:Long\s+|Short\s+)?([A-Z]{2,6})', name)
-                    if m:
-                        return 'LETF_' + m.group(1)
-                    m2 = _re.search(r'(?:T-Rex|Defiance|ProShares|GraniteShares|Direxion)\s+.*?([A-Z]{2,6})(?:\s|$)', name)
-                    if m2:
-                        return 'LETF_' + m2.group(1)
-                    return sym  # 普通股不合并
+
+                _LETF_RE1 = _re.compile(r'\d[\d.]*[Xx]\s+(?:Long\s+|Short\s+)?([A-Z]{2,6})')
+                _LETF_RE2 = _re.compile(r'(?:T-Rex|Defiance|ProShares|GraniteShares|Direxion)\s+.*?([A-Z]{2,6})(?:\s|$)')
+                _LETF_RE3 = _re.compile(r'(?i)\b(2x|3x|1\.5x|bull|bear|leveraged|inverse)\b|\d[\d.]*[Xx]\s+(?:long|short|bull|bear)')
+                _WARRANT_RE = _re.compile(r'(?i)\b(wt|warrant|rights|rts|units?)\b')
+
+                def _extract_letf_underlying(name: str) -> str:
+                    """从杠杆ETF名称提取底层ticker，非杠杆ETF返回空字符串"""
+                    for pat in (_LETF_RE1, _LETF_RE2):
+                        m = pat.search(name)
+                        if m:
+                            return m.group(1)
+                    m3 = _LETF_RE3.search(name)
+                    if m3:
+                        # 尝试从名称中提取大写简称作为底层（守望法）
+                        tokens = _re.findall(r'\b[A-Z]{1,5}\b', name)
+                        for t in tokens:
+                            if t not in ('ETF', 'US', 'USD', 'NYSE', 'NASDAQ'):
+                                return t
+                    return ""
+
+                def _is_warrant(name: str) -> bool:
+                    return bool(_WARRANT_RE.search(name))
 
                 sorted_df = sorted_df.copy()
-                sorted_df['_key'] = sorted_df.apply(_us_key, axis=1)
-                sorted_df = (
-                    sorted_df[sorted_df['_key'].notna()]      # 去除权证
-                    .drop_duplicates(subset=['_key'])          # 杠杆ETF只留成交额最大
-                    .drop(columns=['_key'])
-                )
+
+                # 1) 去除权证
+                sorted_df = sorted_df[~sorted_df['name'].apply(_is_warrant)]
+
+                # 2) 收集所有"非杠杆ETF"的 symbol
+                ordinary_syms: set = set()
+                for _, row in sorted_df.iterrows():
+                    name = str(row.get('name', ''))
+                    sym  = str(row.get('symbol', '')).split('.')[-1]
+                    if not _extract_letf_underlying(name):
+                        ordinary_syms.add(sym)
+
+                # 3) 删除底层在普通股列表中的杠杆ETF
+                keep_mask = []
+                for _, row in sorted_df.iterrows():
+                    name = str(row.get('name', ''))
+                    underlying = _extract_letf_underlying(name)
+                    if underlying and underlying in ordinary_syms:
+                        keep_mask.append(False)   # 删除该杠杆ETF
+                    else:
+                        keep_mask.append(True)
+                sorted_df = sorted_df[pd.Series(keep_mask, index=sorted_df.index)].copy()
+
+                # 4) 同底层杠杆ETF去重（留成交额最大的一个）
+                letf_idx_by_underlying: dict = {}
+                for idx, row in sorted_df.iterrows():
+                    name = str(row.get('name', ''))
+                    underlying = _extract_letf_underlying(name)
+                    if underlying:
+                        letf_idx_by_underlying.setdefault(underlying, []).append(idx)
+                for underlying, indices in letf_idx_by_underlying.items():
+                    if len(indices) > 1:
+                        best_idx = sorted_df.loc[indices, 'amount'].idxmax()
+                        for idx in indices:
+                            if idx != best_idx:
+                                sorted_df = sorted_df.drop(idx)
 
         # 先取初筛 Top 50（多取一些供下游过滤）
         candidates = sorted_df.head(50).to_dict(orient="records")
@@ -1070,11 +1132,30 @@ class MarketHeatMap:
         # 补齐市值字段（用于推送展示）
         self._enrich_market_metrics(market, results)
 
-        # 细分行业标签（主业优先）
+        # 细分行业标签（保留作为催化剂全空时的最终兜底）
         try:
             enrich_industry_labels(results, market)
         except Exception as e:
             logger.warning(f"Failed to enrich industry labels ({market}): {e}")
+
+        # 催化剂(马甲)标签
+        try:
+            from modules.monitor.catalyst_service import resolve_catalysts
+            resolve_catalysts(results, market)
+        except Exception as e:
+            logger.warning(f"Failed to resolve catalysts ({market}): {e}")
+            for s in results:
+                s.setdefault("catalyst_tags", "催化剂解析异常")
+                s.setdefault("catalyst_source", f"error:{e}")
+
+        # 技术形态标签
+        try:
+            from modules.monitor.pattern_tagger import tag_patterns
+            tag_patterns(results, market)
+        except Exception as e:
+            logger.warning(f"Failed to tag patterns ({market}): {e}")
+            for s in results:
+                s.setdefault("pattern_tag", "")
 
         # 4. 先把热榜结果直接写入 DailyRank，统一“推送口径=入库口径”
         try:
@@ -1095,6 +1176,7 @@ class MarketHeatMap:
                     "pct_chg": float(r.get("pct_chg", 0) or 0),
                     "amount": float(r.get("amount", 0) or 0),
                     "turnover_rate": float(r.get("turnover", 0) or 0),
+                    "catalyst_tags": str(r.get("catalyst_tags", "") or ""),
                 }
                 for r in results
             ]
@@ -1135,12 +1217,17 @@ class MarketHeatMap:
             price_str = f"{price:.2f}" if price else "N/A"
             cap_text = self._format_cap_text(stock, market)
             flow_text = self._format_flow_text(stock, market)
-            news_cnt = int(stock.get("news_count_3d", 0) or 0)
-            news_text = f"  📰 {news_cnt}条/3d" if news_cnt > 0 else ""
-            ind = str(stock.get("industry_label", "") or "").strip()
-            ind_text = f"  🏭 行业:{ind}" if ind else ""
             fomo_text = "  ⚠️ [高位派发疑似]" if bool(stock.get("fomo_flag", False)) else ""
-            msg_lines.append(f"**{i}. {display}**  💰 现价: {price_str}  `{pct:+.2f}%`{cap_text}{flow_text}{ind_text}{news_text}{fomo_text}")
+
+            # 催化剂(马甲)
+            catalyst = str(stock.get("catalyst_tags", "") or "").strip()
+            # 催化剂为空时回退到行业标签
+            if not catalyst:
+                ind = str(stock.get("industry_label", "") or "").strip()
+                catalyst = ind if ind else ""
+            catalyst_text = f"  马甲:[{catalyst}]" if catalyst else ""
+
+            msg_lines.append(f"**{i}. {display}**  💰 现价: {price_str}  `{pct:+.2f}%`{cap_text}{flow_text}{catalyst_text}{fomo_text}")
             if self.enable_daily_attribution:
                 reason = stock.get('reason', '')
                 msg_lines.append(f"💡 {reason}\n")

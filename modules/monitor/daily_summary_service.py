@@ -185,11 +185,14 @@ class DailySummaryService:
                 pct = _bar_pct(r)
                 pct_str = f"+{pct:.2f}%" if pct >= 0 else f"{pct:.2f}%"
                 mv_str = _format_market_cap(mkt, r.symbol)
+                catalyst = str(getattr(r, 'catalyst_tags', '') or '').strip()
+                catalyst_str = f" | 马甲:[{catalyst}]" if catalyst else ""
                 lines.append(
                     f"  {i:>2}. {r.name} ({r.symbol})"
                     f" | 现价: {price_str}"
                     f" | 涨幅: {pct_str}"
                     f" | {mv_str}"
+                    f"{catalyst_str}"
                 )
             lines.append("")
 
