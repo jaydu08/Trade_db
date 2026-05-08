@@ -26,6 +26,20 @@ from interface.telegram_bot import create_bot
 from modules.monitor.repository import WatchlistRepository
 
 
+def _start_web_server():
+    """Start FastAPI web server in a daemon thread."""
+    import threading
+    import uvicorn
+    from interface.api import app, WEB_PORT
+
+    def _run():
+        uvicorn.run(app, host="0.0.0.0", port=WEB_PORT, log_level="warning")
+
+    t = threading.Thread(target=_run, daemon=True, name="web-server")
+    t.start()
+    logger.info(f"Web server started on port {WEB_PORT}")
+
+
 
 def _acquire_single_instance_lock():
     """防止重复启动导致定时任务和推送重复执行。"""
@@ -107,6 +121,12 @@ def main():
     
     # 2. Start Scheduler
     task_scheduler.start()
+
+    # 2.5 Start Web Server
+    try:
+        _start_web_server()
+    except Exception as e:
+        logger.warning(f"Web server failed to start: {e}")
     
     # 3. Start Bot (Blocking)
     bot = create_bot()

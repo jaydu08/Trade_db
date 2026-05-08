@@ -53,11 +53,14 @@ class AsyncMarketProber:
                 
             name, price, change, pct_chg = "", 0.0, 0.0, 0.0
             
+            day_low = 0.0
+            
             if market == "CN":
                 if len(parts) < 32: return None
                 name = parts[0]
                 prev_close = float(parts[2])
                 price = float(parts[3])
+                day_low = float(parts[5]) if parts[5] else 0.0
                 if prev_close > 0:
                     change = price - prev_close
                     pct_chg = round((change / prev_close) * 100, 2)
@@ -67,12 +70,14 @@ class AsyncMarketProber:
                 price = float(parts[6])
                 change = float(parts[7])
                 pct_chg = float(parts[8])
+                day_low = float(parts[5]) if parts[5] else 0.0
             elif market == "US":
                 if len(parts) < 6: return None
                 name = parts[0]
                 price = float(parts[1])
                 pct_chg = float(parts[2])
                 change = float(parts[4])
+                day_low = float(parts[5]) if len(parts) > 5 and parts[5] else 0.0
                 
             return {
                 "symbol": original_symbol,
@@ -80,6 +85,7 @@ class AsyncMarketProber:
                 "price": price,
                 "change": change,
                 "pct_chg": pct_chg,
+                "day_low": day_low,
             }
         except Exception as e:
             logger.debug(f"Parsing failed for {original_symbol}: {e}")

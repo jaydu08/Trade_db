@@ -40,3 +40,8 @@ pytz>=2024.1
 ddgs
 pywencai
 beautifulsoup4
+
+# Web Frontend
+fastapi
+uvicorn[standard]
+python-jose[cryptography]
