@@ -7,7 +7,8 @@
     "last_alert_at": "2026-04-30 21:30:40.627914",
     "alert_threshold_pct": 5.0,
     "is_active": true,
-    "chat_id": -5201901502
+    "chat_id": -5201901502,
+    "entry_price": 314.9
   },
   "US:CRCL": {
     "symbol": "CRCL",
@@ -17,7 +18,8 @@
     "last_alert_at": "2026-05-07 00:27:40.553521",
     "alert_threshold_pct": 5.0,
     "is_active": true,
-    "chat_id": -5201901502
+    "chat_id": -5201901502,
+    "entry_price": 63.02
   },
   "US:NVDA": {
     "symbol": "NVDA",
@@ -28,7 +30,8 @@
     "alert_threshold_pct": 5.0,
     "is_active": true,
     "chat_id": -5201901502,
-    "tags": ""
+    "tags": "",
+    "entry_price": 184.89
   },
   "HK:02513": {
     "symbol": "02513",
@@ -38,17 +41,8 @@
     "last_alert_at": "2026-05-04 09:55:40.612248",
     "alert_threshold_pct": 5.0,
     "is_active": true,
-    "chat_id": -5201901502
-  },
-  "CN:600036": {
-    "symbol": "600036",
-    "market": "CN",
-    "name": "招商银行",
-    "added_at": "2026-02-26 10:24:03.956771",
-    "last_alert_at": "2026-03-02 09:30:57.026507",
-    "alert_threshold_pct": 5.0,
-    "is_active": true,
-    "chat_id": -5201901502
+    "chat_id": -5201901502,
+    "entry_price": 556.5
   },
   "US:HIMS": {
     "symbol": "HIMS",
@@ -58,6 +52,29 @@
     "last_alert_at": "2026-04-24 21:31:04.190493",
     "alert_threshold_pct": 5.0,
     "is_active": true,
-    "chat_id": -5201901502
+    "chat_id": -5201901502,
+    "entry_price": 23.47
+  },
+  "HK:01024": {
+    "symbol": "01024",
+    "market": "HK",
+    "name": "快手",
+    "added_at": "2026-05-08 23:54",
+    "last_alert_at": null,
+    "alert_threshold_pct": 5,
+    "is_active": true,
+    "tags": "",
+    "entry_price": 52.95
+  },
+  "US:FLNC": {
+    "symbol": "FLNC",
+    "market": "US",
+    "name": "FLNC",
+    "added_at": "2026-05-09 00:23",
+    "last_alert_at": null,
+    "alert_threshold_pct": 5,
+    "is_active": true,
+    "tags": "",
+    "entry_price": 24.47
   }
 }

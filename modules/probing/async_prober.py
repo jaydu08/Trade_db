@@ -22,7 +22,15 @@ class AsyncMarketProber:
     """
     
     def __init__(self, max_concurrent: int = MAX_CONCURRENT_REQUESTS):
-        self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.max_concurrent = max_concurrent
+        self._semaphore = None
+
+    def _get_semaphore(self) -> asyncio.Semaphore:
+        """Lazily create semaphore bound to current event loop."""
+        loop = asyncio.get_event_loop()
+        if self._semaphore is None or getattr(self._semaphore, '_loop', None) is not loop:
+            self._semaphore = asyncio.Semaphore(self.max_concurrent)
+        return self._semaphore
 
     @staticmethod
     def _format_symbol_for_sina(symbol: str, market: str) -> str:
@@ -52,8 +60,10 @@ class AsyncMarketProber:
                 return None
                 
             name, price, change, pct_chg = "", 0.0, 0.0, 0.0
-            
             day_low = 0.0
+            amount = 0.0  # 成交额
+            turnover_rate = 0.0  # 换手率
+            volume = 0
             
             if market == "CN":
                 if len(parts) < 32: return None
@@ -61,6 +71,8 @@ class AsyncMarketProber:
                 prev_close = float(parts[2])
                 price = float(parts[3])
                 day_low = float(parts[5]) if parts[5] else 0.0
+                amount = float(parts[9]) if parts[9] else 0.0  # 成交额(元)
+                volume = int(float(parts[8])) if parts[8] else 0  # 成交量
                 if prev_close > 0:
                     change = price - prev_close
                     pct_chg = round((change / prev_close) * 100, 2)
@@ -71,13 +83,18 @@ class AsyncMarketProber:
                 change = float(parts[7])
                 pct_chg = float(parts[8])
                 day_low = float(parts[5]) if parts[5] else 0.0
+                amount = float(parts[11]) if parts[11] else 0.0  # 成交额(港元)
+                volume = int(parts[12]) if parts[12] else 0
             elif market == "US":
-                if len(parts) < 6: return None
+                if len(parts) < 10: return None
                 name = parts[0]
                 price = float(parts[1])
                 pct_chg = float(parts[2])
                 change = float(parts[4])
-                day_low = float(parts[5]) if len(parts) > 5 and parts[5] else 0.0
+                day_low = float(parts[5]) if parts[5] else 0.0
+                volume = int(parts[10]) if len(parts) > 10 and parts[10] else 0
+                # US amount = volume * price
+                amount = volume * price if volume and price else 0.0
                 
             return {
                 "symbol": original_symbol,
@@ -86,6 +103,9 @@ class AsyncMarketProber:
                 "change": change,
                 "pct_chg": pct_chg,
                 "day_low": day_low,
+                "amount": amount,
+                "turnover_rate": turnover_rate,
+                "volume": volume,
             }
         except Exception as e:
             logger.debug(f"Parsing failed for {original_symbol}: {e}")
@@ -102,7 +122,7 @@ class AsyncMarketProber:
         sina_symbol = self._format_symbol_for_sina(symbol, market)
         url = f"{SINA_HQ_URL}{sina_symbol}"
         
-        async with self.semaphore:
+        async with self._get_semaphore():
             # 增加少量的随机抖动，防止批量并发请求触发封禁
             await asyncio.sleep(random.uniform(0.1, 0.5))
             

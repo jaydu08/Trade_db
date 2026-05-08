@@ -5,7 +5,8 @@ Port 9800, JWT auth, serves Vue3 SPA static files.
 import os
 import datetime as dt
 import logging
-from typing import Optional, List
+import time
+from typing import Optional, List, Dict
 
 from fastapi import FastAPI, HTTPException, Depends, Query, Request
 from fastapi.staticfiles import StaticFiles
@@ -22,6 +23,9 @@ JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_DAYS = 365
 WEB_USERNAME = os.getenv("WEB_USERNAME", "game2du")
 WEB_PORT = int(os.getenv("WEB_PORT", "9800"))
+
+# News cache: {symbol: {"summary": str, "ts": float}}
+_news_cache: Dict[str, Dict] = {}
 
 # --------------- App ---------------
 app = FastAPI(title="Trade_db Web", docs_url=None, redoc_url=None)
@@ -92,6 +96,7 @@ def login(req: LoginRequest):
 def _enrich_watchlist_realtime(items_raw: dict) -> list:
     """Enrich watchlist items with real-time quotes, market cap, drawdown."""
     import asyncio
+    import concurrent.futures
     from modules.probing.async_prober import async_prober
     from modules.ingestion.market_cap import get_cn_market_metrics
     from modules.ingestion.us_market_cap import get_us_market_metrics
@@ -102,16 +107,25 @@ def _enrich_watchlist_realtime(items_raw: dict) -> list:
     for key, item in items_raw.items():
         probe_items.append({"symbol": item.get("symbol", ""), "market": item.get("market", "CN")})
 
-    # Batch fetch real-time quotes
+    # Batch fetch real-time quotes - use thread to avoid event loop conflicts
     quotes = {}
-    try:
+    def _fetch_quotes():
         loop = asyncio.new_event_loop()
-        quotes = loop.run_until_complete(async_prober.get_quotes_async(probe_items))
-        loop.close()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(async_prober.get_quotes_async(probe_items))
+        finally:
+            loop.close()
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_fetch_quotes)
+            quotes = future.result(timeout=30)
     except Exception as e:
         logger.warning(f"Watchlist quote fetch failed: {e}")
 
     # Build result with enrichment
+    _backfill_entry_prices = {}
     result = []
     for key, item in items_raw.items():
         symbol = item.get("symbol", "")
@@ -139,13 +153,21 @@ def _enrich_watchlist_realtime(items_raw: dict) -> list:
         # Total change since added
         entry_price = item.get("entry_price", 0)
         current_price = q.get("price", 0)
+        # If entry_price was never recorded, try to backfill from historical close on added_at date
+        if (not entry_price or entry_price <= 0) and current_price and current_price > 0:
+            entry_price = _get_historical_entry_price(symbol, market, item.get("added_at", "")) or current_price
+            item["entry_price"] = entry_price
+            _backfill_entry_prices[key] = entry_price
+
         total_change = 0.0
         if entry_price and current_price and entry_price > 0:
             total_change = round((current_price - entry_price) / entry_price * 100, 2)
 
         # Max drawdown: (entry_price - lowest) / entry_price, includes intraday low
+        # Only consider data AFTER added_at date
         intraday_low = q.get("day_low", 0.0)
-        max_drawdown = _calc_max_drawdown(symbol, market, entry_price, intraday_low)
+        added_at_str = item.get("added_at", "")
+        max_drawdown = _calc_max_drawdown(symbol, market, entry_price, intraday_low, added_at_str)
 
         result.append({
             "key": key,
@@ -156,23 +178,46 @@ def _enrich_watchlist_realtime(items_raw: dict) -> list:
             "tags": item.get("tags", ""),
             "price": current_price,
             "day_change": q.get("pct_chg", 0.0),
-            "amount": q.get("amount", 0.0) if "amount" not in q else q.get("amount", 0.0),
+            "amount": q.get("amount", 0.0),
             "turnover_rate": q.get("turnover_rate", 0.0) if "turnover_rate" in q else 0.0,
             "market_cap": mcap_total,
             "float_cap": mcap_float,
             "entry_price": entry_price,
             "total_change": total_change,
             "max_drawdown": max_drawdown,
+            "news_summary": _get_news_summary(symbol, item.get("name", ""), market),
         })
+    # Persist backfilled entry_prices to watchlist.json
+    if _backfill_entry_prices:
+        try:
+            from modules.monitor.repository import WatchlistRepository
+            repo = WatchlistRepository()
+            all_items = repo.load_all()
+            for k, ep in _backfill_entry_prices.items():
+                if k in all_items:
+                    all_items[k]["entry_price"] = ep
+            repo.save_all(all_items)
+        except Exception:
+            pass
+
     return result
 
 
-def _calc_max_drawdown(symbol: str, market: str, entry_price: float = 0, intraday_low: float = 0) -> float:
-    """Calculate max drawdown from entry_price to lowest price since added.
-    Considers both historical daily closes AND current intraday low.
-    Only counts when price drops below entry_price."""
-    if not entry_price or entry_price <= 0:
+def _get_historical_entry_price(symbol: str, market: str, added_at_str: str) -> float:
+    """Get the close price on or near the added_at date.
+    Tries TrendDailyBar first, then Sina US daily K-line for US stocks."""
+    import datetime as _dt
+
+    added_date = None
+    if added_at_str:
+        try:
+            added_date = _dt.datetime.strptime(added_at_str[:10], "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            return 0.0
+    if not added_date:
         return 0.0
+
+    # Try TrendDailyBar first
     try:
         from core.db import db_manager
         from domain.ledger.analytics import TrendDailyBar
@@ -183,8 +228,117 @@ def _calc_max_drawdown(symbol: str, market: str, entry_price: float = 0, intrada
                 select(TrendDailyBar.close)
                 .where(TrendDailyBar.symbol == symbol)
                 .where(TrendDailyBar.market == market)
+                .where(TrendDailyBar.date >= added_date)
                 .order_by(TrendDailyBar.date)
+                .limit(1)
             )
+            result = session.exec(stmt).first()
+            if result and result > 0:
+                return float(result)
+    except Exception:
+        pass
+
+    # Fallback: Sina US/HK daily K-line
+    if market == "US":
+        return _get_sina_us_close_on_date(symbol, added_date)
+    return 0.0
+
+
+def _get_sina_us_close_on_date(symbol: str, target_date) -> float:
+    """Get US stock close price near target_date from Sina daily K-line."""
+    import datetime as _dt
+    try:
+        import urllib.request, json
+        url = f'http://stock.finance.sina.com.cn/usstock/api/json_v2.php/US_MinKService.getDailyK?symbol={symbol.lower()}&type=daily&range=250'
+        req = urllib.request.Request(url, headers={'Referer': 'http://finance.sina.com.cn'})
+        text = urllib.request.urlopen(req, timeout=8).read().decode('utf-8')
+        data = json.loads(text)
+        best = None
+        for d in data:
+            dd = _dt.datetime.strptime(d['d'], '%Y-%m-%d').date()
+            if dd <= target_date:
+                best = d
+        if best:
+            return float(best['c'])
+        # Use first date after target
+        for d in data:
+            dd = _dt.datetime.strptime(d['d'], '%Y-%m-%d').date()
+            if dd >= target_date:
+                return float(d['c'])
+    except Exception:
+        pass
+    return 0.0
+
+def _get_news_summary(symbol: str, name: str, market: str) -> str:
+    """Get cached news summary for a stock. Cache for 4 hours.
+    Returns immediately from cache; fetches in background if stale."""
+    import threading
+    cache_key = f"{market}:{symbol}"
+    now = time.time()
+    cached = _news_cache.get(cache_key)
+    if cached and (now - cached["ts"]) < 43200:  # 12 hours
+        return cached["summary"]
+
+    # Return old cache immediately, refresh in background
+    def _refresh():
+        try:
+            from modules.ingestion.data_factory import DataManager
+            factory = DataManager()
+            query = name or symbol
+            raw = factory.search(query=f"{query} 最新", limit_per_source=2, timeout=8)
+            if raw and len(raw) > 10:
+                summary = _llm_summarize_news(raw, name or symbol)
+            else:
+                summary = ""
+            _news_cache[cache_key] = {"summary": summary, "ts": time.time()}
+        except Exception as e:
+            logger.debug(f"News refresh failed for {cache_key}: {e}")
+
+    threading.Thread(target=_refresh, daemon=True).start()
+    return cached["summary"] if cached else ""
+
+
+def _llm_summarize_news(news_text: str, stock_name: str) -> str:
+    """Use LLM to summarize news to ~20 chars."""
+    try:
+        from core.llm import simple_prompt
+        prompt = f"以下是关于{stock_name}的最新新闻，请用不超过20个中文字总结最关键的一条动态，只输出总结内容：\n{news_text[:500]}"
+        result = simple_prompt(prompt)
+        return result.strip()[:30] if result else ""
+    except Exception:
+        # Fallback: extract first sentence
+        lines = [l.strip() for l in news_text.split('\n') if l.strip()]
+        return lines[0][:25] if lines else ""
+
+def _calc_max_drawdown(symbol: str, market: str, entry_price: float = 0, intraday_low: float = 0, added_at_str: str = "") -> float:
+    """Calculate max drawdown from entry_price to lowest price SINCE added_at.
+    Considers both historical daily closes AND current intraday low.
+    Only counts when price drops below entry_price."""
+    if not entry_price or entry_price <= 0:
+        return 0.0
+    try:
+        import datetime as _dt
+        from core.db import db_manager
+        from domain.ledger.analytics import TrendDailyBar
+        from sqlmodel import Session, select
+
+        # Parse added_at to filter only post-add data
+        added_date = None
+        if added_at_str:
+            try:
+                added_date = _dt.datetime.strptime(added_at_str[:10], "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                pass
+
+        with Session(db_manager.ledger_engine) as session:
+            stmt = (
+                select(TrendDailyBar.close)
+                .where(TrendDailyBar.symbol == symbol)
+                .where(TrendDailyBar.market == market)
+            )
+            if added_date:
+                stmt = stmt.where(TrendDailyBar.date >= added_date)
+            stmt = stmt.order_by(TrendDailyBar.date)
             closes = [r for r in session.exec(stmt).all() if r and r > 0]
 
         # Include intraday low in comparison
@@ -227,20 +381,31 @@ def add_watchlist(req: WatchlistAddRequest, user: str = Depends(get_current_user
     # Get current price for entry_price tracking
     entry_price = 0.0
     try:
-        loop = asyncio.new_event_loop()
-        quotes = loop.run_until_complete(
-            async_prober.get_quotes_async([{"symbol": req.symbol, "market": req.market}])
-        )
-        loop.close()
+        import concurrent.futures
+        def _fetch_entry_price():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(
+                    async_prober.get_quotes_async([{"symbol": req.symbol, "market": req.market}])
+                )
+            finally:
+                loop.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_fetch_entry_price)
+            quotes = future.result(timeout=15)
         q = quotes.get(f"{req.market}:{req.symbol}", {})
         entry_price = q.get("price", 0.0)
+        fetched_name = q.get("name", "")
     except Exception:
+        fetched_name = ""
         pass
 
     item = {
         "symbol": req.symbol,
         "market": req.market,
-        "name": req.name,
+        "name": req.name or fetched_name or req.symbol,
         "added_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
         "last_alert_at": None,
         "alert_threshold_pct": 5,
@@ -251,6 +416,35 @@ def add_watchlist(req: WatchlistAddRequest, user: str = Depends(get_current_user
     existing[key] = item
     repo.save_all(existing)
     return {"ok": True, "key": key, "entry_price": entry_price}
+
+@app.get("/api/search-stock")
+def search_stock(q: str = Query(default=""), market: str = Query(default=""), user: str = Depends(get_current_user)):
+    """Fuzzy search stocks by name/code for add dialog."""
+    from core.db import db_manager
+    from domain.meta.asset import Asset
+    from sqlmodel import Session, select, col
+
+    results = []
+    if not q or len(q) < 1:
+        return {"results": results}
+
+    try:
+        with Session(db_manager.meta_engine) as session:
+            stmt = select(Asset.symbol, Asset.name, Asset.market)
+            if market:
+                stmt = stmt.where(Asset.market == market)
+            # Search by symbol prefix or name contains
+            stmt = stmt.where(
+                (col(Asset.symbol).startswith(q.upper())) |
+                (col(Asset.name).contains(q))
+            ).limit(20)
+            rows = session.exec(stmt).all()
+            for r in rows:
+                results.append({"symbol": r[0], "name": r[1] or "", "market": r[2] or ""})
+    except Exception as e:
+        logger.warning(f"Search stock failed: {e}")
+
+    return {"results": results}
 
 @app.delete("/api/watchlist/{key}")
 def del_watchlist(key: str, user: str = Depends(get_current_user)):
