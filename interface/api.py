@@ -144,9 +144,11 @@ def _enrich_watchlist_realtime(items_raw: dict) -> list:
             elif market == "US":
                 mc = get_us_market_metrics(symbol)
                 mcap_total = mc.get("market_cap_100m_usd", 0.0)
+                mcap_float = mcap_total  # US stocks: float ≈ total
             elif market == "HK":
                 mc = get_hk_market_metrics(symbol)
                 mcap_total = mc.get("market_cap_100m_hkd", 0.0) or mc.get("market_cap_100m_usd", 0.0)
+                mcap_float = mc.get("circ_mv_100m_hkd", 0.0) or mcap_total
         except Exception:
             pass
 
@@ -176,10 +178,10 @@ def _enrich_watchlist_realtime(items_raw: dict) -> list:
             "market": market,
             "added_at": item.get("added_at", ""),
             "tags": item.get("tags", ""),
+            "rating": item.get("rating", 0),
             "price": current_price,
             "day_change": q.get("pct_chg", 0.0),
             "amount": q.get("amount", 0.0),
-            "turnover_rate": q.get("turnover_rate", 0.0) if "turnover_rate" in q else 0.0,
             "market_cap": mcap_total,
             "float_cap": mcap_float,
             "entry_price": entry_price,
@@ -320,7 +322,7 @@ def _calc_max_drawdown(symbol: str, market: str, entry_price: float = 0, intrada
         import datetime as _dt
         from core.db import db_manager
         from domain.ledger.analytics import TrendDailyBar
-        from sqlmodel import Session, select
+        from sqlmodel import Session, select, or_
 
         # Parse added_at to filter only post-add data
         added_date = None
@@ -330,16 +332,25 @@ def _calc_max_drawdown(symbol: str, market: str, entry_price: float = 0, intrada
             except (ValueError, TypeError):
                 pass
 
+        # US stocks are stored as "105.NVDA" or "106.DELL" in TrendDailyBar
+        sym_candidates = [symbol]
+        if market == "US":
+            sym_candidates += [f"105.{symbol}", f"106.{symbol}"]
+
         with Session(db_manager.ledger_engine) as session:
             stmt = (
                 select(TrendDailyBar.close)
-                .where(TrendDailyBar.symbol == symbol)
+                .where(TrendDailyBar.symbol.in_(sym_candidates))
                 .where(TrendDailyBar.market == market)
             )
             if added_date:
                 stmt = stmt.where(TrendDailyBar.date >= added_date)
             stmt = stmt.order_by(TrendDailyBar.date)
             closes = [r for r in session.exec(stmt).all() if r and r > 0]
+
+        # Fallback: fetch from Sina daily K-line if no TrendDailyBar data
+        if not closes and market == "US" and added_date:
+            closes = _get_sina_us_closes_since(symbol, added_date)
 
         # Include intraday low in comparison
         candidates = closes[:]
@@ -356,6 +367,27 @@ def _calc_max_drawdown(symbol: str, market: str, entry_price: float = 0, intrada
         return round((entry_price - lowest) / entry_price * 100, 2)
     except Exception:
         return 0.0
+
+
+def _get_sina_us_closes_since(symbol: str, since_date) -> list:
+    """Get US stock daily close prices since a date from Sina K-line API."""
+    import datetime as _dt
+    try:
+        import urllib.request, json
+        url = f'http://stock.finance.sina.com.cn/usstock/api/json_v2.php/US_MinKService.getDailyK?symbol={symbol.lower()}&type=daily&range=250'
+        req = urllib.request.Request(url, headers={'Referer': 'http://finance.sina.com.cn'})
+        text = urllib.request.urlopen(req, timeout=8).read().decode('utf-8')
+        data = json.loads(text)
+        closes = []
+        for d in data:
+            dd = _dt.datetime.strptime(d['d'], '%Y-%m-%d').date()
+            if dd >= since_date:
+                c = float(d.get('c', 0))
+                if c > 0:
+                    closes.append(c)
+        return closes
+    except Exception:
+        return []
 
 
 @app.get("/api/watchlist")
@@ -471,6 +503,21 @@ def update_tags(key: str, req: TagUpdateRequest, user: str = Depends(get_current
     repo.save_all(existing)
     return {"ok": True}
 
+class RatingUpdateRequest(BaseModel):
+    rating: int = 0  # 0-5 stars
+
+@app.patch("/api/watchlist/{key}/rating")
+def update_rating(key: str, req: RatingUpdateRequest, user: str = Depends(get_current_user)):
+    from modules.monitor.repository import WatchlistRepository
+    repo = WatchlistRepository()
+    existing = repo.load_all()
+    key = key.replace("%3A", ":").replace("%3a", ":")
+    if key not in existing:
+        raise HTTPException(status_code=404, detail="Not found")
+    existing[key]["rating"] = max(0, min(5, req.rating))
+    repo.save_all(existing)
+    return {"ok": True}
+
 # --------------- Routes: Holds ---------------
 @app.get("/api/holds")
 def get_holds(user: str = Depends(get_current_user)):
@@ -525,7 +572,27 @@ def trade_sell(req: SellRequest, user: str = Depends(get_current_user)):
 def get_trend(days: int = Query(default=7, ge=3, le=30), user: str = Depends(get_current_user)):
     from modules.monitor.trend_service import TrendCalculator
     calc = TrendCalculator()
-    result = calc.calculate_trend(days=days)
+    raw = calc.calculate_trend(days=days)
+    # Transform to frontend-friendly format with proper field names
+    result = {}
+    for mkt, items in raw.items():
+        transformed = []
+        for item in items:
+            # Count days on list from reason_records
+            reason_recs = item.get("reason_records", [])
+            days_on_list = len(set(d for d, _ in reason_recs)) if reason_recs else 1
+            transformed.append({
+                "symbol": item.get("symbol", ""),
+                "name": item.get("name", ""),
+                "price": item.get("current_price", 0),
+                "return_pct": item.get("return_pct", 0),
+                "trend_score": item.get("trend_score", 0),
+                "catalyst_tags": item.get("aggregated_reason", "") or item.get("catalyst_tags", ""),
+                "days_on_list": days_on_list,
+                "signal_strength": item.get("signal_strength", 0),
+                "mcap_mult": item.get("mcap_mult", 1.0),
+            })
+        result[mkt] = transformed
     return {"days": days, "markets": result}
 
 # --------------- Routes: Heatmap ---------------
@@ -566,10 +633,42 @@ def get_heatmap(
             "close": b.close,
             "change_pct": round(pct, 2),
             "amount": b.amount,
-            "turnover_rate": b.turnover_rate,
+            "market_cap": 0.0,
             "catalyst_tags": b.catalyst_tags or "",
         })
+
+    # Enrich with market cap (lightweight - only 5~10 items)
+    _enrich_heatmap_market_cap(items, market)
+
     return {"date": date, "market": market, "items": items}
+
+
+def _enrich_heatmap_market_cap(items: list, market: str):
+    """Fetch market cap for heatmap items. Unit: 亿 (100m CNY/HKD/USD)."""
+    if not items:
+        return
+    try:
+        from modules.ingestion.market_cap import get_cn_market_metrics, get_hk_market_metrics
+        from modules.ingestion.us_market_cap import get_us_market_metrics
+
+        for item in items:
+            raw_sym = item.get("symbol", "")
+            # Strip exchange prefix for US (e.g., "105.INTC" -> "INTC")
+            sym = raw_sym.split(".")[-1] if "." in raw_sym else raw_sym
+            try:
+                if market == "CN":
+                    mc = get_cn_market_metrics(sym)
+                    item["market_cap"] = mc.get("total_mv_100m", 0.0) or 0.0
+                elif market == "US":
+                    mc = get_us_market_metrics(sym)
+                    item["market_cap"] = mc.get("market_cap_100m_usd", 0.0) or 0.0
+                elif market == "HK":
+                    mc = get_hk_market_metrics(sym)
+                    item["market_cap"] = mc.get("market_cap_100m_hkd", 0.0) or mc.get("market_cap_100m_usd", 0.0) or 0.0
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"Heatmap mcap enrich failed: {e}")
 
 # --------------- Routes: Trading Days ---------------
 @app.get("/api/trading-days")

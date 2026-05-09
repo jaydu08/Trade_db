@@ -810,9 +810,21 @@ class MarketHeatMap:
                 )
 
             if market == 'US' and "market_cap_musd" in filtered.columns:
+                # For stocks with mcap data, use mcap multiplier
                 mult = np.where(filtered["market_cap_musd"] >= 300000.0, 2.0,
                                 np.where(filtered["market_cap_musd"] >= 100000.0, 1.6,
                                          np.where(filtered["market_cap_musd"] >= 50000.0, 1.3, 1.0)))
+                # Fallback: stocks with mcap=0 but very high amount likely mega-caps
+                # Use amount percentile as proxy multiplier (1.0~1.5)
+                no_cap_mask = filtered["market_cap_musd"] <= 0
+                if no_cap_mask.any():
+                    amt_rank = filtered.loc[no_cap_mask, "amount"].rank(pct=True)
+                    amt_mult = np.where(amt_rank >= 0.9, 1.5,
+                                        np.where(amt_rank >= 0.7, 1.3,
+                                                 np.where(amt_rank >= 0.5, 1.15, 1.0)))
+                    mult_series = pd.Series(mult, index=filtered.index)
+                    mult_series.loc[no_cap_mask] = amt_mult
+                    mult = mult_series.values
                 filtered["heat_score"] = filtered["heat_score"] * mult
 
             filtered = self._apply_fomo_penalty(market, filtered)

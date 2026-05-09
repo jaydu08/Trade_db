@@ -10,10 +10,10 @@ interface WatchItem {
   market: string
   added_at: string
   tags: string
+  rating: number
   price: number
   day_change: number
   amount: number
-  turnover_rate: number
   market_cap: number
   float_cap: number
   entry_price: number
@@ -180,6 +180,16 @@ function marketColor(market: string) {
   return '#787774'
 }
 
+async function setRating(item: WatchItem, stars: number) {
+  const newRating = item.rating === stars ? 0 : stars
+  try {
+    await api.patch(`/watchlist/${encodeURIComponent(item.key)}/rating`, { rating: newRating })
+    item.rating = newRating
+  } catch {
+    ElMessage.error('评分保存失败')
+  }
+}
+
 function pctClass(v: number) {
   return v > 0 ? 'pct-up' : v < 0 ? 'pct-down' : ''
 }
@@ -203,7 +213,9 @@ function formatCap(total: number, float_cap: number) {
   const t = fmt(total)
   const f = fmt(float_cap)
   if (t === '-' && f === '-') return '-'
-  if (f === '-' || t === f) return t
+  if (f === '-') return t
+  if (t === '-') return f
+  if (t === f) return t
   return `${t} / ${f}`
 }
 
@@ -237,8 +249,8 @@ onMounted(fetchList)
             <th class="num sortable" @click="toggleSort('total_change')">至今涨幅 <span class="sort-icon">{{ sortIcon('total_change') }}</span></th>
             <th class="num sortable" @click="toggleSort('max_drawdown')">最大回撤 <span class="sort-icon">{{ sortIcon('max_drawdown') }}</span></th>
             <th class="num sortable" @click="toggleSort('amount')">成交额 <span class="sort-icon">{{ sortIcon('amount') }}</span></th>
-            <th class="num sortable" @click="toggleSort('turnover_rate')">换手率 <span class="sort-icon">{{ sortIcon('turnover_rate') }}</span></th>
             <th class="num sortable" @click="toggleSort('market_cap')">市值/流通 <span class="sort-icon">{{ sortIcon('market_cap') }}</span></th>
+            <th class="sortable" @click="toggleSort('rating')">评分 <span class="sort-icon">{{ sortIcon('rating') }}</span></th>
             <th>赛道题材</th>
             <th>最新新闻</th>
             <th>操作</th>
@@ -265,8 +277,10 @@ onMounted(fetchList)
               <span class="pct-down">{{ row.max_drawdown ? '-' + row.max_drawdown.toFixed(1) + '%' : '-' }}</span>
             </td>
             <td class="num">{{ formatAmount(row.amount) }}</td>
-            <td class="num">{{ row.turnover_rate ? row.turnover_rate.toFixed(2) + '%' : '-' }}</td>
             <td class="num cap-cell">{{ formatCap(row.market_cap, row.float_cap) }}</td>
+            <td class="rating-cell">
+              <span v-for="s in 5" :key="s" class="star" :class="{ filled: s <= (row.rating || 0) }" @click="setRating(row, s)">★</span>
+            </td>
             <td class="tag-cell">
               <div v-if="editingTag === row.key" class="tag-edit">
                 <input v-model="editTagValue" class="tag-input" @keyup.enter="saveTag(row)" @blur="saveTag(row)" autofocus />
@@ -373,6 +387,10 @@ onMounted(fetchList)
 .news-text { font-size: 11px; color: var(--text-secondary, #787774); }
 .del-btn { font-size: 11px; color: var(--text-secondary, #787774); padding: 1px 4px; border-radius: 3px; border: none; background: none; cursor: pointer; }
 .del-btn:hover { color: var(--red, #EB5757); background: #FEF1F1; }
+.rating-cell { white-space: nowrap; }
+.star { font-size: 14px; cursor: pointer; color: #D1D1D0; transition: color 0.1s; }
+.star.filled { color: #F2C94C; }
+.star:hover { color: #F2C94C; }
 .add-form { display: flex; flex-direction: column; gap: 14px; }
 .form-row { display: flex; flex-direction: column; gap: 4px; position: relative; }
 .form-row label { font-size: 12px; color: var(--text-secondary, #787774); font-weight: 500; }

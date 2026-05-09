@@ -937,22 +937,22 @@ class TrendCalculator:
                 if market == "CN":
                     metrics = get_cn_market_metrics(str(item.get("symbol", "")))
                     total_mv = float((metrics or {}).get("total_mv_100m", 0) or 0)
-                    if total_mv >= 2000:
-                        mcap_mult = 1.5
+                    if total_mv >= 1200:
+                        mcap_mult = 1.2
                     elif total_mv >= 500:
-                        mcap_mult = 1.3
+                        mcap_mult = 1.1
                     elif total_mv >= 200:
-                        mcap_mult = 1.15
+                        mcap_mult = 1.05
                     item["total_mv_100m"] = total_mv
                 elif market == "US":
                     metrics = get_us_market_metrics(str(item.get("symbol", "")).split(".")[-1].strip())
                     cap_musd = float((metrics or {}).get("market_cap_musd", 0) or 0)
                     if cap_musd >= 300000:   # ≥3000亿美元
-                        mcap_mult = 1.5
+                        mcap_mult = 1.2
                     elif cap_musd >= 100000: # ≥1000亿美元
-                        mcap_mult = 1.3
+                        mcap_mult = 1.1
                     elif cap_musd >= 15000:  # ≥150亿美元
-                        mcap_mult = 1.15
+                        mcap_mult = 1.05
                     item["market_cap_musd"] = cap_musd
             except Exception:
                 mcap_mult = 1.0

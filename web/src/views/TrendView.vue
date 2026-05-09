@@ -26,7 +26,6 @@ async function fetchTrend() {
   loading.value = true
   try {
     const res = await api.get('/trend', { params: { days: activeDays.value } })
-    // Transform response
     const marketsData: Record<string, TrendItem[]> = {}
     const raw = res.data.markets || {}
     for (const [mkt, items] of Object.entries(raw) as [string, any[]][]) {
@@ -36,10 +35,10 @@ async function fetchTrend() {
         name: item.name || '',
         market: mkt,
         price: item.price || 0,
-        period_change: item.period_change || item.return_pct || 0,
-        score: item.score || item.total_score || 0,
-        catalyst_tags: item.catalyst_tags || item.reason || '',
-        days_on_list: item.days_on_list || item.pool_days || 0,
+        period_change: item.return_pct || 0,
+        score: item.trend_score || 0,
+        catalyst_tags: item.catalyst_tags || '',
+        days_on_list: item.days_on_list || 0,
       }))
     }
     allData.value = marketsData
@@ -57,6 +56,16 @@ watch([activeMarket, allData], () => {
 
 function pctClass(v: number) {
   return v > 0 ? 'pct-up' : v < 0 ? 'pct-down' : ''
+}
+
+function scoreStars(score: number): number {
+  // Auto map trend_score to 1-5 stars based on thresholds
+  if (score >= 50) return 5
+  if (score >= 30) return 4
+  if (score >= 15) return 3
+  if (score >= 5) return 2
+  if (score > 0) return 1
+  return 0
 }
 
 onMounted(fetchTrend)
@@ -85,26 +94,28 @@ watch(activeDays, fetchTrend)
     <el-table :data="currentItems" v-loading="loading" size="small">
       <el-table-column prop="rank" label="#" width="40" />
       <el-table-column prop="symbol" label="代码" width="90" />
-      <el-table-column prop="name" label="名称" width="120" />
-      <el-table-column label="现价" width="90">
+      <el-table-column prop="name" label="名称" width="100" />
+      <el-table-column label="现价" width="80">
         <template #default="{ row }">{{ row.price ? row.price.toFixed(2) : '-' }}</template>
       </el-table-column>
-      <el-table-column label="N日涨幅" width="90">
+      <el-table-column label="N日涨幅" width="80">
         <template #default="{ row }">
           <span :class="pctClass(row.period_change)">
             {{ row.period_change > 0 ? '+' : '' }}{{ row.period_change.toFixed(1) }}%
           </span>
         </template>
       </el-table-column>
-      <el-table-column label="评分" width="70">
-        <template #default="{ row }">{{ row.score.toFixed(2) }}</template>
+      <el-table-column label="评分" width="80">
+        <template #default="{ row }">
+          <span class="stars">{{ '★'.repeat(scoreStars(row.score)) }}{{ '☆'.repeat(5 - scoreStars(row.score)) }}</span>
+        </template>
       </el-table-column>
       <el-table-column label="马甲" min-width="160">
         <template #default="{ row }">
           <span class="catalyst-text">{{ row.catalyst_tags || '-' }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="上榜天数" width="80">
+      <el-table-column label="上榜天数" width="72">
         <template #default="{ row }">{{ row.days_on_list }}d</template>
       </el-table-column>
     </el-table>
@@ -142,5 +153,10 @@ watch(activeDays, fetchTrend)
 .catalyst-text {
   font-size: 12px;
   color: var(--text-secondary);
+}
+.stars {
+  font-size: 13px;
+  color: #F2C94C;
+  letter-spacing: -1px;
 }
 </style>

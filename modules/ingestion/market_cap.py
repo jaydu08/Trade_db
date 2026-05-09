@@ -327,13 +327,35 @@ def _flow_by_rqdata(symbol: str, trade_date: str) -> Dict[str, float]:
 
 @cached("hk_market_metrics", ttl=600)
 def get_hk_market_metrics(symbol: str) -> Dict[str, float]:
-    """港股市值（优先 Finnhub，失败回退 Yahoo Finance）。"""
-    candidates = _fmt_hk_symbol_candidates(symbol)
-    if not candidates:
-        return {}
+    """港股市值（优先腾讯行情，回退 Finnhub，最后 Yahoo Finance）。"""
+    # --- 1) 腾讯行情 (最可靠，免费无限额) ---
+    raw_digits = "".join(ch for ch in str(symbol or "") if ch.isdigit())
+    if raw_digits:
+        hk_sym = f"hk{raw_digits.zfill(5)}"
+        try:
+            url = f"https://qt.gtimg.cn/q={hk_sym}"
+            resp = requests.get(url, headers=_TENCENT_HEADERS, timeout=8)
+            text = (resp.text or "").strip()
+            if text and '=""' not in text:
+                payload = text.split('="', 1)[1].rsplit('";', 1)[0]
+                parts = payload.split("~")
+                if len(parts) >= 46:
+                    # HK stocks: parts[44]=流通市值(亿港元), parts[45]=总市值(亿港元)
+                    circ_mv = _to_float(parts[44])
+                    total_mv = _to_float(parts[45])
+                    if total_mv > 0 or circ_mv > 0:
+                        return {
+                            "provider": "tencent",
+                            "market_cap_100m_hkd": total_mv if total_mv > 0 else circ_mv,
+                            "circ_mv_100m_hkd": circ_mv if circ_mv > 0 else total_mv,
+                        }
+        except Exception as e:
+            logger.debug("Tencent HK market cap failed for %s: %s", symbol, e)
 
+    # --- 2) Finnhub ---
+    candidates = _fmt_hk_symbol_candidates(symbol)
     key = os.getenv("FINNHUB_API_KEY", "").strip()
-    if key:
+    if key and candidates:
         for sym in candidates:
             try:
                 resp = requests.get(
@@ -360,10 +382,11 @@ def get_hk_market_metrics(symbol: str) -> Dict[str, float]:
             except Exception as e:
                 logger.debug("Finnhub HK market cap failed for %s: %s", sym, e)
 
+    # --- 3) Yahoo Finance (fallback) ---
     try:
         from modules.ingestion.yfinance_client import yfinance_client
 
-        for sym in candidates:
+        for sym in (candidates or []):
             data = yfinance_client.get_financials(sym)
             cap = _to_float((data or {}).get("market_cap"))
             if cap <= 0:

@@ -162,8 +162,8 @@ def cached(
             # 执行函数
             result = func(*args, **kwargs)
             
-            # 缓存结果
-            if result is not None:
+            # 缓存结果 (跳过空字典/空列表，避免缓存失败结果)
+            if result is not None and (not isinstance(result, (dict, list)) or result):
                 cache_manager.set(cache_key, result, ttl=ttl)
             
             return result

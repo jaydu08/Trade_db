@@ -10,7 +10,7 @@ interface HeatmapItem {
   close: number
   change_pct: number
   amount: number
-  turnover_rate: number
+  market_cap: number
   catalyst_tags: string
 }
 
@@ -58,6 +58,14 @@ function formatAmount(v: number) {
   if (v >= 1e8) return (v / 1e8).toFixed(1) + '亿'
   if (v >= 1e4) return (v / 1e4).toFixed(0) + '万'
   return v.toFixed(0)
+}
+
+function formatCap(v: number) {
+  if (!v) return '-'
+  if (v >= 10000) return (v / 10000).toFixed(2) + '万亿'
+  if (v >= 1000) return v.toFixed(0) + '亿'
+  if (v >= 100) return v.toFixed(1) + '亿'
+  return v.toFixed(2) + '亿'
 }
 
 function pctClass(v: number) {
@@ -117,8 +125,8 @@ watch(activeMarket, fetchHeatmap)
       <el-table-column label="成交额" width="90">
         <template #default="{ row }">{{ formatAmount(row.amount) }}</template>
       </el-table-column>
-      <el-table-column label="换手率" width="80">
-        <template #default="{ row }">{{ row.turnover_rate ? row.turnover_rate.toFixed(2) + '%' : '-' }}</template>
+      <el-table-column label="市值" width="90">
+        <template #default="{ row }">{{ formatCap(row.market_cap) }}</template>
       </el-table-column>
       <el-table-column label="马甲" min-width="180">
         <template #default="{ row }">
