@@ -332,6 +332,11 @@ def _calc_max_drawdown(symbol: str, market: str, entry_price: float = 0, intrada
             except (ValueError, TypeError):
                 pass
 
+        # If added TODAY, no meaningful drawdown can be computed yet
+        today = _dt.date.today()
+        if added_date and added_date >= today:
+            return 0.0
+
         # US stocks are stored as "105.NVDA" or "106.DELL" in TrendDailyBar
         sym_candidates = [symbol]
         if market == "US":
@@ -344,7 +349,9 @@ def _calc_max_drawdown(symbol: str, market: str, entry_price: float = 0, intrada
                 .where(TrendDailyBar.market == market)
             )
             if added_date:
-                stmt = stmt.where(TrendDailyBar.date >= added_date)
+                # Use strict > (not >=): the entry day's close doesn't represent post-add performance
+                # If added on a non-trading day, this also avoids including stale data
+                stmt = stmt.where(TrendDailyBar.date > added_date)
             stmt = stmt.order_by(TrendDailyBar.date)
             closes = [r for r in session.exec(stmt).all() if r and r > 0]
 
@@ -353,9 +360,23 @@ def _calc_max_drawdown(symbol: str, market: str, entry_price: float = 0, intrada
             closes = _get_sina_us_closes_since(symbol, added_date)
 
         # Include intraday low in comparison
+        # But ONLY if market is likely open right now (otherwise stale from last session)
+        # And ONLY if there are closes data (meaning at least one trading day has passed)
         candidates = closes[:]
-        if intraday_low and intraday_low > 0:
-            candidates.append(intraday_low)
+        if closes and intraday_low and intraday_low > 0:
+            try:
+                from zoneinfo import ZoneInfo
+                tz_map = {"US": "America/New_York", "HK": "Asia/Hong_Kong", "CN": "Asia/Shanghai"}
+                tz = ZoneInfo(tz_map.get(market, "Asia/Shanghai"))
+                now_local = _dt.datetime.now(tz)
+                is_weekday = 0 <= now_local.weekday() <= 4
+                hour = now_local.hour
+                # Generous market hours: Mon-Fri within extended trading window
+                is_market_hours = hour >= 8 and hour < 21
+                if is_weekday and is_market_hours:
+                    candidates.append(intraday_low)
+            except Exception:
+                candidates.append(intraday_low)  # fallback: include if we can't determine
 
         if not candidates:
             return 0.0
@@ -381,7 +402,7 @@ def _get_sina_us_closes_since(symbol: str, since_date) -> list:
         closes = []
         for d in data:
             dd = _dt.datetime.strptime(d['d'], '%Y-%m-%d').date()
-            if dd >= since_date:
+            if dd > since_date:
                 c = float(d.get('c', 0))
                 if c > 0:
                     closes.append(c)
@@ -522,7 +543,6 @@ def update_rating(key: str, req: RatingUpdateRequest, user: str = Depends(get_cu
 @app.get("/api/holds")
 def get_holds(user: str = Depends(get_current_user)):
     from modules.paper_trading.service import PaperTradingService
-    from config.settings import settings
     svc = PaperTradingService()
     chat_id = int(os.getenv("ALLOWED_USER_IDS", "0").split(",")[0])
     trades = svc.get_active_trades(chat_id)
