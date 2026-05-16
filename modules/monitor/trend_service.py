@@ -12,7 +12,7 @@ from core.db import get_ledger_session
 from domain.ledger.analytics import TrendSeedPool, DailyRank, TrendDailyBar
 # ChromaDB 已禁用，新闻查询跳过
 # from modules.monitor.news_intel import summarize_symbol_news
-from modules.ingestion.market_cap import get_cn_market_metrics
+from modules.ingestion.market_cap import get_cn_market_metrics, get_hk_market_metrics
 from modules.ingestion.us_market_cap import get_us_market_metrics
 
 logger = logging.getLogger(__name__)
@@ -846,6 +846,304 @@ class TrendCalculator:
             logger.debug(f"DailyRank fallback failed for {symbol} ({market}): {e2}")
             return 0.0, 0.0, ""
 
+
+
+    @staticmethod
+    def _market_topn(market: str) -> int:
+        defaults = {"CN": 10, "HK": 7, "US": 10, "CF": 5}
+        val = os.getenv(f"TREND_TOPN_{market}", "").strip()
+        try:
+            if val:
+                n = int(val)
+                if n > 0:
+                    return n
+        except Exception:
+            pass
+        return defaults.get(market, 10)
+
+    @staticmethod
+    def _market_quota(market: str, topn: int) -> Tuple[int, int, int]:
+        defaults = {
+            "CN": (3, 4, 3),
+            "HK": (3, 3, 1),
+            "US": (3, 5, 2),
+        }
+        raw = os.getenv(f"TREND_QUOTA_{market}", "").strip()
+        quota = defaults.get(market, (topn, 0, 0))
+        if raw:
+            try:
+                arr = [int(x.strip()) for x in raw.split(",") if x.strip()]
+                if len(arr) == 3 and sum(arr) > 0:
+                    quota = (max(0, arr[0]), max(0, arr[1]), max(0, arr[2]))
+            except Exception:
+                pass
+        qsum = sum(quota)
+        if qsum <= 0:
+            return (topn, 0, 0)
+        if qsum == topn:
+            return quota
+        scale = topn / qsum
+        l = int(round(quota[0] * scale))
+        m = int(round(quota[1] * scale))
+        s = max(0, topn - l - m)
+        return (l, m, s)
+
+    @staticmethod
+    def _cap_bucket(item: Dict) -> str:
+        market = str(item.get("market", "")).strip().upper()
+        if market == "CN":
+            cap = float(item.get("total_mv_100m", 0) or 0)
+            large = float(os.getenv("TREND_CN_LARGE_100M", "1000") or 1000)
+            mid = float(os.getenv("TREND_CN_MID_100M", "200") or 200)
+            if cap >= large:
+                return "large"
+            if cap >= mid:
+                return "mid"
+            if cap > 0:
+                return "small"
+            return "unknown"
+
+        if market == "HK":
+            cap = float(item.get("market_cap_100m_hkd", 0) or 0)
+            large = float(os.getenv("TREND_HK_LARGE_100M_HKD", "1500") or 1500)
+            mid = float(os.getenv("TREND_HK_MID_100M_HKD", "300") or 300)
+            if cap >= large:
+                return "large"
+            if cap >= mid:
+                return "mid"
+            if cap > 0:
+                return "small"
+            return "unknown"
+
+        if market == "US":
+            cap_musd = float(item.get("market_cap_musd", 0) or 0)
+            large = float(os.getenv("TREND_US_LARGE_MUSD", "50000") or 50000)
+            mid = float(os.getenv("TREND_US_MID_MUSD", "5000") or 5000)
+            if cap_musd >= large:
+                return "large"
+            if cap_musd >= mid:
+                return "mid"
+            if cap_musd > 0:
+                return "small"
+            return "unknown"
+
+        return "unknown"
+
+    @staticmethod
+    def _select_with_quota(stks: List[Dict], market: str) -> List[Dict]:
+        topn = TrendCalculator._market_topn(market)
+        ranked = sorted(stks, key=lambda x: x.get("trend_score", x.get("return_pct", 0)), reverse=True)
+        if market not in {"CN", "HK", "US"}:
+            return ranked[:topn]
+
+        if str(os.getenv("TREND_BUCKET_ENABLE", "1")).strip().lower() not in {"1", "true", "yes", "on"}:
+            return ranked[:topn]
+
+        q_large, q_mid, q_small = TrendCalculator._market_quota(market, topn)
+        buckets = {"large": [], "mid": [], "small": [], "unknown": []}
+        for it in ranked:
+            b = TrendCalculator._cap_bucket(it)
+            it["cap_bucket"] = b
+            buckets.setdefault(b, []).append(it)
+
+        picked: List[Dict] = []
+        used: set[str] = set()
+
+        def _take(kind: str, n: int):
+            if n <= 0:
+                return
+            cnt = 0
+            for cand in buckets.get(kind, []):
+                sym = str(cand.get("symbol", "")).strip()
+                if not sym or sym in used:
+                    continue
+                picked.append(cand)
+                used.add(sym)
+                cnt += 1
+                if cnt >= n:
+                    break
+
+        _take("large", q_large)
+        _take("mid", q_mid)
+        _take("small", q_small)
+
+        for kind in ["mid", "large", "small", "unknown"]:
+            if len(picked) >= topn:
+                break
+            for cand in buckets.get(kind, []):
+                sym = str(cand.get("symbol", "")).strip()
+                if not sym or sym in used:
+                    continue
+                picked.append(cand)
+                used.add(sym)
+                if len(picked) >= topn:
+                    break
+
+        if len(picked) < topn:
+            for cand in ranked:
+                sym = str(cand.get("symbol", "")).strip()
+                if not sym or sym in used:
+                    continue
+                picked.append(cand)
+                used.add(sym)
+                if len(picked) >= topn:
+                    break
+
+        ratio = float(os.getenv("TREND_QUALITY_FLOOR_RATIO", "0.95") or 0.95)
+        old_tail = float(ranked[min(topn, len(ranked)) - 1].get("trend_score", 0) or 0) if ranked else 0.0
+        if old_tail > 0 and picked:
+            floor = old_tail * max(0.0, ratio)
+            picked.sort(key=lambda x: x.get("trend_score", x.get("return_pct", 0)), reverse=True)
+            picked_syms = {str(x.get("symbol", "")).strip() for x in picked}
+            while picked and float(picked[-1].get("trend_score", 0) or 0) < floor:
+                repl = None
+                for cand in ranked:
+                    sym = str(cand.get("symbol", "")).strip()
+                    if not sym or sym in picked_syms:
+                        continue
+                    if float(cand.get("trend_score", 0) or 0) >= floor:
+                        repl = cand
+                        break
+                if repl is None:
+                    break
+                old = picked[-1]
+                old_sym = str(old.get("symbol", "")).strip()
+                if old_sym:
+                    picked_syms.discard(old_sym)
+                picked[-1] = repl
+                picked_syms.add(str(repl.get("symbol", "")).strip())
+                picked.sort(key=lambda x: x.get("trend_score", x.get("return_pct", 0)), reverse=True)
+
+        unknown_cap = int(os.getenv(f"TREND_UNKNOWN_MAX_{market}", os.getenv("TREND_UNKNOWN_MAX", "2")) or 2)
+        if unknown_cap >= 0:
+            picked.sort(key=lambda x: x.get("trend_score", x.get("return_pct", 0)), reverse=True)
+            unknown_idx = [i for i, x in enumerate(picked) if str(x.get("cap_bucket", "")) == "unknown"]
+            while len(unknown_idx) > unknown_cap:
+                i = unknown_idx[-1]
+                repl = None
+                for cand in ranked:
+                    sym = str(cand.get("symbol", "")).strip()
+                    if not sym:
+                        continue
+                    if any(str(z.get("symbol", "")).strip() == sym for z in picked):
+                        continue
+                    if str(cand.get("cap_bucket", TrendCalculator._cap_bucket(cand))) == "unknown":
+                        continue
+                    repl = cand
+                    break
+                if repl is None:
+                    break
+                picked[i] = repl
+                picked.sort(key=lambda x: x.get("trend_score", x.get("return_pct", 0)), reverse=True)
+                unknown_idx = [j for j, x in enumerate(picked) if str(x.get("cap_bucket", "")) == "unknown"]
+
+        picked.sort(key=lambda x: x.get("trend_score", x.get("return_pct", 0)), reverse=True)
+        return picked[:topn]
+
+
+    @staticmethod
+    def _is_leveraged_like(name: str) -> bool:
+        text = str(name or "")
+        low = text.lower()
+        if any(k in low for k in ["2x", "3x", "1.5x", "bull", "bear", "leveraged", "inverse"]):
+            return True
+        import re as _re
+        return bool(_re.search(r"\d[\d.]*[xX]\s+(?:long|short|bull|bear)", text))
+
+    @staticmethod
+    def _augment_with_secondary_candidates(items: List[Dict], days: int) -> List[Dict]:
+        """Dual-channel补漏：在主候选外补充DailyRank高流动性候选。"""
+        enabled = str(os.getenv("ENABLE_TREND_SECONDARY_POOL", "1")).strip().lower() in {"1", "true", "yes", "on"}
+        if (not enabled) or (not items):
+            return items
+
+        fetch_n = max(5, int(os.getenv("TREND_SECONDARY_FETCH_N", "20") or 20))
+        cutoff_rank = dt.date.today() - dt.timedelta(days=max(2, min(5, days)))
+
+        by_market = {}
+        for it in items:
+            by_market.setdefault(str(it.get("market", "")), []).append(it)
+
+        merged = list(items)
+        existing = {(str(it.get("market", "")), str(it.get("symbol", ""))) for it in items}
+
+        with get_ledger_session() as session:
+            for market in ["CN", "HK", "US"]:
+                if market not in by_market:
+                    continue
+
+                rows = session.exec(
+                    select(DailyRank)
+                    .where(DailyRank.market == market)
+                    .where(DailyRank.date >= cutoff_rank)
+                    .order_by(DailyRank.amount.desc(), DailyRank.change_pct.desc())
+                    .limit(fetch_n * 3)
+                ).all()
+
+                picked = 0
+                for r in rows:
+                    sym = str(r.symbol or "").strip()
+                    key = (market, sym)
+                    if (not sym) or (key in existing):
+                        continue
+
+                    pct = float(r.change_pct or 0)
+                    amt = float(r.amount or 0)
+
+                    if market == "CN":
+                        if amt < float(os.getenv("CN_HARD_AMOUNT_MIN", "200000000") or 200000000):
+                            continue
+                        if pct < float(os.getenv("TREND_SECONDARY_CN_PCT_MIN", "2.0") or 2.0):
+                            continue
+                        try:
+                            m = get_cn_market_metrics(sym)
+                            mv = float((m or {}).get("total_mv_100m", 0) or 0)
+                            floor = float(os.getenv("CN_HARD_TOTAL_MV_100M_MIN", "50") or 50)
+                            if mv > 0 and mv < floor:
+                                continue
+                        except Exception:
+                            pass
+
+                    elif market == "HK":
+                        if amt < float(os.getenv("HK_HARD_AMOUNT_MIN", "250000000") or 250000000):
+                            continue
+                        if pct < float(os.getenv("TREND_SECONDARY_HK_PCT_MIN", "4.0") or 4.0):
+                            continue
+
+                    elif market == "US":
+                        if amt < float(os.getenv("TREND_SECONDARY_US_AMOUNT_MIN", "20000000") or 20000000):
+                            continue
+                        if pct < float(os.getenv("TREND_SECONDARY_US_PCT_MIN", "4.0") or 4.0):
+                            continue
+                        try:
+                            m = get_us_market_metrics(sym.split(".")[-1].strip())
+                            cap = float((m or {}).get("market_cap_musd", 0) or 0)
+                            floor = float(os.getenv("US_HARD_MCAP_MUSD_MIN", "1000") or 1000)
+                            if cap > 0 and cap < floor:
+                                continue
+                            if cap <= 0 and TrendCalculator._is_leveraged_like(getattr(r, "name", "")):
+                                continue
+                        except Exception:
+                            pass
+
+                    merged.append(
+                        {
+                            "market": market,
+                            "symbol": sym,
+                            "name": str(r.name or ""),
+                            "reason_records": [],
+                        }
+                    )
+                    existing.add(key)
+                    picked += 1
+                    if picked >= fetch_n:
+                        break
+
+                if picked > 0:
+                    logger.info("Trend secondary pool added: market=%s added=%s", market, picked)
+
+        return merged
+
     @staticmethod
     def calculate_trend(days: int = 7) -> Dict[str, List[Dict]]:
         """
@@ -890,6 +1188,7 @@ class TrendCalculator:
                 grouped[key]["reason_records"].append((r["date"], r["daily_reason"].strip()))
                 
         items = list(grouped.values())
+        items = TrendCalculator._augment_with_secondary_candidates(items, days)
         # 候选池限额：避免极端数据膨胀导致内存峰值
         if TrendService.TREND_MAX_SYMBOLS_PER_MARKET > 0:
             by_market = defaultdict(list)
@@ -954,6 +1253,11 @@ class TrendCalculator:
                     elif cap_musd >= 15000:  # ≥150亿美元
                         mcap_mult = 1.05
                     item["market_cap_musd"] = cap_musd
+                elif market == "HK":
+                    metrics = get_hk_market_metrics(str(item.get("symbol", "")))
+                    cap_hkd = float((metrics or {}).get("market_cap_100m_hkd", 0) or 0)
+                    if cap_hkd > 0:
+                        item["market_cap_100m_hkd"] = cap_hkd
             except Exception:
                 mcap_mult = 1.0
 
@@ -976,8 +1280,6 @@ class TrendCalculator:
             
         final_tops = {}
         for mkt, stks in market_tops.items():
-            stks.sort(key=lambda x: x.get("trend_score", x["return_pct"]), reverse=True)
-            # 取出前10名
-            final_tops[mkt] = stks[:10]
-            
+            final_tops[mkt] = TrendCalculator._select_with_quota(stks, mkt)
+
         return dict(final_tops)

@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from typing import Dict
 
 import requests
@@ -7,6 +8,7 @@ import requests
 from core.cache import cached
 
 logger = logging.getLogger(__name__)
+_YF_COOLDOWN_UNTIL = 0.0
 
 
 def _to_float(value) -> float:
@@ -16,9 +18,42 @@ def _to_float(value) -> float:
         return 0.0
 
 
+def _to_sina_symbol(raw: str) -> str:
+    return "gb_" + str(raw or "").strip().lower().replace(".", "$")
+
+
+def _market_cap_from_sina(raw: str) -> Dict[str, float]:
+    try:
+        sid = _to_sina_symbol(raw)
+        resp = requests.get(
+            "http://hq.sinajs.cn/list=" + sid,
+            headers={"Referer": "http://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"},
+            timeout=6,
+        )
+        text = (resp.text or "").strip()
+        if (not text) or ("=\"\"" in text):
+            return {}
+        payload = text.split("=\"", 1)[1].rsplit("\";", 1)[0]
+        parts = payload.split(",")
+        if len(parts) < 13:
+            return {}
+        cap_usd = _to_float(parts[12])
+        if cap_usd <= 0:
+            return {}
+        cap_musd = cap_usd / 1000000.0
+        return {
+            "provider": "sina",
+            "symbol": raw,
+            "market_cap_musd": round(cap_musd, 4),
+            "market_cap_100m_usd": round(cap_musd / 100.0, 4),
+        }
+    except Exception as e:
+        logger.debug("US market cap sina fallback failed for %s: %s", raw, e)
+        return {}
+
+
 @cached("us_market_metrics", ttl=1800)
 def get_us_market_metrics(symbol: str) -> Dict[str, float]:
-    """美股市值（优先 Finnhub，失败回退 Yahoo Finance，本地缓存兜底）。"""
     raw = str(symbol or "").split(".")[-1].strip().upper()
     if not raw:
         return {}
@@ -47,7 +82,9 @@ def get_us_market_metrics(symbol: str) -> Dict[str, float]:
         except Exception as e:
             logger.debug("US market cap finnhub failed for %s: %s", raw, e)
 
-    try:
+    global _YF_COOLDOWN_UNTIL
+    now = time.time()
+    if now >= _YF_COOLDOWN_UNTIL:
         from modules.ingestion.yfinance_client import yfinance_client
 
         data = yfinance_client.get_financials(raw)
@@ -60,7 +97,12 @@ def get_us_market_metrics(symbol: str) -> Dict[str, float]:
                 "market_cap_musd": round(cap_musd, 4),
                 "market_cap_100m_usd": round(cap_musd / 100.0, 4),
             }
-    except Exception as e:
-        logger.debug("US market cap yfinance fallback failed for %s: %s", raw, e)
+        if not data:
+            cooldown = int(os.getenv("US_MCAP_YF_COOLDOWN_SEC", "900") or 900)
+            _YF_COOLDOWN_UNTIL = time.time() + max(60, cooldown)
+
+    sina = _market_cap_from_sina(raw)
+    if sina:
+        return sina
 
     return {}
