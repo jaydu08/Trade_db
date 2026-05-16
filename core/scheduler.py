@@ -42,6 +42,10 @@ class TaskScheduler:
             },
         )
         self.jobs = []
+        self._job_stats = {}
+        self._obs_enabled = os.getenv("SCHED_OBS_ENABLED", "1") == "1"
+        self._obs_interval_minutes = max(5, int(os.getenv("SCHED_OBS_INTERVAL_MIN", "30") or 30))
+        self._slow_job_ms = max(1000, int(os.getenv("SCHED_SLOW_JOB_MS", "120000") or 120000))
 
     def start(self):
         """启动调度器"""
@@ -247,6 +251,15 @@ class TaskScheduler:
             replace_existing=True
         )
 
+        if self._obs_enabled:
+            self.scheduler.add_job(
+                self._job_observability_heartbeat,
+                IntervalTrigger(minutes=self._obs_interval_minutes),
+                id="observability_heartbeat",
+                name="系统观测心跳",
+                replace_existing=True
+            )
+
         logger.info(f"Registered {len(self.scheduler.get_jobs())} jobs.")
 
     @staticmethod
@@ -260,24 +273,78 @@ class TaskScheduler:
             pass
         return 0.0
 
+    def _update_job_stats(self, job_id: str, duration_ms: int, ok: bool):
+        stats = self._job_stats.get(job_id)
+        if not stats:
+            stats = {"runs": 0, "fails": 0, "dur_sum": 0, "dur_max": 0}
+            self._job_stats[job_id] = stats
+
+        stats["runs"] += 1
+        stats["dur_sum"] += max(0, int(duration_ms or 0))
+        stats["dur_max"] = max(int(stats.get("dur_max", 0)), max(0, int(duration_ms or 0)))
+        if not ok:
+            stats["fails"] += 1
+
+    def _job_observability_heartbeat(self):
+        """低频健康心跳：聚合输出，避免高频日志膨胀。"""
+        if not self._job_stats:
+            logger.info("HEARTBEAT | rss_mb=%.1f | jobs=0", self._current_rss_mb())
+            return
+
+        total_runs = sum(int(v.get("runs", 0)) for v in self._job_stats.values())
+        total_fails = sum(int(v.get("fails", 0)) for v in self._job_stats.values())
+        fail_rate = (total_fails / total_runs * 100.0) if total_runs else 0.0
+
+        hot = []
+        for job_id, v in self._job_stats.items():
+            runs = int(v.get("runs", 0))
+            avg = int(v.get("dur_sum", 0) / runs) if runs else 0
+            hot.append((int(v.get("fails", 0)), avg, job_id, runs, int(v.get("dur_max", 0))))
+        hot.sort(reverse=True)
+        top = hot[:4]
+        top_text = "; ".join([f"{jid}(r={r},f={f},avg={a}ms,max={m}ms)" for f, a, jid, r, m in top])
+
+        logger.info(
+            "HEARTBEAT | rss_mb=%.1f | jobs=%s | runs=%s | fails=%s | fail_rate=%.2f%% | top=%s",
+            self._current_rss_mb(),
+            len(self._job_stats),
+            total_runs,
+            total_fails,
+            fail_rate,
+            top_text,
+        )
+
     def _run_job(self, job_id: str, func, *args, **kwargs):
-        """统一任务执行包装：记录耗时、结果与异常。"""
+        """统一任务执行包装：低噪音 + 慢任务/失败强告警。"""
         started = time.perf_counter()
         rss_before = self._current_rss_mb()
-        logger.info("Job started: %s | rss_mb=%s", job_id, rss_before)
         try:
             result = func(*args, **kwargs)
             duration_ms = int((time.perf_counter() - started) * 1000)
             rss_after = self._current_rss_mb()
-            if isinstance(result, dict):
-                logger.info("Job finished: %s | duration_ms=%s | rss_mb=%s | delta_mb=%.1f | result=%s", job_id, duration_ms, rss_after, rss_after-rss_before, result)
-            else:
-                logger.info("Job finished: %s | duration_ms=%s | rss_mb=%s | delta_mb=%.1f", job_id, duration_ms, rss_after, rss_after-rss_before)
+            self._update_job_stats(job_id, duration_ms, True)
+
+            if duration_ms >= self._slow_job_ms:
+                logger.warning(
+                    "Job slow: %s | duration_ms=%s | rss_mb=%s | delta_mb=%.1f",
+                    job_id,
+                    duration_ms,
+                    rss_after,
+                    rss_after - rss_before,
+                )
             gc.collect()
             return result
         except Exception as e:
             duration_ms = int((time.perf_counter() - started) * 1000)
-            logger.error("Job failed: %s | duration_ms=%s | rss_mb=%s | error=%s", job_id, duration_ms, self._current_rss_mb(), e, exc_info=True)
+            self._update_job_stats(job_id, duration_ms, False)
+            logger.error(
+                "Job failed: %s | duration_ms=%s | rss_mb=%s | error=%s",
+                job_id,
+                duration_ms,
+                self._current_rss_mb(),
+                e,
+                exc_info=True,
+            )
             gc.collect()
             return None
 

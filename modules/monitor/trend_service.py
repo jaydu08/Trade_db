@@ -930,8 +930,8 @@ class TrendCalculator:
         return "unknown"
 
     @staticmethod
-    def _select_with_quota(stks: List[Dict], market: str) -> List[Dict]:
-        topn = TrendCalculator._market_topn(market)
+    def _select_with_quota(stks: List[Dict], market: str, topn_override: Optional[int] = None) -> List[Dict]:
+        topn = int(topn_override) if topn_override and int(topn_override) > 0 else TrendCalculator._market_topn(market)
         ranked = sorted(stks, key=lambda x: x.get("trend_score", x.get("return_pct", 0)), reverse=True)
         if market not in {"CN", "HK", "US"}:
             return ranked[:topn]
@@ -1145,7 +1145,7 @@ class TrendCalculator:
         return merged
 
     @staticmethod
-    def calculate_trend(days: int = 7) -> Dict[str, List[Dict]]:
+    def calculate_trend(days: int = 7, topn_override: Optional[int] = None) -> Dict[str, List[Dict]]:
         """
         计算各市场趋势榜单
         """
@@ -1280,6 +1280,6 @@ class TrendCalculator:
             
         final_tops = {}
         for mkt, stks in market_tops.items():
-            final_tops[mkt] = TrendCalculator._select_with_quota(stks, mkt)
+            final_tops[mkt] = TrendCalculator._select_with_quota(stks, mkt, topn_override=topn_override)
 
         return dict(final_tops)

@@ -1,6 +1,7 @@
 import os
 import sys
 import logging
+from logging.handlers import RotatingFileHandler
 import asyncio
 import atexit
 import fcntl
@@ -15,10 +16,16 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("trade_db.log")
+        RotatingFileHandler("trade_db.log", maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8")
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Reduce high-frequency polling/log noise to control log volume.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
 
 from core.db import db_manager
 from core.scheduler import task_scheduler
@@ -84,7 +91,7 @@ def main():
 
     lock_fp = _acquire_single_instance_lock()
     if lock_fp is None:
-        return
+        sys.exit(1)
     
     # 1. Init DB
     db_manager.init_meta_db()

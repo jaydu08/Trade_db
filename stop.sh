@@ -7,7 +7,7 @@
 
 cd "$(dirname "$0")"
 PIDFILE="logs/trade_db.pid"
-PROC_REGEX="[p]ython3?.*Trade_db/main\.py"
+PROC_REGEX="[p]ython3?.*main\.py"
 
 # ── systemd 路径 ──────────────────────────────────────────────
 if systemctl list-unit-files 2>/dev/null | grep -q ^trade_db.service; then

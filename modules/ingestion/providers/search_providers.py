@@ -13,6 +13,8 @@ from typing import List, Dict, Any
 from .base import BaseSearchProvider
 
 logger = logging.getLogger(__name__)
+logging.getLogger("ddgs").setLevel(logging.WARNING)
+logging.getLogger("primp").setLevel(logging.WARNING)
 
 
 class SearXNGProvider(BaseSearchProvider):
@@ -23,8 +25,8 @@ class SearXNGProvider(BaseSearchProvider):
         urls = [url.strip() for url in urls_str.split(",") if url.strip()]
         fallback_urls = [
             "https://search.sapti.me",
+            "https://paulgo.io",
             "https://searx.be",
-            "https://search.bus-hit.me",
         ]
         if not urls:
             urls = fallback_urls.copy()

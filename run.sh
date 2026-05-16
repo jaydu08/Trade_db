@@ -8,7 +8,7 @@
 cd "$(dirname "$0")"
 mkdir -p logs
 
-PROC_REGEX="[p]ython3?.*Trade_db/main\.py"
+PROC_REGEX="[p]ython3?.*main\.py"
 PIDFILE="logs/trade_db.pid"
 
 # ── systemd 路径 ──────────────────────────────────────────────
@@ -18,6 +18,12 @@ if systemctl list-unit-files 2>/dev/null | grep -q ^trade_db.service; then
         echo "ℹ️  Trade_db 已在运行（systemd）。如需重启请执行 ./restart.sh 或:"
         echo "   systemctl restart trade_db.service"
         exit 0
+    fi
+    ORPHANS=$(pgrep -f "$PROC_REGEX" || true)
+    if [ -n "$ORPHANS" ]; then
+        echo "🔍 检测到游离 Trade_db 进程，先清理: $ORPHANS"
+        kill $ORPHANS 2>/dev/null || true
+        sleep 1
     fi
     echo "🚀 正在启动 trade_db.service (systemd)..."
     systemctl start trade_db.service

@@ -1178,7 +1178,17 @@ class MarketHeatMap:
         # 5. 存入长线趋势种子池
         try:
             from modules.monitor.trend_service import TrendService
-            pool_items = [{"symbol": r["symbol"], "name": r["name"], "reason": r.get("reason", "")} for r in results]
+            pool_items = []
+            for r in results:
+                reason = str(r.get("reason", "") or "").strip()
+                catalyst = str(r.get("catalyst_tags", "") or "").strip()
+                pattern = str(r.get("pattern_tag", "") or "").strip()
+                if not reason:
+                    if catalyst and pattern:
+                        reason = f"{catalyst} | {pattern}"
+                    else:
+                        reason = catalyst or pattern or ""
+                pool_items.append({"symbol": r["symbol"], "name": r["name"], "reason": reason})
             TrendService.add_to_pool(market, pool_items)
             bar_items = [
                 {

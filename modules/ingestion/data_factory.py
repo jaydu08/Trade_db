@@ -29,13 +29,23 @@ class DataManager:
 
         self.search_cache_ttl = int(os.getenv("SEARCH_CACHE_TTL", "300") or 300)
 
-        self.search_providers = [
-            DuckDuckGoProvider(),
-            SearXNGProvider(),
-            GoogleNewsRSSProvider(),
-        ]
+        enable_ddg = os.getenv("ENABLE_DDG_SEARCH", "0") == "1"
+        enable_searx = os.getenv("ENABLE_SEARXNG_SEARCH", "0") == "1"
+        enable_rss = os.getenv("ENABLE_GOOGLE_NEWS_RSS", "1") == "1"
+
+        providers = []
+        if enable_ddg:
+            providers.append(DuckDuckGoProvider())
+        if enable_searx:
+            providers.append(SearXNGProvider())
+        if enable_rss:
+            providers.append(GoogleNewsRSSProvider())
+
+        self.search_providers = providers
         self.active_search_providers = [p for p in self.search_providers if p.health_check()]
-        logger.info(f"Active search providers: {[p.provider_name for p in self.active_search_providers]}")
+        if not self.active_search_providers:
+            self.active_search_providers = [GoogleNewsRSSProvider()]
+        logger.info("Active search providers: %s", [p.provider_name for p in self.active_search_providers])
 
         self.market_providers = [
             FinnhubProvider(),

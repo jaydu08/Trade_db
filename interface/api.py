@@ -6,6 +6,7 @@ import os
 import datetime as dt
 import logging
 import time
+import threading
 from typing import Optional, List, Dict
 
 from fastapi import FastAPI, HTTPException, Depends, Query, Request
@@ -15,6 +16,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from jose import jwt, JWTError
 
+from core.cache import get_cache, set_cache
+
 logger = logging.getLogger(__name__)
 
 # --------------- Config ---------------
@@ -23,9 +26,16 @@ JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_DAYS = 365
 WEB_USERNAME = os.getenv("WEB_USERNAME", "game2du")
 WEB_PORT = int(os.getenv("WEB_PORT", "9800"))
+WEB_NEWS_CACHE_TTL_HOURS = int(os.getenv("WEB_NEWS_CACHE_TTL_HOURS", "8"))  # 6-12h recommended
+WEB_NEWS_CACHE_TTL_HOURS = max(6, min(12, WEB_NEWS_CACHE_TTL_HOURS))
+WEB_NEWS_CACHE_TTL_SEC = WEB_NEWS_CACHE_TTL_HOURS * 3600
+WEB_NEWS_AUTO_REFRESH = os.getenv("WEB_NEWS_AUTO_REFRESH", "1") in ("1", "true", "True")
+WEB_NEWS_SUMMARY_LLM = os.getenv("WEB_NEWS_SUMMARY_LLM", "1") in ("1", "true", "True")
 
 # News cache: {symbol: {"summary": str, "ts": float}}
 _news_cache: Dict[str, Dict] = {}
+_news_refreshing = set()
+_news_lock = threading.Lock()
 
 # --------------- App ---------------
 app = FastAPI(title="Trade_db Web", docs_url=None, redoc_url=None)
@@ -272,32 +282,74 @@ def _get_sina_us_close_on_date(symbol: str, target_date) -> float:
     return 0.0
 
 def _get_news_summary(symbol: str, name: str, market: str) -> str:
-    """Get cached news summary for a stock. Cache for 4 hours.
-    Returns immediately from cache; fetches in background if stale."""
-    import threading
+    """Get cached news summary for a stock.
+    双层缓存：内存 + 磁盘；刷新失败不覆盖旧值，避免前端突然空白。"""
     cache_key = f"{market}:{symbol}"
+    disk_key = f"web_news_summary:{cache_key}"
     now = time.time()
-    cached = _news_cache.get(cache_key)
-    if cached and (now - cached["ts"]) < 43200:  # 12 hours
-        return cached["summary"]
 
-    # Return old cache immediately, refresh in background
+    # 1) in-memory hot cache
+    cached = _news_cache.get(cache_key)
+    if cached and (now - float(cached.get("ts", 0))) < WEB_NEWS_CACHE_TTL_SEC:
+        return str(cached.get("summary", ""))
+
+    # 2) disk persistent cache
+    disk_cached = get_cache(disk_key)
+    if isinstance(disk_cached, dict):
+        dsum = str(disk_cached.get("summary", "") or "")
+        dts = float(disk_cached.get("ts", 0) or 0)
+        if dsum:
+            _news_cache[cache_key] = {"summary": dsum, "ts": dts or now}
+            # 命中持久缓存时直接返回，保证首屏稳定
+            if (now - dts) < WEB_NEWS_CACHE_TTL_SEC:
+                return dsum
+
+    # 3) refresh control
+    fallback_summary = str((_news_cache.get(cache_key) or {}).get("summary", "") or "")
+    if not WEB_NEWS_AUTO_REFRESH:
+        return fallback_summary or "加载中"
+
     def _refresh():
         try:
-            from modules.ingestion.data_factory import DataManager
-            factory = DataManager()
+            from modules.ingestion.data_factory import data_manager
             query = name or symbol
-            raw = factory.search(query=f"{query} 最新", limit_per_source=2, timeout=8)
+            raw = data_manager.search(query=f"{query} 最新", limit_per_source=2, timeout=8)
+
+            summary = ""
             if raw and len(raw) > 10:
-                summary = _llm_summarize_news(raw, name or symbol)
-            else:
-                summary = ""
-            _news_cache[cache_key] = {"summary": summary, "ts": time.time()}
+                if WEB_NEWS_SUMMARY_LLM:
+                    summary = _llm_summarize_news(raw, name or symbol)
+                else:
+                    # 无 LLM 时，用搜索结果首条做轻量摘要
+                    lines = [ln.strip() for ln in str(raw).split("\n") if ln.strip()]
+                    for ln in lines:
+                        if ln.startswith("【"):
+                            continue
+                        summary = ln[:30]
+                        break
+
+            summary = str(summary or "").strip()
+            prev = _news_cache.get(cache_key) or {}
+            prev_summary = str(prev.get("summary", "") or "")
+            final_summary = summary or prev_summary
+
+            if final_summary:
+                payload = {"summary": final_summary, "ts": time.time()}
+                _news_cache[cache_key] = payload
+                set_cache(disk_key, payload, ttl=WEB_NEWS_CACHE_TTL_SEC)
         except Exception as e:
             logger.debug(f"News refresh failed for {cache_key}: {e}")
+        finally:
+            with _news_lock:
+                _news_refreshing.discard(cache_key)
+
+    with _news_lock:
+        if cache_key in _news_refreshing:
+            return fallback_summary or "加载中"
+        _news_refreshing.add(cache_key)
 
     threading.Thread(target=_refresh, daemon=True).start()
-    return cached["summary"] if cached else ""
+    return fallback_summary or "加载中"
 
 
 def _llm_summarize_news(news_text: str, stock_name: str) -> str:
@@ -589,31 +641,117 @@ def trade_sell(req: SellRequest, user: str = Depends(get_current_user)):
 
 # --------------- Routes: Trend ---------------
 @app.get("/api/trend")
-def get_trend(days: int = Query(default=7, ge=3, le=30), user: str = Depends(get_current_user)):
+def get_trend(
+    days: int = Query(default=7, ge=3, le=180),
+    limit: int = Query(default=100, ge=10, le=200),
+    user: str = Depends(get_current_user),
+):
+    allowed_days = {3, 7, 14, 30, 60, 90, 180}
+    if days not in allowed_days:
+        raise HTTPException(status_code=400, detail=f"days must be one of {sorted(allowed_days)}")
+
     from modules.monitor.trend_service import TrendCalculator
+    from core.db import get_ledger_session
+    from domain.ledger.analytics import TrendSeedPool, TrendDailyBar
+    from sqlmodel import select
+
     calc = TrendCalculator()
-    raw = calc.calculate_trend(days=days)
-    # Transform to frontend-friendly format with proper field names
+    raw = calc.calculate_trend(days=days, topn_override=limit)
+
+    cutoff = dt.date.today() - dt.timedelta(days=max(30, days))
+    symbols_by_market = {}
+    for mkt, items in raw.items():
+        syms = {
+            str((item or {}).get("symbol", "") or "").strip()
+            for item in (items or [])
+            if str((item or {}).get("symbol", "") or "").strip()
+        }
+        if syms:
+            symbols_by_market[mkt] = syms
+
+    days_on_list_map = {}
+    heatmap_tag_map = {}
+
+    if symbols_by_market:
+        with get_ledger_session() as session:
+            for mkt, syms in symbols_by_market.items():
+                seed_rows = session.exec(
+                    select(TrendSeedPool.symbol, TrendSeedPool.date)
+                    .where(TrendSeedPool.market == mkt)
+                    .where(TrendSeedPool.symbol.in_(list(syms)))
+                    .where(TrendSeedPool.date >= cutoff)
+                ).all()
+
+                date_bucket = {}
+                for sym, d in seed_rows:
+                    key = (mkt, str(sym or "").strip())
+                    if not key[1]:
+                        continue
+                    date_bucket.setdefault(key, set()).add(str(d))
+                for key, dset in date_bucket.items():
+                    days_on_list_map[key] = len(dset)
+
+                bar_rows = session.exec(
+                    select(TrendDailyBar.symbol, TrendDailyBar.date, TrendDailyBar.catalyst_tags)
+                    .where(TrendDailyBar.market == mkt)
+                    .where(TrendDailyBar.symbol.in_(list(syms)))
+                    .where(TrendDailyBar.source == "heatmap")
+                    .where(TrendDailyBar.date >= cutoff)
+                    .order_by(TrendDailyBar.date.desc())
+                ).all()
+
+                for sym, _d, tag in bar_rows:
+                    tag_text = str(tag or "").strip()
+                    if not tag_text:
+                        continue
+                    key = (mkt, str(sym or "").strip())
+                    if key[1] and key not in heatmap_tag_map:
+                        heatmap_tag_map[key] = tag_text
+
     result = {}
     for mkt, items in raw.items():
         transformed = []
         for item in items:
-            # Count days on list from reason_records
+            symbol = str(item.get("symbol", "") or "").strip()
+            key = (mkt, symbol)
+
             reason_recs = item.get("reason_records", [])
-            days_on_list = len(set(d for d, _ in reason_recs)) if reason_recs else 1
+            fallback_days = len(set(str(d) for d, _ in reason_recs)) if reason_recs else 0
+            days_on_list = days_on_list_map.get(key, fallback_days if fallback_days > 0 else 1)
+
+            trend_tag = str(item.get("aggregated_reason", "") or item.get("catalyst_tags", "") or "").strip()
+            heatmap_tag = str(heatmap_tag_map.get(key, "") or "").strip()
+            if heatmap_tag and heatmap_tag not in trend_tag:
+                if (not trend_tag) or (trend_tag in {"暂无新闻催化", "Unknown", "unknown"}):
+                    catalyst_tags = heatmap_tag
+                else:
+                    catalyst_tags = f"{trend_tag} | {heatmap_tag}"
+            else:
+                catalyst_tags = trend_tag or heatmap_tag
+
+            market_cap = 0.0
+            if mkt == "CN":
+                market_cap = float(item.get("total_mv_100m", 0) or 0)
+            elif mkt == "HK":
+                market_cap = float(item.get("market_cap_100m_hkd", 0) or 0)
+            elif mkt == "US":
+                market_cap = float(item.get("market_cap_musd", 0) or 0) / 100.0
+
             transformed.append({
-                "symbol": item.get("symbol", ""),
+                "symbol": symbol,
                 "name": item.get("name", ""),
                 "price": item.get("current_price", 0),
                 "return_pct": item.get("return_pct", 0),
                 "trend_score": item.get("trend_score", 0),
-                "catalyst_tags": item.get("aggregated_reason", "") or item.get("catalyst_tags", ""),
+                "catalyst_tags": catalyst_tags,
                 "days_on_list": days_on_list,
                 "signal_strength": item.get("signal_strength", 0),
                 "mcap_mult": item.get("mcap_mult", 1.0),
+                "price_date": item.get("price_date", ""),
+                "market_cap": market_cap,
             })
         result[mkt] = transformed
-    return {"days": days, "markets": result}
+    return {"days": days, "limit": limit, "markets": result}
 
 # --------------- Routes: Heatmap ---------------
 @app.get("/api/heatmap")

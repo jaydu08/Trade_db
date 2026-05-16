@@ -128,7 +128,7 @@ watch(activeMarket, fetchHeatmap)
       <el-table-column label="市值" width="90">
         <template #default="{ row }">{{ formatCap(row.market_cap) }}</template>
       </el-table-column>
-      <el-table-column label="马甲" min-width="180">
+      <el-table-column label="催化标签" min-width="180">
         <template #default="{ row }">
           <span class="catalyst-text">{{ row.catalyst_tags || '-' }}</span>
         </template>

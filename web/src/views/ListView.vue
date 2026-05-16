@@ -143,6 +143,27 @@ async function handleDelete(item: WatchItem) {
   } catch {}
 }
 
+function splitTags(raw: string): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  String(raw || '').split(',').forEach((x) => {
+    const t = x.trim()
+    if (!t) return
+    if (seen.has(t)) return
+    seen.add(t)
+    out.push(t)
+  })
+  return out
+}
+
+function joinTags(tags: string[]): string {
+  return splitTags(tags.join(',')).join(',')
+}
+
+function mergeTag(raw: string, tag: string): string {
+  return joinTags([...splitTags(raw), tag])
+}
+
 async function handleTagSave(item: WatchItem, newTags: string) {
   try {
     await api.patch(`/watchlist/${encodeURIComponent(item.key)}/tags`, { tags: newTags })
@@ -160,16 +181,48 @@ function startEditTag(item: WatchItem) {
   editTagValue.value = item.tags || ''
 }
 
-function saveTag(item: WatchItem) {
-  handleTagSave(item, editTagValue.value)
+async function saveTag(item: WatchItem) {
+  const normalized = joinTags(splitTags(editTagValue.value))
+  editTagValue.value = normalized
+  await handleTagSave(item, normalized)
   editingTag.value = null
 }
 
-function addExistingTag(tag: string) {
-  if (editTagValue.value) {
-    editTagValue.value += ',' + tag
-  } else {
-    editTagValue.value = tag
+function addExistingTag(item: WatchItem, tag: string) {
+  const merged = mergeTag(editTagValue.value, tag)
+  editTagValue.value = merged
+  item.tags = merged
+  handleTagSave(item, merged)
+}
+
+function removeTag(item: WatchItem, tag: string) {
+  const next = splitTags(item.tags).filter((t) => t !== tag).join(',')
+  item.tags = next
+  handleTagSave(item, next)
+}
+
+function tagStyle(tag: string) {
+  const palettes = [
+    { bg: '#EFF7FF', bd: '#B9DAFF', fg: '#155AA8' },
+    { bg: '#F1FAF3', bd: '#BDE5C5', fg: '#1F7A39' },
+    { bg: '#FFF6EC', bd: '#F7D8B5', fg: '#9A5C1B' },
+    { bg: '#F7F2FF', bd: '#D9C7FF', fg: '#6B3EC6' },
+    { bg: '#FFF1F3', bd: '#F6C0CB', fg: '#A03356' },
+    { bg: '#F2F5F9', bd: '#CAD6E6', fg: '#3A536B' },
+    { bg: '#EEF9F8', bd: '#BFE8E3', fg: '#0F6D65' },
+    { bg: '#FAF6EC', bd: '#E8D7B2', fg: '#7C5A17' },
+  ]
+
+  const text = String(tag || '').trim()
+  let hash = 0
+  for (let i = 0; i < text.length; i++) {
+    hash = (hash * 31 + text.charCodeAt(i)) >>> 0
+  }
+  const c = palettes[hash % palettes.length]
+  return {
+    background: c.bg,
+    border: `1px solid ${c.bd}`,
+    color: c.fg,
   }
 }
 
@@ -243,16 +296,16 @@ onMounted(fetchList)
             <th class="sortable" @click="toggleSort('added_at')">日期 <span class="sort-icon">{{ sortIcon('added_at') }}</span></th>
             <th>代码</th>
             <th>名称</th>
-            <th class="sortable" @click="toggleSort('market')">市场 <span class="sort-icon">{{ sortIcon('market') }}</span></th>
-            <th class="num sortable" @click="toggleSort('price')">现价 <span class="sort-icon">{{ sortIcon('price') }}</span></th>
+            <th class="market-col sortable" @click="toggleSort('market')">市场 <span class="sort-icon">{{ sortIcon('market') }}</span></th>
+            <th class="num price-col sortable" @click="toggleSort('price')">现价 <span class="sort-icon">{{ sortIcon('price') }}</span></th>
             <th class="num sortable" @click="toggleSort('day_change')">当日涨幅 <span class="sort-icon">{{ sortIcon('day_change') }}</span></th>
             <th class="num sortable" @click="toggleSort('total_change')">至今涨幅 <span class="sort-icon">{{ sortIcon('total_change') }}</span></th>
             <th class="num sortable" @click="toggleSort('max_drawdown')">最大回撤 <span class="sort-icon">{{ sortIcon('max_drawdown') }}</span></th>
             <th class="num sortable" @click="toggleSort('amount')">成交额 <span class="sort-icon">{{ sortIcon('amount') }}</span></th>
             <th class="num sortable" @click="toggleSort('market_cap')">市值/流通 <span class="sort-icon">{{ sortIcon('market_cap') }}</span></th>
-            <th class="sortable" @click="toggleSort('rating')">评分 <span class="sort-icon">{{ sortIcon('rating') }}</span></th>
             <th>赛道题材</th>
-            <th>最新新闻</th>
+            <th class="news-col">最新新闻</th>
+            <th class="sortable" @click="toggleSort('rating')">评分 <span class="sort-icon">{{ sortIcon('rating') }}</span></th>
             <th>操作</th>
           </tr>
         </thead>
@@ -261,8 +314,8 @@ onMounted(fetchList)
             <td class="date-cell">{{ formatDate(row.added_at) }}</td>
             <td class="code-cell">{{ row.symbol }}</td>
             <td class="name-cell">{{ row.name || '-' }}</td>
-            <td><span class="market-tag" :style="{ color: marketColor(row.market) }">{{ row.market }}</span></td>
-            <td class="num">{{ row.price ? row.price.toFixed(2) : '-' }}</td>
+            <td class="market-col"><span class="market-tag" :style="{ color: marketColor(row.market) }">{{ row.market }}</span></td>
+            <td class="num price-col">{{ row.price ? row.price.toFixed(2) : '-' }}</td>
             <td class="num">
               <span :class="pctClass(row.day_change)">
                 {{ row.day_change ? (row.day_change > 0 ? '+' : '') + row.day_change.toFixed(2) + '%' : '-' }}
@@ -278,25 +331,25 @@ onMounted(fetchList)
             </td>
             <td class="num">{{ formatAmount(row.amount) }}</td>
             <td class="num cap-cell">{{ formatCap(row.market_cap, row.float_cap) }}</td>
-            <td class="rating-cell">
-              <span v-for="s in 5" :key="s" class="star" :class="{ filled: s <= (row.rating || 0) }" @click="setRating(row, s)">★</span>
-            </td>
             <td class="tag-cell">
               <div v-if="editingTag === row.key" class="tag-edit">
                 <input v-model="editTagValue" class="tag-input" @keyup.enter="saveTag(row)" @blur="saveTag(row)" autofocus />
                 <div v-if="allTags.length" class="tag-suggest">
-                  <span v-for="t in allTags" :key="t" class="tag-chip" @mousedown.prevent="addExistingTag(t)">{{ t }}</span>
+                  <span v-for="t in allTags" :key="t" class="tag-chip" :style="tagStyle(t)" @click="addExistingTag(row, t)">{{ t }}</span>
                 </div>
               </div>
               <div v-else class="tag-display" @click="startEditTag(row)">
                 <span v-if="row.tags" class="tag-badges">
-                  <span v-for="t in row.tags.split(',')" :key="t" class="tag-badge">{{ t.trim() }}</span>
+                  <span v-for="t in row.tags.split(',')" :key="t" class="tag-badge" :style="tagStyle(t.trim())">{{ t.trim() }}<button class="tag-remove" @click.stop="removeTag(row, t.trim())">×</button></span>
                 </span>
                 <span v-else class="tag-placeholder">+</span>
               </div>
             </td>
-            <td class="news-cell">
+            <td class="news-cell news-col">
               <span class="news-text">{{ row.news_summary || '-' }}</span>
+            </td>
+            <td class="rating-cell">
+              <span v-for="s in 5" :key="s" class="star" :class="{ filled: s <= (row.rating || 0) }" @click="setRating(row, s)">★</span>
             </td>
             <td>
               <button class="del-btn" @click="handleDelete(row)">删除</button>
@@ -373,17 +426,22 @@ onMounted(fetchList)
 .name-cell { max-width: 72px; overflow: hidden; text-overflow: ellipsis; }
 .cap-cell { font-size: 11px; }
 .market-tag { font-size: 11px; font-weight: 600; letter-spacing: -0.5px; }
+.market-col { width: 46px; min-width: 46px; }
+.price-col { width: 72px; min-width: 72px; }
+.news-col { min-width: 220px; max-width: 320px; }
 .tag-cell { min-width: 60px; max-width: 160px; }
 .tag-display { cursor: pointer; display: flex; flex-wrap: wrap; gap: 2px; align-items: center; min-height: 20px; }
 .tag-badges { display: flex; flex-wrap: wrap; gap: 2px; }
-.tag-badge { font-size: 10px; background: var(--bg-hover, #F7F6F3); padding: 1px 5px; border-radius: 3px; color: var(--text, #37352F); }
+.tag-badge { font-size: 10px; padding: 1px 6px; border-radius: 10px; color: var(--text, #37352F); line-height: 1.4; display: inline-flex; align-items: center; gap: 4px; }
+.tag-remove { font-size: 10px; line-height: 1; color: inherit; opacity: 0.55; border: none; background: transparent; padding: 0; cursor: pointer; }
+.tag-remove:hover { opacity: 1; }
 .tag-placeholder { font-size: 11px; color: var(--text-secondary, #787774); opacity: 0.3; }
 .tag-edit { position: relative; }
 .tag-input { width: 110px; padding: 2px 5px; border: 1px solid var(--accent, #2F80ED); border-radius: 4px; font-size: 11px; outline: none; }
 .tag-suggest { position: absolute; top: 24px; left: 0; background: #fff; border: 1px solid var(--border, #E9E9E7); border-radius: 6px; padding: 4px; z-index: 10; display: flex; flex-wrap: wrap; gap: 3px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
-.tag-chip { font-size: 10px; padding: 2px 6px; border-radius: 4px; background: #F0EFED; cursor: pointer; }
-.tag-chip:hover { background: #E3E2E0; }
-.news-cell { max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
+.tag-chip { font-size: 10px; padding: 2px 6px; border-radius: 10px; cursor: pointer; user-select: none; }
+.tag-chip:hover { transform: translateY(-1px); filter: saturate(1.06); }
+.news-cell { min-width: 240px; max-width: 360px; overflow: hidden; text-overflow: ellipsis; }
 .news-text { font-size: 11px; color: var(--text-secondary, #787774); }
 .del-btn { font-size: 11px; color: var(--text-secondary, #787774); padding: 1px 4px; border-radius: 3px; border: none; background: none; cursor: pointer; }
 .del-btn:hover { color: var(--red, #EB5757); background: #FEF1F1; }
