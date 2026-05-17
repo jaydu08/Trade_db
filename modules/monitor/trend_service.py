@@ -30,6 +30,158 @@ class TrendService:
     POOL_SYMBOL_CAPS = {"CN": 100, "US": 100, "HK": 50, "CF": 30}
     TREND_MAX_SYMBOLS_PER_MARKET = int(os.getenv("TREND_MAX_SYMBOLS_PER_MARKET", "60") or 60)
 
+    BASELINE_SEEDS = {
+        "US": "NVDA:NVIDIA,AAPL:Apple,MSFT:Microsoft,AMZN:Amazon,GOOGL:Alphabet,META:Meta,TSLA:Tesla,AMD:AMD,AVGO:Broadcom,LLY:Eli Lilly,JPM:JPMorgan,UNH:UnitedHealth",
+        "HK": "00700:腾讯控股,09988:阿里巴巴-W,03690:美团-W,01211:比亚迪股份,09868:小鹏汽车-W,09618:京东集团-SW,01810:小米集团-W,00388:香港交易所,02318:中国平安,00941:中国移动",
+        "CN": "600519:贵州茅台,300750:宁德时代,601318:中国平安,600036:招商银行,000858:五粮液,002594:比亚迪,688981:中芯国际,601012:隆基绿能,000333:美的集团,600276:恒瑞医药",
+    }
+
+    @staticmethod
+    def _parse_seed_specs(raw: str, market: str, reason: str) -> List[Dict]:
+        out: List[Dict] = []
+        for part in str(raw or "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" in part:
+                sym, name = part.split(":", 1)
+            else:
+                sym, name = part, ""
+            sym = sym.strip()
+            if not sym:
+                continue
+            out.append({"symbol": sym, "name": name.strip(), "reason": reason})
+        return out
+
+    @staticmethod
+    def _baseline_seed_items() -> Dict[str, List[Dict]]:
+        if str(os.getenv("ENABLE_TREND_BASELINE_SEEDS", "1")).strip().lower() not in {"1", "true", "yes", "on"}:
+            return {}
+        result: Dict[str, List[Dict]] = {}
+        for market, default_raw in TrendService.BASELINE_SEEDS.items():
+            raw = os.getenv(f"TREND_BASELINE_{market}", default_raw)
+            items = TrendService._parse_seed_specs(raw, market, "大票趋势基线")
+            if items:
+                result[market] = items
+        return result
+
+    @staticmethod
+    def _watchlist_seed_items() -> Dict[str, List[Dict]]:
+        result: Dict[str, List[Dict]] = {}
+        try:
+            from modules.monitor.repository import WatchlistRepository
+            data = WatchlistRepository().load_all()
+            for item in (data or {}).values():
+                if not item or not item.get("is_active", True):
+                    continue
+                market = str(item.get("market", "") or "").strip().upper()
+                sym = str(item.get("symbol", "") or "").strip()
+                if market not in {"CN", "HK", "US", "CF"} or not sym:
+                    continue
+                result.setdefault(market, []).append({
+                    "symbol": sym,
+                    "name": str(item.get("name", "") or ""),
+                    "reason": "自选观察",
+                })
+        except Exception as e:
+            logger.debug("Collect watchlist trend seeds failed: %s", e)
+        return result
+
+    @staticmethod
+    def _paper_trade_seed_items() -> Dict[str, List[Dict]]:
+        result: Dict[str, List[Dict]] = {}
+        try:
+            from domain.ledger.paper_trade import PaperTrade
+            with get_ledger_session() as session:
+                rows = session.exec(select(PaperTrade).where(PaperTrade.status == "ACTIVE")).all()
+            for r in rows:
+                market = str(r.market or "").strip().upper()
+                sym = str(r.symbol or "").strip()
+                if market not in {"CN", "HK", "US", "CF"} or not sym:
+                    continue
+                result.setdefault(market, []).append({
+                    "symbol": sym,
+                    "name": str(r.name or ""),
+                    "reason": "模拟持仓",
+                })
+        except Exception as e:
+            logger.debug("Collect paper trade trend seeds failed: %s", e)
+        return result
+
+    @staticmethod
+    def _daily_rank_seed_items(lookback_days: int = 3) -> Dict[str, List[Dict]]:
+        result: Dict[str, List[Dict]] = {}
+        if str(os.getenv("ENABLE_TREND_DAILY_RANK_SEEDS", "1")).strip().lower() not in {"1", "true", "yes", "on"}:
+            return result
+        cutoff = dt.date.today() - dt.timedelta(days=max(1, int(lookback_days or 1)))
+        max_per_market = int(os.getenv("TREND_DAILY_RANK_SEED_MAX", "30") or 30)
+        with get_ledger_session() as session:
+            for market in ["CN", "HK", "US"]:
+                rows = session.exec(
+                    select(DailyRank)
+                    .where(DailyRank.market == market)
+                    .where(DailyRank.date >= cutoff)
+                    .order_by(DailyRank.amount.desc(), DailyRank.change_pct.desc())
+                    .limit(max_per_market * 4)
+                ).all()
+                picked = 0
+                seen = set()
+                for r in rows:
+                    sym = str(r.symbol or "").strip()
+                    if not sym or sym in seen:
+                        continue
+                    seen.add(sym)
+                    pct = float(r.change_pct or 0)
+                    amt = float(r.amount or 0)
+                    if market == "CN" and (amt < float(os.getenv("CN_HARD_AMOUNT_MIN", "200000000") or 200000000) or pct < float(os.getenv("TREND_DAILY_RANK_CN_PCT_MIN", "1.5") or 1.5)):
+                        continue
+                    if market == "HK" and (amt < float(os.getenv("HK_HARD_AMOUNT_MIN", "250000000") or 250000000) or pct < float(os.getenv("TREND_DAILY_RANK_HK_PCT_MIN", "3.0") or 3.0)):
+                        continue
+                    if market == "US":
+                        if TrendCalculator._is_leveraged_like(f"{sym} {str(r.name or '')}"):
+                            continue
+                        if amt < float(os.getenv("TREND_SECONDARY_US_AMOUNT_MIN", "20000000") or 20000000) or pct < float(os.getenv("TREND_DAILY_RANK_US_PCT_MIN", "3.0") or 3.0):
+                            continue
+                    result.setdefault(market, []).append({
+                        "symbol": sym,
+                        "name": str(r.name or ""),
+                        "reason": f"DailyRank高流动性异动 {pct:+.1f}%",
+                    })
+                    picked += 1
+                    if picked >= max_per_market:
+                        break
+        return result
+
+    @staticmethod
+    def refresh_seed_pool_from_sources() -> Dict[str, Dict[str, int]]:
+        """低频扩展 TrendSeedPool：自选/持仓、DailyRank、本地大票基线。"""
+        by_market: Dict[str, List[Dict]] = {}
+        sources = [
+            TrendService._baseline_seed_items(),
+            TrendService._watchlist_seed_items(),
+            TrendService._paper_trade_seed_items(),
+            TrendService._daily_rank_seed_items(int(os.getenv("TREND_SEED_RANK_LOOKBACK_DAYS", "3") or 3)),
+        ]
+        for src in sources:
+            for market, items in (src or {}).items():
+                by_market.setdefault(market, []).extend(items or [])
+
+        summary: Dict[str, Dict[str, int]] = {}
+        for market, items in by_market.items():
+            seen = set()
+            deduped = []
+            for item in items:
+                sym = str(item.get("symbol", "") or "").strip()
+                if not sym or sym in seen:
+                    continue
+                seen.add(sym)
+                deduped.append(item)
+            if deduped:
+                TrendService.add_to_pool(market, deduped)
+            summary[market] = {"candidates": len(items), "saved_or_seen": len(deduped)}
+        logger.info("Trend seed pool multi-source refresh finished: %s", summary)
+        return summary
+
     @staticmethod
     def _enforce_pool_symbol_cap(session, market: str):
         """按市场限制 trend 种子池标的数量，优先保留最近出现的标的。"""
@@ -1045,16 +1197,26 @@ class TrendCalculator:
     def _is_leveraged_like(name: str) -> bool:
         text = str(name or "")
         low = text.lower()
+        leveraged_tickers = {
+            "NVDL", "NVDS", "NVDU", "TSLL", "TSLS", "MSTX", "MSTZ", "MUU",
+            "SOXL", "SOXS", "TQQQ", "SQQQ", "SPXL", "SPXS", "LABU", "LABD",
+            "FNGU", "FNGD", "TECL", "TECS", "WEBL", "WEBS", "YINN", "YANG",
+            "CONL", "AAPU", "AAPD", "GGLL", "GGLS", "AMDL", "AMDS",
+            "BABX", "MSTU", "TSDD", "TSLQ", "NOWL", "TSLT", "TSLZ",
+        }
+        import re as _re
+        tokens = {x for x in _re.split(r"[^A-Za-z0-9]+", text.upper()) if x}
+        if tokens & leveraged_tickers:
+            return True
         if any(k in low for k in ["2x", "3x", "1.5x", "bull", "bear", "leveraged", "inverse"]):
             return True
-        import re as _re
         return bool(_re.search(r"\d[\d.]*[xX]\s+(?:long|short|bull|bear)", text))
 
     @staticmethod
     def _augment_with_secondary_candidates(items: List[Dict], days: int) -> List[Dict]:
         """Dual-channel补漏：在主候选外补充DailyRank高流动性候选。"""
         enabled = str(os.getenv("ENABLE_TREND_SECONDARY_POOL", "1")).strip().lower() in {"1", "true", "yes", "on"}
-        if (not enabled) or (not items):
+        if not enabled:
             return items
 
         fetch_n = max(5, int(os.getenv("TREND_SECONDARY_FETCH_N", "20") or 20))
@@ -1069,9 +1231,6 @@ class TrendCalculator:
 
         with get_ledger_session() as session:
             for market in ["CN", "HK", "US"]:
-                if market not in by_market:
-                    continue
-
                 rows = session.exec(
                     select(DailyRank)
                     .where(DailyRank.market == market)
@@ -1121,7 +1280,7 @@ class TrendCalculator:
                             floor = float(os.getenv("US_HARD_MCAP_MUSD_MIN", "1000") or 1000)
                             if cap > 0 and cap < floor:
                                 continue
-                            if cap <= 0 and TrendCalculator._is_leveraged_like(getattr(r, "name", "")):
+                            if cap <= 0 and TrendCalculator._is_leveraged_like(f"{sym} {getattr(r, 'name', '')}"):
                                 continue
                         except Exception:
                             pass
@@ -1170,10 +1329,7 @@ class TrendCalculator:
                 for r in rows
             ]
             
-        if not records:
-            return {}
-            
-        # 2. 按市场和代码去重合并理由
+        # 2. 按市场和代码去重合并理由；无 heatmap 种子时仍允许 DailyRank 二级池补漏
         grouped = defaultdict(dict)
         for r in records:
             key = (r["market"], r["symbol"])
@@ -1244,6 +1400,11 @@ class TrendCalculator:
                         mcap_mult = 1.05
                     item["total_mv_100m"] = total_mv
                 elif market == "US":
+                    if TrendCalculator._is_leveraged_like(f"{item.get('symbol', '')} {item.get('name', '')}"):
+                        item["market_cap_musd"] = 0.0
+                        item["trend_score"] = 0.0
+                        item["mcap_mult"] = 1.0
+                        return item
                     metrics = get_us_market_metrics(str(item.get("symbol", "")).split(".")[-1].strip())
                     cap_musd = float((metrics or {}).get("market_cap_musd", 0) or 0)
                     if cap_musd >= 300000:   # ≥3000亿美元

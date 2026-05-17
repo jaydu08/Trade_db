@@ -242,6 +242,24 @@ class TaskScheduler:
             replace_existing=True
         )
 
+        # 13.6 机构筹码低频缓存：SEC 13F 只在新季度数据出现时下载，HK CCASS 每日刷新汇总缓存
+        self.scheduler.add_job(
+            self._job_institutional_cache_refresh,
+            CronTrigger(hour=3, minute=30),
+            id="institutional_cache_refresh",
+            name="机构筹码低频缓存",
+            replace_existing=True
+        )
+
+        # 13.7 Trend 多源种子池刷新：自选/持仓、DailyRank、大票基线
+        self.scheduler.add_job(
+            self._job_trend_seed_pool_refresh,
+            CronTrigger(hour=3, minute=45),
+            id="trend_seed_pool_refresh",
+            name="Trend多源种子池刷新",
+            replace_existing=True
+        )
+
         # 14. 模拟交易到期检查 (每天 19:20 扫一波)
         self.scheduler.add_job(
             self._job_paper_trade_check,
@@ -497,6 +515,22 @@ class TaskScheduler:
         """Job: 每日榜单同步（US）"""
         from modules.monitor.daily_rank_service import DailyRankService
         self._run_job("daily_rank_us", DailyRankService.sync_daily_ranks, ["US"])
+
+    def _job_institutional_cache_refresh(self):
+        # Job: 机构筹码低频缓存（SEC 13F / HK CCASS）。
+        def _execute():
+            from modules.ingestion.institutional_factor import refresh_hk_ccass_cache, refresh_us_sec13f_cache
+            return {
+                "sec13f": refresh_us_sec13f_cache(force=False, max_periods=2),
+                "hk_ccass": refresh_hk_ccass_cache(force=False),
+            }
+
+        self._run_job("institutional_cache_refresh", _execute)
+
+    def _job_trend_seed_pool_refresh(self):
+        """Job: Trend 多源种子池刷新。"""
+        from modules.monitor.trend_service import TrendService
+        self._run_job("trend_seed_pool_refresh", TrendService.refresh_seed_pool_from_sources)
 
     def _job_ipo_tomorrow(self):
         """Job: 明日新股预告"""

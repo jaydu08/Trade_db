@@ -72,3 +72,5 @@ logs/
 Thumbs.db
 .qoder/
 web/node_modules/
+data/institutional/
+*.log.*

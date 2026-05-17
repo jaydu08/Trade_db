@@ -651,6 +651,7 @@ def get_trend(
         raise HTTPException(status_code=400, detail=f"days must be one of {sorted(allowed_days)}")
 
     from modules.monitor.trend_service import TrendCalculator
+    from modules.ingestion.institutional_factor import get_institutional_change_map
     from core.db import get_ledger_session
     from domain.ledger.analytics import TrendSeedPool, TrendDailyBar
     from sqlmodel import select
@@ -711,6 +712,17 @@ def get_trend(
     result = {}
     for mkt, items in raw.items():
         transformed = []
+
+        inst_symbols = [
+            str((it or {}).get("symbol", "") or "").strip()
+            for it in (items or [])
+            if str((it or {}).get("symbol", "") or "").strip()
+        ]
+        inst_map = {}
+        try:
+            inst_map = get_institutional_change_map(mkt, inst_symbols)
+        except Exception as e:
+            logger.debug(f"Trend inst factor failed: market={mkt} err={e}")
         for item in items:
             symbol = str(item.get("symbol", "") or "").strip()
             key = (mkt, symbol)
@@ -737,6 +749,11 @@ def get_trend(
             elif mkt == "US":
                 market_cap = float(item.get("market_cap_musd", 0) or 0) / 100.0
 
+            inst_payload = inst_map.get(symbol, {}) or {}
+            capital_signal = inst_payload.get("capital_signal")
+            if not isinstance(capital_signal, dict):
+                capital_signal = {"score": 0.0, "items": []}
+
             transformed.append({
                 "symbol": symbol,
                 "name": item.get("name", ""),
@@ -749,9 +766,345 @@ def get_trend(
                 "mcap_mult": item.get("mcap_mult", 1.0),
                 "price_date": item.get("price_date", ""),
                 "market_cap": market_cap,
+                "inst_factor": float(inst_payload.get("inst_factor", 0) or 0),
+                "inst_label": str(inst_payload.get("inst_label", "") or ""),
+                "inst_change_pp": float(inst_payload.get("inst_change_pp", 0) or 0),
+                "inst_delta_abs": float(inst_payload.get("inst_delta_abs", inst_payload.get("inst_change_pp", 0)) or 0),
+                "inst_delta_pct": float(inst_payload.get("inst_delta_pct", 0) or 0),
+                "inst_start_value": float(inst_payload.get("inst_start_value", 0) or 0),
+                "inst_end_value": float(inst_payload.get("inst_end_value", 0) or 0),
+                "inst_start_date": str(inst_payload.get("inst_start_date", "") or ""),
+                "inst_end_date": str(inst_payload.get("inst_end_date", inst_payload.get("inst_date", "")) or ""),
+                "inst_metric_unit": str(inst_payload.get("inst_metric_unit", "percentage_point") or "percentage_point"),
+                "inst_date": str(inst_payload.get("inst_date", "") or ""),
+                "inst_source": str(inst_payload.get("inst_source", "") or ""),
+                "inst_text": str(inst_payload.get("inst_text", "") or ""),
+                "inst_direction": str(inst_payload.get("inst_direction", "") or ""),
+                "inst_holding": inst_payload.get("inst_holding", {}) or {},
+                "capital_signal": capital_signal,
+                "capital_signal_items": capital_signal.get("items", []) or [],
+                "capital_signal_score": float(capital_signal.get("score", 0) or 0),
+                "capital_signal_coverage": inst_payload.get("capital_signal_coverage", {}) or {},
             })
         result[mkt] = transformed
     return {"days": days, "limit": limit, "markets": result}
+
+
+@app.get("/api/trend/slow")
+def get_slow_trend(
+    limit: int = Query(default=100, ge=10, le=200),
+    user: str = Depends(get_current_user),
+):
+    """慢趋势机构票 demo：复用现有 trend 候选池，单独做高门槛过滤，不触发推送。"""
+    cache_key = f"api_trend_slow_demo_v2_{limit}"
+    cached = get_cache(cache_key)
+    if cached:
+        return cached
+
+    from modules.monitor.trend_service import TrendCalculator
+    from modules.ingestion.institutional_factor import get_institutional_change_map
+    from core.db import get_ledger_session
+    from domain.ledger.analytics import TrendDailyBar, DailyRank
+    from sqlmodel import select
+    import math
+
+    def _env_float(name: str, default: float) -> float:
+        try:
+            raw = os.getenv(name, "")
+            return float(raw) if str(raw).strip() else float(default)
+        except Exception:
+            return float(default)
+
+    def _display_symbol(symbol: str, market: str) -> str:
+        sym = str(symbol or "").strip()
+        if market == "US" and "." in sym:
+            return sym.split(".")[-1].strip()
+        return sym
+
+    def _symbol_candidates(symbol: str, market: str) -> List[str]:
+        raw = str(symbol or "").strip()
+        if not raw:
+            return []
+        out = [raw]
+        if market == "US":
+            ticker = raw.split(".")[-1].strip() if "." in raw else raw
+            out.extend([ticker, f"105.{ticker}", f"106.{ticker}", f"107.{ticker}"])
+        seen = set()
+        deduped = []
+        for s in out:
+            if s and s not in seen:
+                deduped.append(s)
+                seen.add(s)
+        return deduped
+
+    def _latest_amount(symbol: str, market: str) -> float:
+        candidates = _symbol_candidates(symbol, market)
+        if not candidates:
+            return 0.0
+        cutoff = dt.date.today() - dt.timedelta(days=30)
+        amount = 0.0
+        with get_ledger_session() as session:
+            bar_rows = session.exec(
+                select(TrendDailyBar.amount)
+                .where(TrendDailyBar.market == market)
+                .where(TrendDailyBar.symbol.in_(candidates))
+                .where(TrendDailyBar.date >= cutoff)
+                .order_by(TrendDailyBar.date.desc())
+                .limit(5)
+            ).all()
+            for v in bar_rows:
+                try:
+                    amount = max(amount, float(v or 0))
+                except Exception:
+                    pass
+            if market != "CF":
+                rank_rows = session.exec(
+                    select(DailyRank.amount)
+                    .where(DailyRank.market == market)
+                    .where(DailyRank.symbol.in_(candidates))
+                    .where(DailyRank.date >= cutoff)
+                    .order_by(DailyRank.date.desc())
+                    .limit(5)
+                ).all()
+                for v in rank_rows:
+                    try:
+                        amount = max(amount, float(v or 0))
+                    except Exception:
+                        pass
+        return amount
+
+    def _local_series(symbol: str, market: str) -> List[Dict]:
+        candidates = _symbol_candidates(symbol, market)
+        if not candidates:
+            return []
+        cutoff = dt.date.today() - dt.timedelta(days=130)
+        points = {}
+
+        def _upsert(d, close, amount=0.0):
+            try:
+                c = float(close or 0)
+                if not d or c <= 0:
+                    return
+                amt = float(amount or 0)
+            except Exception:
+                return
+            cur = points.get(d) or {"date": d, "close": c, "amount": 0.0}
+            cur["close"] = c
+            if amt > float(cur.get("amount", 0) or 0):
+                cur["amount"] = amt
+            points[d] = cur
+
+        with get_ledger_session() as session:
+            bar_rows = session.exec(
+                select(TrendDailyBar.date, TrendDailyBar.close, TrendDailyBar.amount)
+                .where(TrendDailyBar.market == market)
+                .where(TrendDailyBar.symbol.in_(candidates))
+                .where(TrendDailyBar.date >= cutoff)
+                .order_by(TrendDailyBar.date.desc())
+                .limit(130)
+            ).all()
+            for d, close, amount in bar_rows:
+                _upsert(d, close, amount)
+            if market != "CF":
+                rank_rows = session.exec(
+                    select(DailyRank.date, DailyRank.price, DailyRank.amount)
+                    .where(DailyRank.market == market)
+                    .where(DailyRank.symbol.in_(candidates))
+                    .where(DailyRank.date >= cutoff)
+                    .order_by(DailyRank.date.desc())
+                    .limit(130)
+                ).all()
+                for d, close, amount in rank_rows:
+                    _upsert(d, close, amount)
+        return sorted(points.values(), key=lambda x: x["date"])
+
+    def _series_return(series: List[Dict], days: int):
+        if not series:
+            return 0.0, 0.0, ""
+        cur = series[-1]
+        cur_date = cur["date"]
+        cur_price = float(cur.get("close", 0) or 0)
+        target = cur_date - dt.timedelta(days=days)
+        past = None
+        for p in series:
+            if p["date"] <= target:
+                past = p
+            else:
+                break
+        past = past or series[0]
+        past_price = float(past.get("close", 0) or 0)
+        if cur_price <= 0 or past_price <= 0:
+            return 0.0, cur_price, str(cur_date)
+        return round((cur_price - past_price) / past_price * 100, 2), round(cur_price, 4), str(cur_date)
+
+    min20 = _env_float("SLOW_TREND_RETURN_20D_MIN", 12.0)
+    min60 = _env_float("SLOW_TREND_RETURN_60D_MIN", 30.0)
+    amount_floor = {
+        "CN": _env_float("SLOW_TREND_CN_AMOUNT_MIN", 1_000_000_000.0),
+        "HK": _env_float("SLOW_TREND_HK_AMOUNT_MIN", 500_000_000.0),
+        "US": _env_float("SLOW_TREND_US_AMOUNT_MIN", 200_000_000.0),
+    }
+    cap_floor = {
+        "CN": _env_float("SLOW_TREND_CN_MCAP_MIN_100M", 800.0),
+        "HK": _env_float("SLOW_TREND_HK_MCAP_MIN_100M_HKD", 1500.0),
+        "US": _env_float("SLOW_TREND_US_MCAP_MIN_MUSD", 50_000.0),
+    }
+    hk_price_min = _env_float("SLOW_TREND_HK_PRICE_MIN", 5.0)
+    ma_gap_min = _env_float("SLOW_TREND_MA_GAP_MIN", 2.0)
+    high_gap_min = _env_float("SLOW_TREND_HIGH_GAP_MIN", -12.0)
+
+    calc = TrendCalculator()
+    raw = calc.calculate_trend(days=60, topn_override=200)
+    filtered = {}
+
+    for mkt, items in raw.items():
+        if mkt not in {"CN", "HK", "US"}:
+            continue
+        rows = []
+        for item in items or []:
+            symbol = str(item.get("symbol", "") or "").strip()
+            if not symbol:
+                continue
+            display_symbol = _display_symbol(symbol, mkt)
+            series = _local_series(symbol, mkt)
+            if len(series) < 30 or (series[-1]["date"] - series[0]["date"]).days < 45:
+                continue
+            ret20, current_price, price_date = _series_return(series, 20)
+            ret60, _, _ = _series_return(series, 60)
+            if ret60 < min60 or ret20 < min20:
+                continue
+            if mkt == "HK" and current_price < hk_price_min:
+                continue
+
+            closes = [float(p.get("close", 0) or 0) for p in series if float(p.get("close", 0) or 0) > 0]
+            if len(closes) < 30:
+                continue
+            ma20 = sum(closes[-20:]) / min(20, len(closes))
+            ma60_window = closes[-60:] if len(closes) >= 60 else closes
+            ma60 = sum(ma60_window) / len(ma60_window)
+            ma_gap_pct = (ma20 / ma60 - 1.0) * 100 if ma60 > 0 else 0.0
+            high60 = max(ma60_window)
+            high_gap_pct = (current_price / high60 - 1.0) * 100 if high60 > 0 else 0.0
+            if ma_gap_pct < ma_gap_min or current_price < ma20 or high_gap_pct < high_gap_min:
+                continue
+
+            if mkt == "CN":
+                cap_value = float(item.get("total_mv_100m", 0) or 0)
+                market_cap = cap_value
+            elif mkt == "HK":
+                cap_value = float(item.get("market_cap_100m_hkd", 0) or 0)
+                market_cap = cap_value
+            else:
+                cap_value = float(item.get("market_cap_musd", 0) or 0)
+                market_cap = cap_value / 100.0
+            if cap_value <= 0 or cap_value < cap_floor.get(mkt, 0):
+                continue
+
+            amount = max(_latest_amount(symbol, mkt), float(series[-1].get("amount", 0) or 0))
+            if amount < amount_floor.get(mkt, 0):
+                continue
+
+            amount_score = math.log10(max(1.0, amount / max(1.0, amount_floor[mkt]))) * 6.0
+            cap_score = math.log10(max(1.0, cap_value / max(1.0, cap_floor[mkt]))) * 5.0
+            structure_score = ma_gap_pct * 1.35 + max(0.0, 12.0 + high_gap_pct) * 0.7
+            score = round(ret60 * 0.46 + ret20 * 0.30 + structure_score + amount_score + cap_score, 2)
+            reason = f"慢趋势机构票 | 20日{ret20:+.1f}% | 60日{ret60:+.1f}% | MA20/60{ma_gap_pct:+.1f}% | 距60日高点{high_gap_pct:+.1f}%"
+            item = dict(item)
+            item.update({
+                "symbol": symbol,
+                "display_symbol": display_symbol,
+                "current_price": current_price or item.get("current_price", 0),
+                "price_date": price_date or item.get("price_date", ""),
+                "return_pct": ret60,
+                "return_20d": ret20,
+                "return_60d": ret60,
+                "trend_score": score,
+                "slow_score": score,
+                "amount": amount,
+                "market_cap": market_cap,
+                "ma_gap_pct": round(ma_gap_pct, 2),
+                "high_gap_pct": round(high_gap_pct, 2),
+                "slow_reason": reason,
+                "aggregated_reason": reason,
+                "catalyst_tags": reason,
+                "signal_strength": max(1.0, float(item.get("signal_strength", 0) or 0)),
+            })
+            rows.append(item)
+        rows.sort(key=lambda x: x.get("slow_score", x.get("trend_score", 0)), reverse=True)
+        filtered[mkt] = rows[:limit]
+
+    result = {}
+    for mkt, items in filtered.items():
+        inst_symbols = [str((it or {}).get("symbol", "") or "").strip() for it in items if str((it or {}).get("symbol", "") or "").strip()]
+        inst_map = {}
+        try:
+            inst_map = get_institutional_change_map(mkt, inst_symbols)
+        except Exception as e:
+            logger.debug(f"Slow trend inst factor failed: market={mkt} err={e}")
+
+        transformed = []
+        for i, item in enumerate(items, 1):
+            symbol = str(item.get("symbol", "") or "").strip()
+            inst_payload = inst_map.get(symbol, {}) or {}
+            capital_signal = inst_payload.get("capital_signal")
+            if not isinstance(capital_signal, dict):
+                capital_signal = {"score": 0.0, "items": []}
+            transformed.append({
+                "symbol": item.get("display_symbol") or symbol,
+                "raw_symbol": symbol,
+                "name": item.get("name", ""),
+                "price": item.get("current_price", 0),
+                "return_pct": item.get("return_60d", item.get("return_pct", 0)),
+                "return_20d": item.get("return_20d", 0),
+                "return_60d": item.get("return_60d", item.get("return_pct", 0)),
+                "trend_score": item.get("slow_score", item.get("trend_score", 0)),
+                "catalyst_tags": item.get("slow_reason") or item.get("aggregated_reason", ""),
+                "days_on_list": len(set(str(d) for d, _ in item.get("reason_records", []))) or 1,
+                "signal_strength": item.get("signal_strength", 0),
+                "mcap_mult": item.get("mcap_mult", 1.0),
+                "price_date": item.get("price_date", ""),
+                "market_cap": item.get("market_cap", 0),
+                "amount": item.get("amount", 0),
+                "ma_gap_pct": item.get("ma_gap_pct", 0),
+                "high_gap_pct": item.get("high_gap_pct", 0),
+                "inst_factor": float(inst_payload.get("inst_factor", 0) or 0),
+                "inst_label": str(inst_payload.get("inst_label", "") or ""),
+                "inst_change_pp": float(inst_payload.get("inst_change_pp", 0) or 0),
+                "inst_delta_abs": float(inst_payload.get("inst_delta_abs", inst_payload.get("inst_change_pp", 0)) or 0),
+                "inst_delta_pct": float(inst_payload.get("inst_delta_pct", 0) or 0),
+                "inst_start_value": float(inst_payload.get("inst_start_value", 0) or 0),
+                "inst_end_value": float(inst_payload.get("inst_end_value", 0) or 0),
+                "inst_start_date": str(inst_payload.get("inst_start_date", "") or ""),
+                "inst_end_date": str(inst_payload.get("inst_end_date", inst_payload.get("inst_date", "")) or ""),
+                "inst_metric_unit": str(inst_payload.get("inst_metric_unit", "percentage_point") or "percentage_point"),
+                "inst_date": str(inst_payload.get("inst_date", "") or ""),
+                "inst_source": str(inst_payload.get("inst_source", "") or ""),
+                "inst_text": str(inst_payload.get("inst_text", "") or ""),
+                "inst_direction": str(inst_payload.get("inst_direction", "") or ""),
+                "inst_holding": inst_payload.get("inst_holding", {}) or {},
+                "capital_signal": capital_signal,
+                "capital_signal_items": capital_signal.get("items", []) or [],
+                "capital_signal_score": float(capital_signal.get("score", 0) or 0),
+                "capital_signal_coverage": inst_payload.get("capital_signal_coverage", {}) or {},
+            })
+        result[mkt] = transformed
+
+    payload = {
+        "mode": "slow",
+        "days": 60,
+        "limit": limit,
+        "thresholds": {
+            "return_20d_min": min20,
+            "return_60d_min": min60,
+            "amount_floor": amount_floor,
+            "cap_floor": cap_floor,
+            "ma_gap_min": ma_gap_min,
+            "high_gap_min": high_gap_min,
+        },
+        "markets": result,
+    }
+    set_cache(cache_key, payload, ttl=900)
+    return payload
 
 # --------------- Routes: Heatmap ---------------
 @app.get("/api/heatmap")
