@@ -30,6 +30,7 @@ interface TrendItem {
   return_20d: number
   return_60d: number
   amount: number
+  turnover_rate: number
   score: number
   catalyst_tags: string
   days_on_list: number
@@ -57,7 +58,7 @@ interface TrendItem {
 
 const markets = ['CN', 'HK', 'US']
 const daysOptions = [3, 7, 14, 30, 60, 90, 180]
-const activeMode = ref<'hot' | 'slow'>('hot')
+const activeMode = ref<'hot' | 'daily' | 'slow'>('hot')
 const activeMarket = ref('CN')
 const activeDays = ref(7)
 const loading = ref(false)
@@ -71,8 +72,16 @@ const sortOrder = ref<'ascending' | 'descending' | ''>('')
 async function fetchTrend() {
   loading.value = true
   try {
-    const endpoint = activeMode.value === 'slow' ? '/trend/slow' : '/trend'
-    const params = activeMode.value === 'slow' ? { limit: 100 } : { days: activeDays.value, limit: 100 }
+    let endpoint = '/trend'
+    let params: Record<string, number> = { days: activeDays.value, limit: 100 }
+    if (activeMode.value === 'daily') {
+      endpoint = '/trend/daily'
+      params = { limit: 100 }
+    } else if (activeMode.value === 'slow') {
+      endpoint = '/trend/slow'
+      params = { limit: 100 }
+    }
+    const mode = activeMode.value
     const res = await api.get(endpoint, { params })
     const marketsData: Record<string, TrendItem[]> = {}
     const raw = res.data.markets || {}
@@ -83,10 +92,11 @@ async function fetchTrend() {
         name: item.name || '',
         market: mkt,
         price: item.price || 0,
-        period_change: activeMode.value === 'slow' ? (item.return_60d || item.return_pct || 0) : (item.return_pct || 0),
+        period_change: mode === 'slow' ? (item.return_60d || item.return_pct || 0) : (item.return_pct || 0),
         return_20d: item.return_20d || 0,
         return_60d: item.return_60d || item.return_pct || 0,
         amount: item.amount || 0,
+        turnover_rate: item.turnover_rate || 0,
         score: item.trend_score || 0,
         catalyst_tags: item.catalyst_tags || '',
         days_on_list: item.days_on_list || 0,
@@ -205,6 +215,24 @@ function formatAmount(v: number, market: string): string {
   return v.toFixed(0) + unit
 }
 
+
+function formatTurnover(v: number): string {
+  if (!v) return '-'
+  return `${Number(v).toFixed(2)}%`
+}
+
+function changeLabel(): string {
+  if (activeMode.value === 'daily') return '当日涨幅'
+  if (activeMode.value === 'slow') return '60日涨幅'
+  return 'N日涨幅'
+}
+
+function metaPrefix(): string {
+  if (activeMode.value === 'daily') return '当日强势候选'
+  if (activeMode.value === 'slow') return '慢趋势候选'
+  return '共'
+}
+
 function formatDate(v: string): string {
   if (!v) return '-'
   return String(v).slice(0, 10)
@@ -286,6 +314,7 @@ onMounted(fetchTrend)
     <div class="toolbar">
       <div class="mode-group">
         <button class="mode-btn" :class="{ active: activeMode === 'hot' }" @click="activeMode = 'hot'">热门趋势</button>
+        <button class="mode-btn" :class="{ active: activeMode === 'daily' }" @click="activeMode = 'daily'">当日强势</button>
         <button class="mode-btn" :class="{ active: activeMode === 'slow' }" @click="activeMode = 'slow'">慢趋势机构票</button>
       </div>
       <div class="tab-group">
@@ -302,8 +331,9 @@ onMounted(fetchTrend)
           @click="activeDays = d"
         >{{ d }}天</button>
       </div>
-      <div v-else class="slow-criteria">20日≥12% · 60日≥30% · 高市值/高成交额</div>
-      <div class="meta-text">{{ activeMode === 'slow' ? '慢趋势候选' : '共' }} {{ totalItems }} 个标的</div>
+      <div v-else-if="activeMode === 'daily'" class="mode-criteria daily-criteria">本地日榜 · 基础过滤 · 不触发全市场 API</div>
+      <div v-else class="mode-criteria slow-criteria">20日≥12% · 60日≥30% · 高市值/高成交额</div>
+      <div class="meta-text">{{ metaPrefix() }} {{ totalItems }} 个标的</div>
     </div>
 
     <el-table :data="pagedItems" v-loading="loading" size="small" @sort-change="handleSortChange">
@@ -313,7 +343,7 @@ onMounted(fetchTrend)
       <el-table-column label="现价" width="78">
         <template #default="{ row }">{{ row.price ? row.price.toFixed(2) : '-' }}</template>
       </el-table-column>
-      <el-table-column prop="period_change" :label="activeMode === 'slow' ? '60日涨幅' : 'N日涨幅'" width="96" sortable="custom">
+      <el-table-column prop="period_change" :label="changeLabel()" width="96" sortable="custom">
         <template #default="{ row }">
           <span :class="pctClass(row.period_change)">
             {{ row.period_change > 0 ? '+' : '' }}{{ row.period_change.toFixed(1) }}%
@@ -330,10 +360,13 @@ onMounted(fetchTrend)
       <el-table-column prop="market_cap" label="市值" width="118" sortable="custom">
         <template #default="{ row }">{{ formatCap(row.market_cap, row.market) }}</template>
       </el-table-column>
-      <el-table-column v-if="activeMode === 'slow'" prop="amount" label="成交额" width="116" sortable="custom">
+      <el-table-column v-if="activeMode !== 'hot'" prop="amount" label="成交额" width="116" sortable="custom">
         <template #default="{ row }">{{ formatAmount(row.amount, row.market) }}</template>
       </el-table-column>
-      <el-table-column prop="capital_signal_score" label="筹码" width="236" sortable="custom">
+      <el-table-column v-if="activeMode === 'daily'" prop="turnover_rate" label="换手率" width="88" sortable="custom">
+        <template #default="{ row }">{{ formatTurnover(row.turnover_rate) }}</template>
+      </el-table-column>
+      <el-table-column v-if="activeMode !== 'daily'" prop="capital_signal_score" label="筹码" width="236" sortable="custom">
         <template #default="{ row }">
           <el-tooltip :content="coverageTooltip(row)" placement="top" :disabled="!coverageTooltip(row)">
             <div v-if="chipItems(row).length" class="chip-wrap">
@@ -352,7 +385,7 @@ onMounted(fetchTrend)
           <span class="catalyst-text">{{ row.catalyst_tags || "-" }}</span>
         </template>
       </el-table-column>
-      <el-table-column prop="days_on_list" label="上榜天数" width="88" sortable="custom">
+      <el-table-column v-if="activeMode !== 'daily'" prop="days_on_list" label="上榜天数" width="88" sortable="custom">
         <template #default="{ row }">{{ row.days_on_list }}d</template>
       </el-table-column>
       <el-table-column prop="score" label="评分" width="110" sortable="custom">
@@ -413,14 +446,20 @@ onMounted(fetchTrend)
   font-size: 12px;
   color: var(--text-secondary);
 }
-.slow-criteria {
+.mode-criteria {
   padding: 4px 10px;
   border-radius: 999px;
   font-size: 12px;
   font-weight: 600;
+  white-space: nowrap;
+}
+.slow-criteria {
   color: #8a4b00;
   background: rgba(245, 158, 11, 0.12);
-  white-space: nowrap;
+}
+.daily-criteria {
+  color: #155eef;
+  background: rgba(21, 94, 239, 0.09);
 }
 .catalyst-text {
   font-size: 12px;

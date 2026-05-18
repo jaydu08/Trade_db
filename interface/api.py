@@ -1281,6 +1281,386 @@ def get_slow_trend(
     set_cache(cache_key, payload, ttl=900)
     return payload
 
+
+@app.get("/api/trend/daily")
+def get_daily_hot_trend(
+    date: str = Query(default=""),
+    limit: int = Query(default=100, ge=10, le=200),
+    user: str = Depends(get_current_user),
+):
+    """当日强势榜：只使用本地 DailyRank/TrendDailyBar 截面，避免 Web 打开时触发全市场 API。"""
+    cache_key = f"api_trend_daily_hot_v1_{date or 'latest'}_{limit}"
+    cached = get_cache(cache_key)
+    if cached:
+        return cached
+
+    from core.db import get_ledger_session
+    from domain.ledger.analytics import DailyRank, TrendDailyBar
+    from modules.ingestion.market_cap import get_cn_market_metrics, get_hk_market_metrics
+    from modules.ingestion.us_market_cap import get_us_market_metrics
+    from modules.monitor.trend_service import TrendCalculator
+    from sqlmodel import select, func
+    import math
+
+    markets = ["CN", "HK", "US"]
+
+    def _env_float(name: str, default: float) -> float:
+        try:
+            raw = os.getenv(name, "")
+            return float(raw) if str(raw).strip() else float(default)
+        except Exception:
+            return float(default)
+
+    def _env_int(name: str, default: int) -> int:
+        try:
+            raw = os.getenv(name, "")
+            return int(raw) if str(raw).strip() else int(default)
+        except Exception:
+            return int(default)
+
+    requested_date = None
+    if str(date or "").strip():
+        try:
+            requested_date = dt.date.fromisoformat(str(date).strip()[:10])
+        except Exception:
+            raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+
+    thresholds = {
+        "CN": {
+            "amount_min": _env_float("DAILY_HOT_CN_AMOUNT_MIN", _env_float("CN_HARD_AMOUNT_MIN", 200_000_000.0)),
+            "mcap_min_100m": _env_float("DAILY_HOT_CN_MCAP_MIN_100M", _env_float("CN_HARD_TOTAL_MV_100M_MIN", 50.0)),
+            "price_min": _env_float("DAILY_HOT_CN_PRICE_MIN", 1.0),
+        },
+        "HK": {
+            "amount_min": _env_float("DAILY_HOT_HK_AMOUNT_MIN", 500_000_000.0),
+            "price_min": _env_float("DAILY_HOT_HK_PRICE_MIN", 2.0),
+        },
+        "US": {
+            "amount_min": _env_float("DAILY_HOT_US_AMOUNT_MIN", 20_000_000.0),
+            "mcap_min_musd": _env_float("DAILY_HOT_US_MCAP_MIN_MUSD", _env_float("US_HARD_MCAP_MUSD_MIN", 1000.0)),
+            "price_min": _env_float("DAILY_HOT_US_PRICE_MIN", 2.0),
+        },
+    }
+    cap_lookup_limit = max(0, min(160, _env_int("DAILY_HOT_MCAP_LOOKUP_LIMIT", 30)))
+
+    def _to_float(value) -> float:
+        try:
+            return float(value or 0)
+        except Exception:
+            return 0.0
+
+    def _display_symbol(symbol: str, market: str) -> str:
+        sym = str(symbol or "").strip()
+        if market == "US" and "." in sym:
+            return sym.split(".")[-1].strip().upper()
+        return sym
+
+    def _is_hk_product(symbol: str, name: str) -> bool:
+        text = f"{symbol} {name}".lower()
+        bad_words = [
+            "牛", "熊", "认购", "认沽", "窝轮", "涡轮", "权证", "界内证",
+            "杠杆", "反向", "做空", "两倍", "二倍", "三倍", "xl二", "xl三", "etf",
+            "daily inverse", "daily leveraged", "leveraged", "inverse",
+        ]
+        return any(k in text for k in bad_words)
+
+    def _is_us_product(symbol: str, name: str) -> bool:
+        text = f"{symbol} {name}"
+        if TrendCalculator._is_leveraged_like(text):
+            return True
+        low = text.lower()
+        bad_words = [
+            " warrant", " right", " unit", " etf", "proshares", "direxion",
+            "graniteshares", "tradr", "t-rex", "yieldmax", "rex shares",
+            "做空", "做多", "二倍", "两倍", "三倍", "杠杆", "反向", "etf",
+        ]
+        return any(k in low for k in bad_words)
+
+    def _latest_market_date(session, market: str):
+        def _max_date(model, upper=None):
+            stmt = select(func.max(model.date)).where(model.market == market)
+            if upper is not None:
+                stmt = stmt.where(model.date <= upper)
+            return session.exec(stmt).first()
+
+        if requested_date is not None:
+            rank_hit = session.exec(
+                select(func.count()).select_from(DailyRank)
+                .where(DailyRank.market == market)
+                .where(DailyRank.date == requested_date)
+            ).first()
+            bar_hit = session.exec(
+                select(func.count()).select_from(TrendDailyBar)
+                .where(TrendDailyBar.market == market)
+                .where(TrendDailyBar.date == requested_date)
+            ).first()
+            if (rank_hit or 0) > 0 or (bar_hit or 0) > 0:
+                return requested_date
+            dates = [d for d in (_max_date(DailyRank, requested_date), _max_date(TrendDailyBar, requested_date)) if d]
+            return max(dates) if dates else None
+
+        dates = [d for d in (_max_date(DailyRank), _max_date(TrendDailyBar)) if d]
+        return max(dates) if dates else None
+
+    def _merge_candidate(store: dict, market: str, symbol: str, name: str, price: float, pct: float, amount: float, turnover: float, source: str, catalyst: str, d):
+        display = _display_symbol(symbol, market)
+        if not display:
+            return
+        rec = store.get(display)
+        if not rec:
+            rec = {
+                "symbol": display,
+                "raw_symbol": str(symbol or "").strip(),
+                "name": str(name or ""),
+                "price": round(_to_float(price), 4),
+                "return_pct": round(_to_float(pct), 2),
+                "amount": _to_float(amount),
+                "turnover_rate": _to_float(turnover),
+                "source_set": set(),
+                "catalyst_tags": str(catalyst or "").strip(),
+                "price_date": str(d or ""),
+            }
+            store[display] = rec
+        else:
+            if name and not rec.get("name"):
+                rec["name"] = str(name)
+            if _to_float(amount) > _to_float(rec.get("amount")):
+                rec["amount"] = _to_float(amount)
+            if _to_float(turnover) > _to_float(rec.get("turnover_rate")):
+                rec["turnover_rate"] = _to_float(turnover)
+            if _to_float(pct) > _to_float(rec.get("return_pct")):
+                rec["return_pct"] = round(_to_float(pct), 2)
+                rec["price"] = round(_to_float(price), 4)
+            if catalyst and catalyst not in str(rec.get("catalyst_tags", "")):
+                rec["catalyst_tags"] = f"{rec.get('catalyst_tags', '')} | {catalyst}".strip(" |")
+            if d and (not rec.get("price_date") or str(d) > str(rec.get("price_date"))):
+                rec["price_date"] = str(d)
+        if source:
+            rec.setdefault("source_set", set()).add(str(source))
+
+    def _load_candidates_for_market(session, market: str, market_date) -> list:
+        store = {}
+        if not market_date:
+            return []
+
+        rank_rows = session.exec(
+            select(DailyRank)
+            .where(DailyRank.market == market)
+            .where(DailyRank.date == market_date)
+            .order_by(DailyRank.change_pct.desc(), DailyRank.amount.desc())
+            .limit(500)
+        ).all()
+        for r in rank_rows:
+            _merge_candidate(
+                store, market, r.symbol, r.name, r.price, r.change_pct, r.amount, r.turnover_rate,
+                f"daily_rank:{r.rank_type}", "当日日榜", r.date,
+            )
+
+        bar_rows = session.exec(
+            select(TrendDailyBar)
+            .where(TrendDailyBar.market == market)
+            .where(TrendDailyBar.date == market_date)
+            .order_by(TrendDailyBar.amount.desc(), TrendDailyBar.close.desc())
+            .limit(700)
+        ).all()
+        for b in bar_rows:
+            pct = 0.0
+            if _to_float(b.open) > 0:
+                pct = (_to_float(b.close) - _to_float(b.open)) / _to_float(b.open) * 100.0
+            _merge_candidate(
+                store, market, b.symbol, b.name, b.close, pct, b.amount, b.turnover_rate,
+                f"bar:{b.source}", b.catalyst_tags or "", b.date,
+            )
+        return list(store.values())
+
+    def _passes_pre_filter(market: str, item: dict) -> bool:
+        pct = _to_float(item.get("return_pct"))
+        price = _to_float(item.get("price"))
+        amount = _to_float(item.get("amount"))
+        if pct <= 0 or price <= 0:
+            return False
+        if market == "CN":
+            return price >= thresholds["CN"]["price_min"] and amount >= thresholds["CN"]["amount_min"]
+        if market == "HK":
+            if _is_hk_product(item.get("symbol", ""), item.get("name", "")):
+                return False
+            return price >= thresholds["HK"]["price_min"] and amount >= thresholds["HK"]["amount_min"]
+        if market == "US":
+            if _is_us_product(item.get("symbol", ""), item.get("name", "")):
+                return False
+            return price >= thresholds["US"]["price_min"] and amount >= thresholds["US"]["amount_min"]
+        return False
+
+    def _enrich_and_filter_market_cap(market: str, rows: list) -> list:
+        if not rows:
+            return []
+        sorted_for_lookup = sorted(rows, key=lambda x: (_to_float(x.get("amount")), _to_float(x.get("return_pct"))), reverse=True)
+        lookup_symbols = {str(x.get("symbol", "")) for x in sorted_for_lookup[:cap_lookup_limit]}
+        out = []
+        for item in rows:
+            sym = str(item.get("symbol", "")).strip()
+            cap_value = 0.0
+            market_cap_display = 0.0
+            if sym in lookup_symbols:
+                try:
+                    if market == "CN":
+                        metrics = get_cn_market_metrics(sym)
+                        cap_value = _to_float((metrics or {}).get("total_mv_100m"))
+                        market_cap_display = cap_value
+                    elif market == "HK":
+                        metrics = get_hk_market_metrics(sym)
+                        cap_value = _to_float((metrics or {}).get("market_cap_100m_hkd")) or _to_float((metrics or {}).get("market_cap_100m_usd"))
+                        market_cap_display = cap_value
+                    elif market == "US":
+                        metrics = get_us_market_metrics(sym)
+                        cap_value = _to_float((metrics or {}).get("market_cap_musd"))
+                        market_cap_display = cap_value / 100.0 if cap_value > 0 else 0.0
+                except Exception as e:
+                    logger.debug("Daily hot mcap failed: market=%s symbol=%s err=%s", market, sym, e)
+            cap_known = cap_value > 0
+            item["market_cap"] = round(market_cap_display, 4)
+            item["mcap_known"] = cap_known
+            item["mcap_value"] = round(cap_value, 4)
+
+            # 与 heatmap 一致：市值拿到才执行硬市值过滤；拿不到不丢票，避免限流造成漏票。
+            if market == "CN" and cap_known and cap_value < thresholds["CN"]["mcap_min_100m"]:
+                continue
+            if market == "US" and cap_known and cap_value < thresholds["US"]["mcap_min_musd"]:
+                continue
+            out.append(item)
+        return out
+
+    def _score_rows(market: str, rows: list) -> list:
+        if not rows:
+            return []
+
+        def _rank_map(values: dict) -> dict:
+            if not values:
+                return {}
+            ordered = sorted(values.items(), key=lambda kv: kv[1])
+            n = len(ordered)
+            if n <= 1:
+                return {ordered[0][0]: 1.0} if ordered else {}
+            return {key: (idx + 1) / n for idx, (key, _v) in enumerate(ordered)}
+
+        pct_rank = _rank_map({i: _to_float(r.get("return_pct")) for i, r in enumerate(rows)})
+        amount_rank = _rank_map({i: math.log10(max(1.0, _to_float(r.get("amount")))) for i, r in enumerate(rows)})
+        turnover_values = {i: _to_float(r.get("turnover_rate")) for i, r in enumerate(rows) if _to_float(r.get("turnover_rate")) > 0}
+        turnover_rank = _rank_map(turnover_values) if turnover_values else {}
+        cap_values = {i: math.log10(max(1.0, _to_float(r.get("mcap_value")))) for i, r in enumerate(rows) if _to_float(r.get("mcap_value")) > 0}
+        cap_rank = _rank_map(cap_values) if cap_values else {}
+
+        for i, r in enumerate(rows):
+            score = (
+                pct_rank.get(i, 0.5) * 0.55
+                + amount_rank.get(i, 0.5) * 0.25
+                + cap_rank.get(i, 0.5) * 0.15
+                + turnover_rank.get(i, 0.5) * 0.05
+            ) * 100.0
+            if market == "US":
+                cap = _to_float(r.get("mcap_value"))
+                if cap >= 300_000:
+                    score *= 1.35
+                elif cap >= 100_000:
+                    score *= 1.22
+                elif cap >= 50_000:
+                    score *= 1.12
+            sources = sorted(r.get("source_set") or [])
+            base_tag = str(r.get("catalyst_tags", "") or "").strip()
+            if not base_tag or base_tag == "当日日榜":
+                base_tag = "当日强势 | 成交额达标"
+            r["trend_score"] = round(score, 2)
+            r["daily_score"] = round(score, 2)
+            r["source"] = ",".join(sources)
+            r["catalyst_tags"] = base_tag
+            r["days_on_list"] = 1
+            r["signal_strength"] = 1
+            r["mcap_mult"] = 1.0
+        rows.sort(key=lambda x: (_to_float(x.get("return_pct")), _to_float(x.get("trend_score")), _to_float(x.get("amount"))), reverse=True)
+        return rows[:limit]
+
+    result = {}
+    market_dates = {}
+    with get_ledger_session() as session:
+        for mkt in markets:
+            market_date = _latest_market_date(session, mkt)
+            market_dates[mkt] = str(market_date or "")
+            candidates = _load_candidates_for_market(session, mkt, market_date)
+            pre_filtered = [x for x in candidates if _passes_pre_filter(mkt, x)]
+            cap_filtered = _enrich_and_filter_market_cap(mkt, pre_filtered)
+            final_rows = _score_rows(mkt, cap_filtered)
+            result[mkt] = final_rows
+
+    # 默认不拉机构/筹码，避免打开 Web 日榜时产生额外外部数据调用；需要时可开 ENABLE_DAILY_HOT_INST=1。
+    if str(os.getenv("ENABLE_DAILY_HOT_INST", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+        try:
+            from modules.ingestion.institutional_factor import get_institutional_change_map
+            for mkt, rows in result.items():
+                syms = [str(r.get("symbol", "") or "").strip() for r in rows if str(r.get("symbol", "") or "").strip()]
+                inst_map = get_institutional_change_map(mkt, syms)
+                for r in rows:
+                    inst_payload = inst_map.get(str(r.get("symbol", "")), {}) or {}
+                    capital_signal = inst_payload.get("capital_signal")
+                    if not isinstance(capital_signal, dict):
+                        capital_signal = {"score": 0.0, "items": []}
+                    r.update({
+                        "inst_factor": float(inst_payload.get("inst_factor", 0) or 0),
+                        "inst_label": str(inst_payload.get("inst_label", "") or ""),
+                        "inst_change_pp": float(inst_payload.get("inst_change_pp", 0) or 0),
+                        "inst_delta_abs": float(inst_payload.get("inst_delta_abs", inst_payload.get("inst_change_pp", 0)) or 0),
+                        "inst_delta_pct": float(inst_payload.get("inst_delta_pct", 0) or 0),
+                        "inst_start_value": float(inst_payload.get("inst_start_value", 0) or 0),
+                        "inst_end_value": float(inst_payload.get("inst_end_value", 0) or 0),
+                        "inst_start_date": str(inst_payload.get("inst_start_date", "") or ""),
+                        "inst_end_date": str(inst_payload.get("inst_end_date", inst_payload.get("inst_date", "")) or ""),
+                        "inst_metric_unit": str(inst_payload.get("inst_metric_unit", "percentage_point") or "percentage_point"),
+                        "inst_date": str(inst_payload.get("inst_date", "") or ""),
+                        "inst_source": str(inst_payload.get("inst_source", "") or ""),
+                        "inst_text": str(inst_payload.get("inst_text", "") or ""),
+                        "inst_direction": str(inst_payload.get("inst_direction", "") or ""),
+                        "capital_signal": capital_signal,
+                        "capital_signal_items": capital_signal.get("items", []) or [],
+                        "capital_signal_score": float(capital_signal.get("score", 0) or 0),
+                        "capital_signal_coverage": inst_payload.get("capital_signal_coverage", {}) or {},
+                    })
+        except Exception as e:
+            logger.debug("Daily hot inst factor skipped: %s", e)
+
+    for rows in result.values():
+        for r in rows:
+            r.pop("source_set", None)
+            r.pop("mcap_value", None)
+            r.setdefault("inst_factor", 0.0)
+            r.setdefault("inst_label", "")
+            r.setdefault("inst_change_pp", 0.0)
+            r.setdefault("inst_delta_abs", 0.0)
+            r.setdefault("inst_delta_pct", 0.0)
+            r.setdefault("inst_start_value", 0.0)
+            r.setdefault("inst_end_value", 0.0)
+            r.setdefault("inst_start_date", "")
+            r.setdefault("inst_end_date", "")
+            r.setdefault("inst_metric_unit", "percentage_point")
+            r.setdefault("inst_date", "")
+            r.setdefault("inst_text", "")
+            r.setdefault("inst_source", "")
+            r.setdefault("inst_direction", "")
+            r.setdefault("capital_signal_items", [])
+            r.setdefault("capital_signal_score", 0.0)
+            r.setdefault("capital_signal_coverage", {"status": "unknown", "text": "日榜", "reason": "当日强势榜默认不拉低频筹码数据"})
+
+    payload = {
+        "mode": "daily",
+        "date": str(requested_date or ""),
+        "market_dates": market_dates,
+        "limit": limit,
+        "candidate_source": "local DailyRank + TrendDailyBar",
+        "thresholds": thresholds,
+        "cap_lookup_limit": cap_lookup_limit,
+        "markets": result,
+    }
+    set_cache(cache_key, payload, ttl=600)
+    return payload
+
 # --------------- Routes: Heatmap ---------------
 @app.get("/api/heatmap")
 def get_heatmap(

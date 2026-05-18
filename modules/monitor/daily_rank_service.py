@@ -60,8 +60,9 @@ class DailyRankService:
                     
                     logger.info(f"Fetching daily rank for {market} - {rank_type}...")
                     
-                    # 取 Top 10
-                    df = akshare_client.get_daily_top_ranks(market=market, rank_type=rank_type, top_n=10)
+                    # 低频日榜只在定时任务中拉取；TopN 可配置，默认扩大到 50 以支撑 Web 端当日强势榜。
+                    top_n = DailyRankService._env_int("DAILY_RANK_TOP_N", 50)
+                    df = akshare_client.get_daily_top_ranks(market=market, rank_type=rank_type, top_n=top_n)
                     if df.empty:
                         logger.warning(f"No rank data available for {market} - {rank_type}.")
                         continue
@@ -165,6 +166,16 @@ class DailyRankService:
         if raw is None:
             return default
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _env_int(name: str, default: int = 0) -> int:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return default
+        try:
+            return int(raw)
+        except Exception:
+            return default
 
     @staticmethod
     def _should_sync_today(market: str) -> bool:
