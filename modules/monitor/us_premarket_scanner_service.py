@@ -54,7 +54,11 @@ class USPremarketScannerService:
 
     @staticmethod
     def _fetch_sina_batch(symbols: List[str], timeout_sec: int) -> List[Dict]:
-        """Use Sina API to batch-fetch US stock quotes (works during pre-market)."""
+        """Use Sina API to batch-fetch US pre-market quotes.
+
+        Sina gb_* fields are easy to mix up: parts[1] is the regular-session
+        close/last base, while parts[21]/[27] are pre-market price/volume.
+        """
         if not symbols:
             return []
         # Convert to Sina format: gb_aapl, gb_msft, ...
@@ -76,22 +80,42 @@ class USPremarketScannerService:
                 sina_id = line.split('="')[0].split('hq_str_')[1]
                 # Extract original symbol from sina_id (gb_aapl -> AAPL)
                 raw_sym = sina_id.replace('gb_', '').replace('$', '.').upper()
-                if len(parts) < 11:
+                if len(parts) < 28:
                     continue
+
                 name = parts[0]
-                price = USPremarketScannerService._to_float(parts[1])
-                pct_chg = USPremarketScannerService._to_float(parts[2])
-                volume = USPremarketScannerService._to_float(parts[10] if len(parts) > 10 else 0)
-                amount = volume * price if volume and price else 0.0
-                if price <= 0:
+                regular_close = USPremarketScannerService._to_float(parts[1])
+                prev_close = USPremarketScannerService._to_float(parts[26] if len(parts) > 26 else 0) or regular_close
+                pre_price = USPremarketScannerService._to_float(parts[21])
+                pre_volume = USPremarketScannerService._to_float(parts[27])
+                sina_pct = USPremarketScannerService._to_float(parts[22])
+                pre_change = USPremarketScannerService._to_float(parts[23])
+                pre_time = parts[24] if len(parts) > 24 else ""
+
+                if pre_price <= 0 or prev_close <= 0 or pre_volume <= 0:
                     continue
+
+                # 盘前涨幅必须基于“盘前价 vs 昨收/常规收盘价”重新计算，避免误用常规盘涨跌幅字段。
+                pct_chg = round((pre_price - prev_close) / prev_close * 100, 2)
+                if abs(pct_chg - sina_pct) > 0.2:
+                    logger.debug(
+                        "US premarket pct recalculated: symbol=%s sina_pct=%.2f calc_pct=%.2f prev=%.4f pre=%.4f",
+                        raw_sym, sina_pct, pct_chg, prev_close, pre_price,
+                    )
+                amount = pre_volume * pre_price
+
                 results.append({
                     "symbol": raw_sym,
                     "name": name,
-                    "price": price,
+                    "price": pre_price,
+                    "prev_close": prev_close,
+                    "regular_close": regular_close,
                     "pct": pct_chg,
-                    "volume": volume,
+                    "pre_change": round(pre_price - prev_close, 4),
+                    "sina_pre_change": pre_change,
+                    "volume": pre_volume,
                     "amount": amount,
+                    "pre_time": pre_time,
                 })
             except Exception:
                 continue
@@ -129,10 +153,12 @@ class USPremarketScannerService:
             "symbol": symbol,
             "name": name,
             "pre_price": price,
+            "prev_close": row.get("prev_close", 0.0),
             "pre_vol": volume,
             "pre_notional": amount,
             "pct": pct,
             "market_cap": mcap,
+            "pre_time": row.get("pre_time", ""),
         }
 
     @staticmethod
@@ -198,12 +224,13 @@ class USPremarketScannerService:
         for i, item in enumerate(top, 1):
             direction = "\u2b06\ufe0f" if item["pct"] >= 0 else "\u2b07\ufe0f"
             lines.append(
-                "{i}. {symbol} {direction} {pct:+.2f}%  盘前价:{price:.2f}  成交额:{notional:.1f}M  市值:{mcap:.1f}B".format(
+                "{i}. {symbol} {direction} 盘前{pct:+.2f}%  盘前价:{price:.2f}  昨收:{prev:.2f}  成交额:{notional:.1f}M  市值:{mcap:.1f}B".format(
                     i=i,
                     symbol=item.get("symbol", ""),
                     direction=direction,
                     pct=float(item.get("pct", 0) or 0),
                     price=float(item.get("pre_price", 0) or 0),
+                    prev=float(item.get("prev_close", 0) or 0),
                     notional=float(item.get("pre_notional", 0) or 0) / 1e6,
                     mcap=float(item.get("market_cap", 0) or 0) / 1e9,
                 )
