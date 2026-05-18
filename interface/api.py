@@ -796,16 +796,18 @@ def get_slow_trend(
     user: str = Depends(get_current_user),
 ):
     """慢趋势机构票 demo：复用现有 trend 候选池，单独做高门槛过滤，不触发推送。"""
-    cache_key = f"api_trend_slow_demo_v2_{limit}"
+    cache_key = f"api_trend_slow_demo_v3_{limit}"
     cached = get_cache(cache_key)
     if cached:
         return cached
 
-    from modules.monitor.trend_service import TrendCalculator
+    from modules.monitor.trend_service import TrendCalculator, TrendService
     from modules.ingestion.institutional_factor import get_institutional_change_map
     from core.db import get_ledger_session
-    from domain.ledger.analytics import TrendDailyBar, DailyRank
+    from domain.ledger.analytics import TrendDailyBar, DailyRank, TrendSeedPool
     from sqlmodel import select
+    from modules.ingestion.market_cap import get_cn_market_metrics, get_hk_market_metrics
+    from modules.ingestion.us_market_cap import get_us_market_metrics
     import math
 
     def _env_float(name: str, default: float) -> float:
@@ -814,6 +816,13 @@ def get_slow_trend(
             return float(raw) if str(raw).strip() else float(default)
         except Exception:
             return float(default)
+
+    def _env_int(name: str, default: int) -> int:
+        try:
+            raw = os.getenv(name, "")
+            return int(raw) if str(raw).strip() else int(default)
+        except Exception:
+            return int(default)
 
     def _display_symbol(symbol: str, market: str) -> str:
         sym = str(symbol or "").strip()
@@ -937,6 +946,120 @@ def get_slow_trend(
             return 0.0, cur_price, str(cur_date)
         return round((cur_price - past_price) / past_price * 100, 2), round(cur_price, 4), str(cur_date)
 
+    def _build_slow_candidates() -> Dict[str, List[Dict]]:
+        """Build an independent slow-trend universe from local seeds and high-liquidity history."""
+        markets = ["CN", "HK", "US"]
+        max_per_market = max(60, min(500, _env_int("SLOW_TREND_CANDIDATE_MAX_PER_MARKET", 240)))
+        stores: Dict[str, Dict[str, Dict]] = {m: {} for m in markets}
+
+        def _add(market: str, symbol: str, name: str = "", reason: str = "", amount: float = 0.0, date=None, priority: int = 0):
+            mkt = str(market or "").strip().upper()
+            raw_sym = str(symbol or "").strip()
+            if mkt not in stores or not raw_sym:
+                return
+            display = _display_symbol(raw_sym, mkt)
+            key = display or raw_sym
+            bucket = stores[mkt]
+            rec = bucket.get(key)
+            if not rec:
+                rec = {
+                    "market": mkt,
+                    "symbol": raw_sym,
+                    "display_symbol": display,
+                    "name": str(name or ""),
+                    "reason_records": [],
+                    "amount_hint": 0.0,
+                    "date_hint": None,
+                    "priority": 0,
+                    "source_tags": set(),
+                }
+                bucket[key] = rec
+            if name and not rec.get("name"):
+                rec["name"] = str(name)
+            if reason:
+                rec["reason_records"].append((date or dt.date.today(), str(reason).strip()))
+                rec["source_tags"].add(str(reason).strip()[:16])
+            try:
+                amt = float(amount or 0)
+                if amt > float(rec.get("amount_hint", 0) or 0):
+                    rec["amount_hint"] = amt
+            except Exception:
+                pass
+            if date and (not rec.get("date_hint") or date > rec.get("date_hint")):
+                rec["date_hint"] = date
+            if priority > int(rec.get("priority", 0) or 0):
+                rec["priority"] = priority
+
+        try:
+            for market, items in TrendService._baseline_seed_items().items():
+                for it in items:
+                    _add(market, it.get("symbol", ""), it.get("name", ""), it.get("reason", "大票趋势基线"), priority=10)
+        except Exception as e:
+            logger.debug("Slow trend baseline candidates failed: %s", e)
+
+        for collector, priority, fallback_reason in (
+            (TrendService._watchlist_seed_items, 9, "自选观察"),
+            (TrendService._paper_trade_seed_items, 9, "模拟持仓"),
+        ):
+            try:
+                for market, items in collector().items():
+                    for it in items:
+                        _add(market, it.get("symbol", ""), it.get("name", ""), it.get("reason", fallback_reason), priority=priority)
+            except Exception as e:
+                logger.debug("Slow trend manual candidates failed: %s", e)
+
+        today = dt.date.today()
+        seed_cutoff = today - dt.timedelta(days=180)
+        rank_cutoff = today - dt.timedelta(days=60)
+        bar_cutoff = today - dt.timedelta(days=130)
+        with get_ledger_session() as session:
+            seed_rows = session.exec(
+                select(TrendSeedPool.market, TrendSeedPool.symbol, TrendSeedPool.name, TrendSeedPool.daily_reason, TrendSeedPool.date)
+                .where(TrendSeedPool.market.in_(markets))
+                .where(TrendSeedPool.date >= seed_cutoff)
+                .order_by(TrendSeedPool.date.desc())
+                .limit(max_per_market * len(markets) * 4)
+            ).all()
+            for market, symbol, name, reason, d in seed_rows:
+                _add(market, symbol, name, reason or "趋势种子池", date=d, priority=6)
+
+            for market in markets:
+                rank_rows = session.exec(
+                    select(DailyRank.symbol, DailyRank.name, DailyRank.amount, DailyRank.date)
+                    .where(DailyRank.market == market)
+                    .where(DailyRank.date >= rank_cutoff)
+                    .order_by(DailyRank.amount.desc(), DailyRank.date.desc())
+                    .limit(max_per_market * 5)
+                ).all()
+                for symbol, name, amount, d in rank_rows:
+                    _add(market, symbol, name, "高成交额排行榜", amount=amount, date=d, priority=4)
+
+                bar_rows = session.exec(
+                    select(TrendDailyBar.symbol, TrendDailyBar.name, TrendDailyBar.amount, TrendDailyBar.date)
+                    .where(TrendDailyBar.market == market)
+                    .where(TrendDailyBar.date >= bar_cutoff)
+                    .order_by(TrendDailyBar.amount.desc(), TrendDailyBar.date.desc())
+                    .limit(max_per_market * 5)
+                ).all()
+                for symbol, name, amount, d in bar_rows:
+                    _add(market, symbol, name, "高成交额日线池", amount=amount, date=d, priority=3)
+
+        out: Dict[str, List[Dict]] = {}
+        for market, recs in stores.items():
+            arr = list(recs.values())
+            arr.sort(
+                key=lambda x: (
+                    int(x.get("priority", 0) or 0),
+                    float(x.get("amount_hint", 0) or 0),
+                    x.get("date_hint") or dt.date.min,
+                ),
+                reverse=True,
+            )
+            for rec in arr:
+                rec["source_tags"] = ",".join(sorted(rec.get("source_tags") or []))
+            out[market] = arr[:max_per_market]
+        return out
+
     min20 = _env_float("SLOW_TREND_RETURN_20D_MIN", 12.0)
     min60 = _env_float("SLOW_TREND_RETURN_60D_MIN", 30.0)
     amount_floor = {
@@ -953,8 +1076,7 @@ def get_slow_trend(
     ma_gap_min = _env_float("SLOW_TREND_MA_GAP_MIN", 2.0)
     high_gap_min = _env_float("SLOW_TREND_HIGH_GAP_MIN", -12.0)
 
-    calc = TrendCalculator()
-    raw = calc.calculate_trend(days=60, topn_override=200)
+    raw = _build_slow_candidates()
     filtered = {}
 
     for mkt, items in raw.items():
@@ -988,15 +1110,34 @@ def get_slow_trend(
             if ma_gap_pct < ma_gap_min or current_price < ma20 or high_gap_pct < high_gap_min:
                 continue
 
-            if mkt == "CN":
-                cap_value = float(item.get("total_mv_100m", 0) or 0)
-                market_cap = cap_value
-            elif mkt == "HK":
-                cap_value = float(item.get("market_cap_100m_hkd", 0) or 0)
-                market_cap = cap_value
-            else:
-                cap_value = float(item.get("market_cap_musd", 0) or 0)
-                market_cap = cap_value / 100.0
+            if mkt == "US" and TrendCalculator._is_leveraged_like(f"{display_symbol} {item.get('name', '')}"):
+                continue
+
+            cap_value = 0.0
+            market_cap = 0.0
+            try:
+                if mkt == "CN":
+                    cap_value = float(item.get("total_mv_100m", 0) or 0)
+                    if cap_value <= 0:
+                        metrics = get_cn_market_metrics(display_symbol or symbol)
+                        cap_value = float((metrics or {}).get("total_mv_100m", 0) or 0)
+                    market_cap = cap_value
+                elif mkt == "HK":
+                    cap_value = float(item.get("market_cap_100m_hkd", 0) or 0)
+                    if cap_value <= 0:
+                        metrics = get_hk_market_metrics(display_symbol or symbol)
+                        cap_value = float((metrics or {}).get("market_cap_100m_hkd", 0) or 0)
+                    market_cap = cap_value
+                else:
+                    cap_value = float(item.get("market_cap_musd", 0) or 0)
+                    if cap_value <= 0:
+                        metrics = get_us_market_metrics(display_symbol.split(".")[-1].strip())
+                        cap_value = float((metrics or {}).get("market_cap_musd", 0) or 0)
+                    market_cap = cap_value / 100.0
+            except Exception as e:
+                logger.debug("Slow trend market cap failed: market=%s symbol=%s err=%s", mkt, symbol, e)
+                cap_value = 0.0
+                market_cap = 0.0
             if cap_value <= 0 or cap_value < cap_floor.get(mkt, 0):
                 continue
 
@@ -1093,6 +1234,7 @@ def get_slow_trend(
         "mode": "slow",
         "days": 60,
         "limit": limit,
+        "candidate_source": "baseline/watchlist/positions/seed_pool/daily_rank/trend_daily_bar",
         "thresholds": {
             "return_20d_min": min20,
             "return_60d_min": min60,
