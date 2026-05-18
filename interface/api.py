@@ -616,6 +616,39 @@ def get_holds(user: str = Depends(get_current_user)):
         })
     return {"items": result}
 
+@app.get("/api/trades/history")
+def get_trade_history(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    market: str = Query(default=""),
+    symbol: str = Query(default=""),
+    review_status: str = Query(default=""),
+    sort: str = Query(default="exit_date_desc"),
+    user: str = Depends(get_current_user),
+):
+    allowed_sort = {
+        "exit_date_desc", "exit_date_asc",
+        "entry_date_desc", "entry_date_asc",
+        "pnl_desc", "pnl_asc",
+        "hold_days_desc", "hold_days_asc",
+    }
+    if sort not in allowed_sort:
+        raise HTTPException(status_code=400, detail=f"sort must be one of {sorted(allowed_sort)}")
+
+    from modules.paper_trading.service import PaperTradingService
+    svc = PaperTradingService()
+    scope = os.getenv("WEB_TRADE_HISTORY_SCOPE", "all").strip().lower()
+    chat_id = None if scope in {"all", "admin"} else int(os.getenv("ALLOWED_USER_IDS", "0").split(",")[0])
+    return svc.get_trade_history(
+        chat_id=chat_id,
+        page=page,
+        page_size=page_size,
+        market=market,
+        symbol=symbol,
+        review_status=review_status,
+        sort=sort,
+    )
+
 @app.post("/api/trade/buy")
 def trade_buy(req: BuyRequest, user: str = Depends(get_current_user)):
     from modules.paper_trading.service import PaperTradingService

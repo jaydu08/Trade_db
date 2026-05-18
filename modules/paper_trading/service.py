@@ -4,7 +4,7 @@ Paper Trading Service
 """
 import logging
 import datetime
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from sqlmodel import select
 
@@ -188,6 +188,118 @@ class PaperTradingService:
                 PaperTrade.status == "ACTIVE"
             ).order_by(PaperTrade.entry_date.desc())
             return list(session.exec(stmt).all())
+
+    @staticmethod
+    def _trade_payload(trade: PaperTrade, include_review: bool = True) -> Dict:
+        """Serialize a PaperTrade row for web/API responses."""
+        end_date = trade.exit_date or datetime.date.today()
+        hold_days = (end_date - trade.entry_date).days if trade.entry_date else 0
+        payload = {
+            "id": trade.id,
+            "symbol": trade.symbol,
+            "name": trade.name,
+            "market": trade.market,
+            "entry_price": trade.entry_price,
+            "entry_date": str(trade.entry_date) if trade.entry_date else "",
+            "target_days": trade.target_days,
+            "entry_reason": trade.entry_reason or "",
+            "status": trade.status,
+            "exit_price": trade.exit_price,
+            "exit_date": str(trade.exit_date) if trade.exit_date else "",
+            "hold_days": hold_days,
+            "days_held": hold_days,
+            "pnl_pct": trade.pnl_pct,
+            "review_status": trade.review_status or PaperTradingService.REVIEW_PENDING,
+            "review_attempts": int(trade.review_attempts or 0),
+            "review_source": trade.review_source or "",
+            "last_reviewed_at": str(trade.last_reviewed_at) if trade.last_reviewed_at else "",
+        }
+        if include_review:
+            payload.update({
+                "review_text": trade.review_text or "",
+                "review_error": trade.review_error or "",
+            })
+        return payload
+
+    @staticmethod
+    def get_trade_history(
+        chat_id: Optional[int] = None,
+        page: int = 1,
+        page_size: int = 20,
+        market: str = "",
+        symbol: str = "",
+        review_status: str = "",
+        sort: str = "exit_date_desc",
+    ) -> Dict:
+        """获取 CLOSED 模拟交易历史，复用 papertrade 表，避免重复历史表。"""
+        page = max(1, int(page or 1))
+        page_size = max(1, min(100, int(page_size or 20)))
+        market = str(market or "").strip().upper()
+        symbol_q = str(symbol or "").strip().upper()
+        review_status = str(review_status or "").strip().upper()
+
+        with db_manager.ledger_session() as session:
+            stmt = select(PaperTrade).where(PaperTrade.status == "CLOSED")
+            if chat_id is not None:
+                stmt = stmt.where(PaperTrade.chat_id == chat_id)
+            rows = list(session.exec(stmt).all())
+
+        if market:
+            rows = [t for t in rows if str(t.market or "").upper() == market]
+        if symbol_q:
+            rows = [
+                t for t in rows
+                if symbol_q in str(t.symbol or "").upper()
+                or symbol_q in str(t.name or "").upper()
+            ]
+        if review_status:
+            rows = [t for t in rows if str(t.review_status or "").upper() == review_status]
+
+        def _hold_days(t: PaperTrade) -> int:
+            end_date = t.exit_date or datetime.date.today()
+            return (end_date - t.entry_date).days if t.entry_date else 0
+
+        total = len(rows)
+        pnl_values = [float(t.pnl_pct) for t in rows if t.pnl_pct is not None]
+        hold_values = [_hold_days(t) for t in rows]
+        wins = len([v for v in pnl_values if v > 0])
+        losses = len([v for v in pnl_values if v < 0])
+        win_rate = round(wins / len(pnl_values) * 100, 2) if pnl_values else 0.0
+        avg_pnl = round(sum(pnl_values) / len(pnl_values), 2) if pnl_values else 0.0
+        avg_hold_days = round(sum(hold_values) / len(hold_values), 1) if hold_values else 0.0
+        best = max(rows, key=lambda t: float(t.pnl_pct if t.pnl_pct is not None else -10**9), default=None)
+        worst = min(rows, key=lambda t: float(t.pnl_pct if t.pnl_pct is not None else 10**9), default=None)
+
+        def _sort_key(t: PaperTrade):
+            if sort.startswith("pnl"):
+                return float(t.pnl_pct if t.pnl_pct is not None else -10**9)
+            if sort.startswith("hold_days"):
+                return _hold_days(t)
+            if sort.startswith("entry_date"):
+                return t.entry_date or datetime.date.min
+            return t.exit_date or t.updated_at.date() if getattr(t.updated_at, "date", None) else datetime.date.min
+
+        reverse = not sort.endswith("_asc")
+        rows.sort(key=_sort_key, reverse=reverse)
+        start = (page - 1) * page_size
+        page_rows = rows[start:start + page_size]
+
+        return {
+            "items": [PaperTradingService._trade_payload(t, include_review=True) for t in page_rows],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "summary": {
+                "total": total,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": win_rate,
+                "avg_pnl": avg_pnl,
+                "avg_hold_days": avg_hold_days,
+                "best_trade": PaperTradingService._trade_payload(best, include_review=False) if best else None,
+                "worst_trade": PaperTradingService._trade_payload(worst, include_review=False) if worst else None,
+            },
+        }
 
     @staticmethod
     def check_expired_trades() -> List[PaperTrade]:
