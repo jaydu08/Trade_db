@@ -1072,9 +1072,11 @@ class MarketHeatMap:
             logger.error(f"Failed to fetch market data for {market}: {e}")
             return
             
-        # 2. 生成榜单配置
+        # 2. 生成榜单配置：TG 推送仍保持精简，Web 当日强势额外落库更宽候选池。
         min_amt = 50_000_000   # CN/HK: 5000万人民币
-        n = 10
+        push_n = 10
+        persist_n = int(os.getenv("DAILY_HOT_PERSIST_TOP_N", "80") or 80)
+        persist_n = max(push_n, min(200, persist_n))
         cn_total_amount = 0.0
 
         if market == 'CN':
@@ -1089,19 +1091,20 @@ class MarketHeatMap:
             # 回调至 2000万美元（配合 Finnhub 接口做 1亿美金市值精确过滤）
             min_amt = 20_000_000
         elif market == 'HK':
-            n = 5
+            push_n = 5
 
-        top_stocks = self._generate_heatmap(df, market, top_n=n, min_amount=min_amt)
+        persist_stocks = self._generate_heatmap(df, market, top_n=persist_n, min_amount=min_amt)
+        top_stocks = persist_stocks[:push_n]
         
         if not top_stocks:
             logger.warning(f"No stocks found for {market} heat map. Fallback to daily top ranks.")
             fallback_df = akshare_client.get_daily_top_ranks(
-                market=market, rank_type="change_pct", top_n=n
+                market=market, rank_type="change_pct", top_n=persist_n
             )
             if fallback_df.empty:
                 logger.warning(f"Fallback daily ranks still empty for {market}.")
                 return
-            top_stocks = [
+            persist_stocks = [
                 {
                     "symbol": str(row.get("symbol", "")),
                     "name": str(row.get("name", "")),
@@ -1112,6 +1115,9 @@ class MarketHeatMap:
                 }
                 for _, row in fallback_df.iterrows()
             ]
+            top_stocks = persist_stocks[:push_n]
+
+        persist_results = [dict(stock) for stock in persist_stocks]
 
         # 3. 日报智能归因（默认关闭）
         results = []
@@ -1169,9 +1175,16 @@ class MarketHeatMap:
             for s in results:
                 s.setdefault("pattern_tag", "")
 
-        # 4. 先把热榜结果直接写入 DailyRank，统一“推送口径=入库口径”
+        # 4. 宽候选池落库给 Web 当日强势；TG 推送仍只使用 results。
+        persist_map = {str(r.get("symbol", "")): dict(r) for r in persist_results if str(r.get("symbol", ""))}
+        for r in results:
+            sym = str(r.get("symbol", ""))
+            if sym:
+                persist_map[sym] = dict(r)
+        persist_rows = sorted(persist_map.values(), key=lambda x: float(x.get("pct_chg", 0) or 0), reverse=True)
+
         try:
-            self._persist_daily_rank_from_heatmap(market, results)
+            self._persist_daily_rank_from_heatmap(market, persist_rows)
         except Exception as e:
             logger.error(f"Failed to persist DailyRank from heatmap ({market}): {e}")
         
@@ -1179,7 +1192,7 @@ class MarketHeatMap:
         try:
             from modules.monitor.trend_service import TrendService
             pool_items = []
-            for r in results:
+            for r in persist_rows:
                 reason = str(r.get("reason", "") or "").strip()
                 catalyst = str(r.get("catalyst_tags", "") or "").strip()
                 pattern = str(r.get("pattern_tag", "") or "").strip()
@@ -1200,7 +1213,7 @@ class MarketHeatMap:
                     "turnover_rate": float(r.get("turnover", 0) or 0),
                     "catalyst_tags": str(r.get("catalyst_tags", "") or ""),
                 }
-                for r in results
+                for r in persist_rows
             ]
             TrendService.save_daily_bars(market, bar_items, source="heatmap")
         except Exception as e:
