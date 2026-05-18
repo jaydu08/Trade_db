@@ -29,27 +29,160 @@ class USPremarketScannerService:
             return default
 
     @staticmethod
+    def _normalize_us_symbol(symbol: str) -> str:
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            return ""
+        if "." in sym and sym.split(".", 1)[0].isdigit():
+            sym = sym.split(".")[-1].strip()
+        # Sina uses "$" for class-share separators, but accepts gb_brk$b.
+        sym = sym.replace("/", ".").replace("-", ".")
+        return sym
+
+    @staticmethod
+    def _is_excluded_us_asset(symbol: str, name: str = "") -> bool:
+        """Drop obvious non-common-stock symbols before pre-market scanning."""
+        sym = USPremarketScannerService._normalize_us_symbol(symbol)
+        if not sym or len(sym) > 10:
+            return True
+        low = str(name or "").lower()
+        upper = sym.upper()
+
+        leveraged_tickers = {
+            "TQQQ", "SQQQ", "SOXL", "SOXS", "SPXL", "SPXS", "TNA", "TZA",
+            "UVXY", "SVXY", "LABU", "LABD", "BOIL", "KOLD", "DUST", "NUGT",
+            "JNUG", "JDST", "FAS", "FAZ", "TECL", "TECS", "WEBL", "WEBS",
+            "FNGU", "FNGD", "YINN", "YANG", "NVD", "NVDL", "NVDS", "NVDU",
+            "TSLL", "TSLS", "TSLQ", "TSDD", "TSLZ", "TSLT", "MSTX", "MSTZ",
+            "MSTU", "MUU", "AMDL", "AMDS", "BABX", "AAPU", "AAPD", "GGLL",
+            "GGLS", "CONL", "ZSL", "AGQ", "UCO", "SCO", "GUSH", "DRIP",
+        }
+        if upper in leveraged_tickers:
+            return True
+        if any(x in upper for x in ["_WS", ".WS", "_WT", ".WT", "_RT", ".RT"]):
+            return True
+        if upper.endswith((".U", "_U")):
+            return True
+        # Five-character tickers ending in W/WW are overwhelmingly warrants in this universe.
+        if len(upper) >= 5 and upper.endswith("W"):
+            return True
+        if any(k in low for k in ["warrant", " wt", " right", " unit", " units"]):
+            return True
+        if any(k in low for k in ["2x", "3x", "bull", "bear", "inverse", "leveraged"]):
+            return True
+        # Most ETF/ETN products do not have useful equity market-cap semantics for this scanner.
+        if any(k in low for k in [" etf", "etf ", " etn", "etn "]):
+            return True
+        return False
+
+    @staticmethod
     def _load_us_symbols(limit: int) -> List[str]:
-        try:
-            conn = sqlite3.connect("data/meta.db")
-            cur = conn.cursor()
-            cur.execute("SELECT symbol FROM asset WHERE market=?", ("US",))
-            rows = cur.fetchall()
-            conn.close()
-        except Exception as e:
-            logger.warning("US premarket: load symbols failed: %s", e)
-            return []
+        """Build a quality-first US pre-market universe.
+
+        Priority order: large-cap baseline, user/watch positions, recent trend seeds,
+        recent high-turnover ranks/bars, then filtered meta.db fallback.
+        """
+        max_total = max(50, int(limit or 1800))
+        max_rank = int(os.getenv("US_PREMARKET_RANK_SYMBOL_LIMIT", "900") or 900)
+        max_bar = int(os.getenv("US_PREMARKET_BAR_SYMBOL_LIMIT", "900") or 900)
+        max_seed = int(os.getenv("US_PREMARKET_SEED_SYMBOL_LIMIT", "400") or 400)
 
         out: List[str] = []
         seen = set()
-        for row in rows:
-            sym = str((row or [""])[0] or "").split(".")[-1].strip().upper()
-            if (not sym) or (sym in seen):
-                continue
+        stats = {"baseline": 0, "manual": 0, "seed": 0, "rank": 0, "bar": 0, "meta": 0, "excluded": 0}
+
+        def add(symbol: str, name: str = "", source: str = "meta"):
+            if len(out) >= max_total:
+                return
+            sym = USPremarketScannerService._normalize_us_symbol(symbol)
+            if (not sym) or sym in seen:
+                return
+            if USPremarketScannerService._is_excluded_us_asset(sym, name):
+                stats["excluded"] += 1
+                return
             seen.add(sym)
             out.append(sym)
-            if len(out) >= limit:
+            stats[source] = stats.get(source, 0) + 1
+
+        try:
+            from modules.monitor.trend_service import TrendService
+
+            for item in TrendService._baseline_seed_items().get("US", []):
+                add(item.get("symbol", ""), item.get("name", ""), "baseline")
+
+            for source_items in (TrendService._watchlist_seed_items(), TrendService._paper_trade_seed_items()):
+                for item in source_items.get("US", []):
+                    add(item.get("symbol", ""), item.get("name", ""), "manual")
+        except Exception as e:
+            logger.debug("US premarket: priority symbols failed: %s", e)
+
+        try:
+            from core.db import get_ledger_session
+            from domain.ledger.analytics import DailyRank, TrendDailyBar, TrendSeedPool
+            from sqlmodel import select
+
+            today = dt.date.today()
+            with get_ledger_session() as session:
+                seed_rows = session.exec(
+                    select(TrendSeedPool.symbol, TrendSeedPool.name)
+                    .where(TrendSeedPool.market == "US")
+                    .where(TrendSeedPool.date >= today - dt.timedelta(days=120))
+                    .order_by(TrendSeedPool.date.desc())
+                    .limit(max_seed * 3)
+                ).all()
+                for symbol, name in seed_rows:
+                    add(symbol, name, "seed")
+                    if stats["seed"] >= max_seed:
+                        break
+
+                rank_rows = session.exec(
+                    select(DailyRank.symbol, DailyRank.name)
+                    .where(DailyRank.market == "US")
+                    .where(DailyRank.date >= today - dt.timedelta(days=30))
+                    .order_by(DailyRank.amount.desc(), DailyRank.date.desc())
+                    .limit(max_rank * 3)
+                ).all()
+                for symbol, name in rank_rows:
+                    add(symbol, name, "rank")
+                    if stats["rank"] >= max_rank:
+                        break
+
+                bar_rows = session.exec(
+                    select(TrendDailyBar.symbol, TrendDailyBar.name)
+                    .where(TrendDailyBar.market == "US")
+                    .where(TrendDailyBar.date >= today - dt.timedelta(days=60))
+                    .order_by(TrendDailyBar.amount.desc(), TrendDailyBar.date.desc())
+                    .limit(max_bar * 3)
+                ).all()
+                for symbol, name in bar_rows:
+                    add(symbol, name, "bar")
+                    if stats["bar"] >= max_bar:
+                        break
+        except Exception as e:
+            logger.warning("US premarket: local high-liquidity universe failed: %s", e)
+
+        try:
+            conn = sqlite3.connect("data/meta.db")
+            cur = conn.cursor()
+            cur.execute("SELECT symbol, name FROM asset WHERE market=?", ("US",))
+            rows = cur.fetchall()
+            conn.close()
+        except Exception as e:
+            logger.warning("US premarket: load meta fallback failed: %s", e)
+            rows = []
+
+        for row in rows:
+            if len(out) >= max_total:
                 break
+            symbol = str((row or [""])[0] or "")
+            name = str((row or ["", ""])[1] or "") if len(row or []) > 1 else ""
+            add(symbol, name, "meta")
+
+        logger.info(
+            "US premarket universe built: total=%s baseline=%s manual=%s seed=%s rank=%s bar=%s meta=%s excluded=%s limit=%s",
+            len(out), stats.get("baseline", 0), stats.get("manual", 0), stats.get("seed", 0),
+            stats.get("rank", 0), stats.get("bar", 0), stats.get("meta", 0), stats.get("excluded", 0), max_total,
+        )
         return out
 
     @staticmethod
