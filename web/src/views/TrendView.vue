@@ -86,6 +86,10 @@ function resetTableState() {
   sortOrder.value = ''
 }
 
+function wait(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
 function normalizeTrendItems(mkt: string, items: any[], mode: TrendMode): TrendItem[] {
   return (items || []).map((item: any, idx: number) => ({
     rank: idx + 1,
@@ -148,7 +152,21 @@ async function fetchTrend(force = false) {
       endpoint = '/trend/slow'
     }
 
-    const res = await api.get(endpoint, { params })
+    const maxAttempts = mode === 'daily' || mode === 'slow' ? 2 : 1
+    const requestTimeout = mode === 'slow' ? 90000 : mode === 'daily' ? 60000 : 30000
+    let res: any = null
+    let lastError: any = null
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        res = await api.get(endpoint, { params, timeout: requestTimeout })
+        break
+      } catch (err: any) {
+        lastError = err
+        if (attempt < maxAttempts) await wait(800)
+      }
+    }
+    if (!res) throw lastError
+
     const raw = res.data.markets || {}
     const sourceItems = Array.isArray(raw[market]) ? raw[market] : []
     const nextItems = normalizeTrendItems(market, sourceItems, mode)
