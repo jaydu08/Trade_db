@@ -106,3 +106,12 @@ def get_us_market_metrics(symbol: str) -> Dict[str, float]:
         return sina
 
     return {}
+
+
+@cached("us_market_metrics_light", ttl=1800)
+def get_us_market_metrics_light(symbol: str) -> Dict[str, float]:
+    """Lightweight US market-cap lookup for UI list enrichment: Sina only."""
+    raw = str(symbol or "").split(".")[-1].strip().upper()
+    if not raw:
+        return {}
+    return _market_cap_from_sina(raw)

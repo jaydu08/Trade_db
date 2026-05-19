@@ -395,8 +395,8 @@ class MarketHeatMap:
             logger.warning("Heatmap market brief LLM failed for %s: %s", market, e)
             return ""
 
-    def _persist_daily_rank_from_heatmap(self, market: str, results: List[Dict]):
-        """将热榜结果直接写入 DailyRank（口径统一为 heatmap 结果）"""
+    def _persist_daily_rank_from_heatmap(self, market: str, results: List[Dict], rank_type: str = "change_pct"):
+        """将热榜结果写入 DailyRank；change_pct 保持 TG 推送口径，daily_hot 供 Web 扩容。"""
         from sqlmodel import select
         from core.db import db_manager
         from domain.ledger.analytics import DailyRank
@@ -411,7 +411,7 @@ class MarketHeatMap:
                 DailyRank(
                     date=today,
                     market=market,
-                    rank_type="change_pct",
+                    rank_type=rank_type,
                     symbol=str(item.get("symbol", "")),
                     name=str(item.get("name", "")),
                     price=float(item.get("price", 0) or 0),
@@ -426,7 +426,7 @@ class MarketHeatMap:
                 select(DailyRank).where(
                     DailyRank.date == today,
                     DailyRank.market == market,
-                    DailyRank.rank_type == "change_pct",
+                    DailyRank.rank_type == rank_type,
                 )
             ).all()
             for old in existing:
@@ -435,7 +435,7 @@ class MarketHeatMap:
                 session.add_all(rows)
             session.commit()
 
-        logger.info("DailyRank synced from heatmap: market=%s rows=%s date=%s", market, len(rows), today)
+        logger.info("DailyRank synced from heatmap: market=%s rank_type=%s rows=%s date=%s", market, rank_type, len(rows), today)
 
     def _load_recent_avg_amount_map(self, market: str, symbols: List[str], lookback_days: int = 12) -> Dict[str, float]:
         if not symbols:
@@ -1184,15 +1184,16 @@ class MarketHeatMap:
         persist_rows = sorted(persist_map.values(), key=lambda x: float(x.get("pct_chg", 0) or 0), reverse=True)
 
         try:
-            self._persist_daily_rank_from_heatmap(market, persist_rows)
+            self._persist_daily_rank_from_heatmap(market, results, rank_type="change_pct")
+            self._persist_daily_rank_from_heatmap(market, persist_rows, rank_type="daily_hot")
         except Exception as e:
             logger.error(f"Failed to persist DailyRank from heatmap ({market}): {e}")
         
-        # 5. 存入长线趋势种子池
+        # 5. 存入长线趋势种子池和日线快照；heatmap 保持 TG 原口径，daily_hot 供 Web 扩容。
         try:
             from modules.monitor.trend_service import TrendService
             pool_items = []
-            for r in persist_rows:
+            for r in results:
                 reason = str(r.get("reason", "") or "").strip()
                 catalyst = str(r.get("catalyst_tags", "") or "").strip()
                 pattern = str(r.get("pattern_tag", "") or "").strip()
@@ -1203,19 +1204,23 @@ class MarketHeatMap:
                         reason = catalyst or pattern or ""
                 pool_items.append({"symbol": r["symbol"], "name": r["name"], "reason": reason})
             TrendService.add_to_pool(market, pool_items)
-            bar_items = [
-                {
-                    "symbol": r.get("symbol", ""),
-                    "name": r.get("name", ""),
-                    "price": float(r.get("price", 0) or 0),
-                    "pct_chg": float(r.get("pct_chg", 0) or 0),
-                    "amount": float(r.get("amount", 0) or 0),
-                    "turnover_rate": float(r.get("turnover", 0) or 0),
-                    "catalyst_tags": str(r.get("catalyst_tags", "") or ""),
-                }
-                for r in persist_rows
-            ]
-            TrendService.save_daily_bars(market, bar_items, source="heatmap")
+
+            def _to_bar_items(rows):
+                return [
+                    {
+                        "symbol": r.get("symbol", ""),
+                        "name": r.get("name", ""),
+                        "price": float(r.get("price", 0) or 0),
+                        "pct_chg": float(r.get("pct_chg", 0) or 0),
+                        "amount": float(r.get("amount", 0) or 0),
+                        "turnover_rate": float(r.get("turnover", 0) or 0),
+                        "catalyst_tags": str(r.get("catalyst_tags", "") or ""),
+                    }
+                    for r in rows
+                ]
+
+            TrendService.save_daily_bars(market, _to_bar_items(results), source="heatmap")
+            TrendService.save_daily_bars(market, _to_bar_items(persist_rows), source="daily_hot")
         except Exception as e:
             logger.error(f"Failed to add heatmap results to TrendSeedPool: {e}")
 

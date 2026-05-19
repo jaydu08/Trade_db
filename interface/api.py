@@ -109,7 +109,7 @@ def _enrich_watchlist_realtime(items_raw: dict) -> list:
     import concurrent.futures
     from modules.probing.async_prober import async_prober
     from modules.ingestion.market_cap import get_cn_market_metrics
-    from modules.ingestion.us_market_cap import get_us_market_metrics
+    from modules.ingestion.us_market_cap import get_us_market_metrics, get_us_market_metrics_light
     from modules.ingestion.market_cap import get_hk_market_metrics
 
     # Prepare items for async quote fetch
@@ -829,7 +829,7 @@ def get_slow_trend(
     user: str = Depends(get_current_user),
 ):
     """慢趋势机构票 demo：复用现有 trend 候选池，单独做高门槛过滤，不触发推送。"""
-    cache_key = f"api_trend_slow_demo_v3_{limit}"
+    cache_key = f"api_trend_slow_demo_v4_{limit}"
     cached = get_cache(cache_key)
     if cached:
         return cached
@@ -840,7 +840,7 @@ def get_slow_trend(
     from domain.ledger.analytics import TrendDailyBar, DailyRank, TrendSeedPool
     from sqlmodel import select
     from modules.ingestion.market_cap import get_cn_market_metrics, get_hk_market_metrics
-    from modules.ingestion.us_market_cap import get_us_market_metrics
+    from modules.ingestion.us_market_cap import get_us_market_metrics, get_us_market_metrics_light
     import math
 
     def _env_float(name: str, default: float) -> float:
@@ -1289,7 +1289,7 @@ def get_daily_hot_trend(
     user: str = Depends(get_current_user),
 ):
     """当日强势榜：只使用本地 DailyRank/TrendDailyBar 截面，避免 Web 打开时触发全市场 API。"""
-    cache_key = f"api_trend_daily_hot_v1_{date or 'latest'}_{limit}"
+    cache_key = f"api_trend_daily_hot_v4_{date or 'latest'}_{limit}"
     cached = get_cache(cache_key)
     if cached:
         return cached
@@ -1297,7 +1297,7 @@ def get_daily_hot_trend(
     from core.db import get_ledger_session
     from domain.ledger.analytics import DailyRank, TrendDailyBar
     from modules.ingestion.market_cap import get_cn_market_metrics, get_hk_market_metrics
-    from modules.ingestion.us_market_cap import get_us_market_metrics
+    from modules.ingestion.us_market_cap import get_us_market_metrics, get_us_market_metrics_light
     from modules.monitor.trend_service import TrendCalculator
     from sqlmodel import select, func
     import math
@@ -1341,7 +1341,11 @@ def get_daily_hot_trend(
             "price_min": _env_float("DAILY_HOT_US_PRICE_MIN", 2.0),
         },
     }
-    cap_lookup_limit = max(0, min(160, _env_int("DAILY_HOT_MCAP_LOOKUP_LIMIT", 30)))
+    cap_lookup_limits = {
+        "CN": max(0, min(160, _env_int("DAILY_HOT_CN_MCAP_LOOKUP_LIMIT", _env_int("DAILY_HOT_MCAP_LOOKUP_LIMIT", 80)))),
+        "HK": max(0, min(160, _env_int("DAILY_HOT_HK_MCAP_LOOKUP_LIMIT", _env_int("DAILY_HOT_MCAP_LOOKUP_LIMIT", 80)))),
+        "US": max(0, min(80, _env_int("DAILY_HOT_US_MCAP_LOOKUP_LIMIT", _env_int("DAILY_HOT_MCAP_LOOKUP_LIMIT", 30)))),
+    }
 
     def _to_float(value) -> float:
         try:
@@ -1494,8 +1498,9 @@ def get_daily_hot_trend(
     def _enrich_and_filter_market_cap(market: str, rows: list) -> list:
         if not rows:
             return []
-        sorted_for_lookup = sorted(rows, key=lambda x: (_to_float(x.get("amount")), _to_float(x.get("return_pct"))), reverse=True)
-        lookup_symbols = {str(x.get("symbol", "")) for x in sorted_for_lookup[:cap_lookup_limit]}
+        sorted_for_lookup = sorted(rows, key=lambda x: (_to_float(x.get("return_pct")), _to_float(x.get("amount"))), reverse=True)
+        lookup_limit = int(cap_lookup_limits.get(market, 30) or 0)
+        lookup_symbols = {str(x.get("symbol", "")) for x in sorted_for_lookup[:lookup_limit]}
         out = []
         for item in rows:
             sym = str(item.get("symbol", "")).strip()
@@ -1512,8 +1517,11 @@ def get_daily_hot_trend(
                         cap_value = _to_float((metrics or {}).get("market_cap_100m_hkd")) or _to_float((metrics or {}).get("market_cap_100m_usd"))
                         market_cap_display = cap_value
                     elif market == "US":
-                        metrics = get_us_market_metrics(sym)
+                        # UI daily list uses Sina first to avoid Finnhub/Yahoo rate limits.
+                        metrics = get_us_market_metrics_light(sym)
                         cap_value = _to_float((metrics or {}).get("market_cap_musd"))
+                        if 0 < cap_value < 100.0:
+                            cap_value = 0.0
                         market_cap_display = cap_value / 100.0 if cap_value > 0 else 0.0
                 except Exception as e:
                     logger.debug("Daily hot mcap failed: market=%s symbol=%s err=%s", market, sym, e)
@@ -1655,7 +1663,7 @@ def get_daily_hot_trend(
         "limit": limit,
         "candidate_source": "local DailyRank + TrendDailyBar",
         "thresholds": thresholds,
-        "cap_lookup_limit": cap_lookup_limit,
+        "cap_lookup_limits": cap_lookup_limits,
         "markets": result,
     }
     set_cache(cache_key, payload, ttl=600)
@@ -1715,7 +1723,7 @@ def _enrich_heatmap_market_cap(items: list, market: str):
         return
     try:
         from modules.ingestion.market_cap import get_cn_market_metrics, get_hk_market_metrics
-        from modules.ingestion.us_market_cap import get_us_market_metrics
+        from modules.ingestion.us_market_cap import get_us_market_metrics, get_us_market_metrics_light
 
         for item in items:
             raw_sym = item.get("symbol", "")

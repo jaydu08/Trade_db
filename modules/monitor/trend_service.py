@@ -24,6 +24,7 @@ class TrendService:
         "trend_pool_history_backfill",
         "commodity",
         "heatmap",
+        "daily_hot",
         "selftest",
     }
     POOL_RETENTION_DAYS = 60
