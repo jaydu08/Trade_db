@@ -56,81 +56,116 @@ interface TrendItem {
   price_date: string
 }
 
+type TrendMode = 'hot' | 'daily' | 'slow'
+
 const markets = ['CN', 'HK', 'US']
 const daysOptions = [3, 7, 14, 30, 60, 90, 180]
-const activeMode = ref<'hot' | 'daily' | 'slow'>('hot')
+const activeMode = ref<TrendMode>('hot')
 const activeMarket = ref('CN')
 const activeDays = ref(7)
 const loading = ref(false)
-const allData = ref<Record<string, TrendItem[]>>({})
+const loadingKey = ref('')
+const trendCache = ref<Record<string, TrendItem[]>>({})
 
 const pageSize = ref(20)
 const currentPage = ref(1)
 const sortProp = ref<string>('')
 const sortOrder = ref<'ascending' | 'descending' | ''>('')
 
-async function fetchTrend() {
+function makeCacheKey(
+  mode: TrendMode = activeMode.value,
+  market: string = activeMarket.value,
+  days: number = activeDays.value,
+): string {
+  return mode === 'hot' ? `${mode}:${market}:${days}` : `${mode}:${market}`
+}
+
+function resetTableState() {
+  currentPage.value = 1
+  sortProp.value = ''
+  sortOrder.value = ''
+}
+
+function normalizeTrendItems(mkt: string, items: any[], mode: TrendMode): TrendItem[] {
+  return (items || []).map((item: any, idx: number) => ({
+    rank: idx + 1,
+    symbol: item.symbol || '',
+    name: item.name || '',
+    market: mkt,
+    price: item.price || 0,
+    period_change: mode === 'slow' ? (item.return_60d || item.return_pct || 0) : (item.return_pct || 0),
+    return_20d: item.return_20d || 0,
+    return_60d: item.return_60d || item.return_pct || 0,
+    amount: item.amount || 0,
+    turnover_rate: item.turnover_rate || 0,
+    score: item.trend_score || 0,
+    catalyst_tags: item.catalyst_tags || '',
+    days_on_list: item.days_on_list || 0,
+    market_cap: item.market_cap || 0,
+    inst_factor: item.inst_factor || 0,
+    inst_label: item.inst_label || '',
+    inst_change_pp: item.inst_change_pp || 0,
+    inst_delta_abs: item.inst_delta_abs || item.inst_change_pp || 0,
+    inst_delta_pct: item.inst_delta_pct || 0,
+    inst_start_value: item.inst_start_value || 0,
+    inst_end_value: item.inst_end_value || 0,
+    inst_start_date: item.inst_start_date || '',
+    inst_end_date: item.inst_end_date || item.inst_date || '',
+    inst_metric_unit: item.inst_metric_unit || 'percentage_point',
+    inst_date: item.inst_date || '',
+    inst_text: item.inst_text || '',
+    inst_source: item.inst_source || '',
+    inst_direction: item.inst_direction || '',
+    capital_signal_items: Array.isArray(item.capital_signal_items) ? item.capital_signal_items : [],
+    capital_signal_score: item.capital_signal_score || 0,
+    capital_signal_coverage: item.capital_signal_coverage || {},
+    signal_strength: item.signal_strength || 0,
+    price_date: item.price_date || '',
+  }))
+}
+
+async function fetchTrend(force = false) {
+  const mode = activeMode.value
+  const market = activeMarket.value
+  const days = activeDays.value
+  const key = makeCacheKey(mode, market, days)
+
+  if (!force && trendCache.value[key]) {
+    if (loadingKey.value !== key) loading.value = false
+    return
+  }
+
+  loadingKey.value = key
   loading.value = true
   try {
     let endpoint = '/trend'
-    let params: Record<string, number> = { days: activeDays.value, limit: 100 }
-    if (activeMode.value === 'daily') {
+    const params: Record<string, number | string> = { limit: 100, market }
+    if (mode === 'hot') {
+      params.days = days
+    } else if (mode === 'daily') {
       endpoint = '/trend/daily'
-      params = { limit: 100 }
-    } else if (activeMode.value === 'slow') {
+    } else if (mode === 'slow') {
       endpoint = '/trend/slow'
-      params = { limit: 100 }
     }
-    const mode = activeMode.value
+
     const res = await api.get(endpoint, { params })
-    const marketsData: Record<string, TrendItem[]> = {}
     const raw = res.data.markets || {}
-    for (const [mkt, items] of Object.entries(raw) as [string, any[]][]) {
-      marketsData[mkt] = (items || []).map((item: any, idx: number) => ({
-        rank: idx + 1,
-        symbol: item.symbol || '',
-        name: item.name || '',
-        market: mkt,
-        price: item.price || 0,
-        period_change: mode === 'slow' ? (item.return_60d || item.return_pct || 0) : (item.return_pct || 0),
-        return_20d: item.return_20d || 0,
-        return_60d: item.return_60d || item.return_pct || 0,
-        amount: item.amount || 0,
-        turnover_rate: item.turnover_rate || 0,
-        score: item.trend_score || 0,
-        catalyst_tags: item.catalyst_tags || '',
-        days_on_list: item.days_on_list || 0,
-        market_cap: item.market_cap || 0,
-        inst_factor: item.inst_factor || 0,
-        inst_label: item.inst_label || "",
-        inst_change_pp: item.inst_change_pp || 0,
-        inst_delta_abs: item.inst_delta_abs || item.inst_change_pp || 0,
-        inst_delta_pct: item.inst_delta_pct || 0,
-        inst_start_value: item.inst_start_value || 0,
-        inst_end_value: item.inst_end_value || 0,
-        inst_start_date: item.inst_start_date || "",
-        inst_end_date: item.inst_end_date || item.inst_date || "",
-        inst_metric_unit: item.inst_metric_unit || "percentage_point",
-        inst_date: item.inst_date || "",
-        inst_text: item.inst_text || "",
-        inst_source: item.inst_source || "",
-        inst_direction: item.inst_direction || "",
-        capital_signal_items: Array.isArray(item.capital_signal_items) ? item.capital_signal_items : [],
-        capital_signal_score: item.capital_signal_score || 0,
-        capital_signal_coverage: item.capital_signal_coverage || {},
-        signal_strength: item.signal_strength || 0,
-        price_date: item.price_date || '',
-      }))
-    }
-    allData.value = marketsData
+    const sourceItems = Array.isArray(raw[market]) ? raw[market] : []
+    const nextItems = normalizeTrendItems(market, sourceItems, mode)
+    trendCache.value = { ...trendCache.value, [key]: nextItems }
   } catch (e: any) {
-    ElMessage.error(e?.response?.data?.detail || '加载趋势数据失败')
+    if (loadingKey.value === key) {
+      ElMessage.error(e?.response?.data?.detail || '加载趋势数据失败')
+    }
   } finally {
-    loading.value = false
+    if (loadingKey.value === key) {
+      loading.value = false
+      loadingKey.value = ''
+    }
   }
 }
 
-const currentItems = computed<TrendItem[]>(() => allData.value[activeMarket.value] || [])
+const currentItems = computed<TrendItem[]>(() => trendCache.value[makeCacheKey()] || [])
 
 const sortedItems = computed<TrendItem[]>(() => {
   const list = [...currentItems.value]
@@ -156,21 +191,18 @@ const pagedItems = computed<TrendItem[]>(() => {
 })
 
 watch(activeMarket, () => {
-  currentPage.value = 1
-  sortProp.value = ''
-  sortOrder.value = ''
+  resetTableState()
+  fetchTrend()
 })
 
 watch(activeDays, () => {
   if (activeMode.value !== 'hot') return
-  currentPage.value = 1
+  resetTableState()
   fetchTrend()
 })
 
 watch(activeMode, () => {
-  currentPage.value = 1
-  sortProp.value = ''
-  sortOrder.value = ''
+  resetTableState()
   fetchTrend()
 })
 

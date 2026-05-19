@@ -673,15 +673,25 @@ def trade_sell(req: SellRequest, user: str = Depends(get_current_user)):
     return {"ok": True, "message": msg}
 
 # --------------- Routes: Trend ---------------
+def _normalize_trend_market(market: str, allowed_markets) -> str:
+    market_filter = str(market or "").strip().upper()
+    if not market_filter:
+        return ""
+    if market_filter not in allowed_markets:
+        raise HTTPException(status_code=400, detail=f"market must be one of {sorted(allowed_markets)}")
+    return market_filter
+
 @app.get("/api/trend")
 def get_trend(
     days: int = Query(default=7, ge=3, le=180),
     limit: int = Query(default=100, ge=10, le=200),
+    market: str = Query(default=""),
     user: str = Depends(get_current_user),
 ):
     allowed_days = {3, 7, 14, 30, 60, 90, 180}
     if days not in allowed_days:
         raise HTTPException(status_code=400, detail=f"days must be one of {sorted(allowed_days)}")
+    market_filter = _normalize_trend_market(market, {"CN", "HK", "US", "CF"})
 
     from modules.monitor.trend_service import TrendCalculator
     from modules.ingestion.institutional_factor import get_institutional_change_map
@@ -691,6 +701,8 @@ def get_trend(
 
     calc = TrendCalculator()
     raw = calc.calculate_trend(days=days, topn_override=limit)
+    if market_filter:
+        raw = {market_filter: raw.get(market_filter, [])}
 
     cutoff = dt.date.today() - dt.timedelta(days=max(30, days))
     symbols_by_market = {}
@@ -820,16 +832,18 @@ def get_trend(
                 "capital_signal_coverage": inst_payload.get("capital_signal_coverage", {}) or {},
             })
         result[mkt] = transformed
-    return {"days": days, "limit": limit, "markets": result}
+    return {"days": days, "limit": limit, "market": market_filter, "markets": result}
 
 
 @app.get("/api/trend/slow")
 def get_slow_trend(
     limit: int = Query(default=100, ge=10, le=200),
+    market: str = Query(default=""),
     user: str = Depends(get_current_user),
 ):
     """慢趋势机构票 demo：复用现有 trend 候选池，单独做高门槛过滤，不触发推送。"""
-    cache_key = f"api_trend_slow_demo_v4_{limit}"
+    market_filter = _normalize_trend_market(market, {"CN", "HK", "US"})
+    cache_key = f"api_trend_slow_demo_v5_{market_filter or 'ALL'}_{limit}"
     cached = get_cache(cache_key)
     if cached:
         return cached
@@ -981,7 +995,7 @@ def get_slow_trend(
 
     def _build_slow_candidates() -> Dict[str, List[Dict]]:
         """Build an independent slow-trend universe from local seeds and high-liquidity history."""
-        markets = ["CN", "HK", "US"]
+        markets = [market_filter] if market_filter else ["CN", "HK", "US"]
         max_per_market = max(60, min(500, _env_int("SLOW_TREND_CANDIDATE_MAX_PER_MARKET", 240)))
         stores: Dict[str, Dict[str, Dict]] = {m: {} for m in markets}
 
@@ -1267,6 +1281,7 @@ def get_slow_trend(
         "mode": "slow",
         "days": 60,
         "limit": limit,
+        "market": market_filter,
         "candidate_source": "baseline/watchlist/positions/seed_pool/daily_rank/trend_daily_bar",
         "thresholds": {
             "return_20d_min": min20,
@@ -1286,10 +1301,12 @@ def get_slow_trend(
 def get_daily_hot_trend(
     date: str = Query(default=""),
     limit: int = Query(default=100, ge=10, le=200),
+    market: str = Query(default=""),
     user: str = Depends(get_current_user),
 ):
     """当日强势榜：只使用本地 DailyRank/TrendDailyBar 截面，避免 Web 打开时触发全市场 API。"""
-    cache_key = f"api_trend_daily_hot_v4_{date or 'latest'}_{limit}"
+    market_filter = _normalize_trend_market(market, {"CN", "HK", "US"})
+    cache_key = f"api_trend_daily_hot_v5_{market_filter or 'ALL'}_{date or 'latest'}_{limit}"
     cached = get_cache(cache_key)
     if cached:
         return cached
@@ -1302,7 +1319,7 @@ def get_daily_hot_trend(
     from sqlmodel import select, func
     import math
 
-    markets = ["CN", "HK", "US"]
+    markets = [market_filter] if market_filter else ["CN", "HK", "US"]
 
     def _env_float(name: str, default: float) -> float:
         try:
@@ -1661,6 +1678,7 @@ def get_daily_hot_trend(
         "date": str(requested_date or ""),
         "market_dates": market_dates,
         "limit": limit,
+        "market": market_filter,
         "candidate_source": "local DailyRank + TrendDailyBar",
         "thresholds": thresholds,
         "cap_lookup_limits": cap_lookup_limits,
