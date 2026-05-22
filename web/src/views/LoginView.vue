@@ -16,7 +16,7 @@ async function handleLogin() {
   error.value = ''
   try {
     const res = await api.post('/login', { username: username.value.trim() })
-    auth.setAuth(res.data.token, res.data.username)
+    auth.setAuth(res.data.token, res.data.username, res.data.role || 'user', res.data.chat_id || 0)
     router.push('/list')
   } catch (e: any) {
     error.value = e.response?.data?.detail || '登录失败'
@@ -33,7 +33,7 @@ async function handleLogin() {
         <span class="logo-icon">T</span>
       </div>
       <h1 class="login-title">Trade DB</h1>
-      <p class="login-subtitle">输入用户名登录</p>
+      <p class="login-subtitle">输入已配置账号登录</p>
       <form @submit.prevent="handleLogin" class="login-form">
         <input
           v-model="username"

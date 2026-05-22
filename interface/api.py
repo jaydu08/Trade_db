@@ -3,11 +3,14 @@ FastAPI Web Interface for Trade_db
 Port 9800, JWT auth, serves Vue3 SPA static files.
 """
 import os
+import json
+import hashlib
 import datetime as dt
 import logging
 import time
 import threading
-from typing import Optional, List, Dict
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, HTTPException, Depends, Query, Request
 from fastapi.staticfiles import StaticFiles
@@ -60,6 +63,8 @@ class LoginRequest(BaseModel):
 class LoginResponse(BaseModel):
     token: str
     username: str
+    role: str = "user"
+    chat_id: int = 0
 
 class WatchlistAddRequest(BaseModel):
     symbol: str
@@ -80,35 +85,137 @@ class SellRequest(BaseModel):
     market: str = ""
 
 # --------------- Auth ---------------
-def create_token(username: str) -> str:
+@dataclass(frozen=True)
+class UserContext:
+    username: str
+    role: str = "user"
+    chat_id: int = 0
+
+    @property
+    def is_admin(self) -> bool:
+        return self.role == "admin"
+
+
+def _default_chat_id() -> int:
+    raw = os.getenv("ALLOWED_USER_IDS", "0")
+    first = str(raw).split(",")[0].strip()
+    try:
+        return int(first)
+    except Exception:
+        return 0
+
+
+def _stable_web_chat_id(username: str) -> int:
+    """Create a deterministic negative chat_id for web-only users."""
+    digest = hashlib.md5(username.encode("utf-8")).hexdigest()
+    return -int(digest[:8], 16)
+
+
+def _strip_env_quotes(value: str) -> str:
+    value = str(value or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def _coerce_chat_id(value: Any, username: str, primary_username: str) -> int:
+    if value is None or str(value).strip() == "":
+        return _default_chat_id() if username == primary_username else _stable_web_chat_id(username)
+    try:
+        return int(value)
+    except Exception:
+        logger.warning("Invalid web chat_id for user=%s, using deterministic fallback", username)
+        return _default_chat_id() if username == primary_username else _stable_web_chat_id(username)
+
+
+def _load_web_users() -> Dict[str, UserContext]:
+    """Load lightweight web accounts from env, keeping WEB_USERNAME backward compatible."""
+    primary_username = str(WEB_USERNAME or "game2du").strip() or "game2du"
+    users: Dict[str, UserContext] = {
+        primary_username: UserContext(username=primary_username, role="admin", chat_id=_default_chat_id())
+    }
+
+    raw = _strip_env_quotes(os.getenv("WEB_USERS_JSON", ""))
+    if raw:
+        try:
+            data = json.loads(raw)
+        except Exception as e:
+            logger.warning("WEB_USERS_JSON parse failed, falling back to WEB_USERNAME only: %s", e)
+            data = None
+
+        if isinstance(data, dict):
+            for username, cfg in data.items():
+                name = str(username or "").strip()
+                if not name:
+                    continue
+                default_role = "admin" if name == primary_username else "user"
+                role_value = default_role
+                chat_id_value = None
+                if isinstance(cfg, dict):
+                    role_value = str(cfg.get("role", default_role) or default_role).strip().lower()
+                    chat_id_value = cfg.get("chat_id", cfg.get("chatId"))
+                elif isinstance(cfg, (int, float, str)):
+                    chat_id_value = cfg
+                role = "admin" if role_value == "admin" else "user"
+                users[name] = UserContext(
+                    username=name,
+                    role=role,
+                    chat_id=_coerce_chat_id(chat_id_value, name, primary_username),
+                )
+        elif isinstance(data, list):
+            for username in data:
+                name = str(username or "").strip()
+                if name and name not in users:
+                    users[name] = UserContext(name, "user", _stable_web_chat_id(name))
+
+    extra_users = os.getenv("WEB_EXTRA_USERS", "")
+    for username in str(extra_users or "").split(","):
+        name = username.strip()
+        if name and name not in users:
+            users[name] = UserContext(name, "user", _stable_web_chat_id(name))
+
+    return users
+
+
+def _get_web_user(username: str) -> Optional[UserContext]:
+    name = str(username or "").strip()
+    if not name:
+        return None
+    return _load_web_users().get(name)
+
+
+def create_token(user: UserContext) -> str:
     expire = dt.datetime.utcnow() + dt.timedelta(days=JWT_EXPIRE_DAYS)
-    payload = {"sub": username, "exp": expire}
+    payload = {"sub": user.username, "role": user.role, "chat_id": user.chat_id, "exp": expire}
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
-def get_current_user(request: Request) -> str:
+
+def get_current_user(request: Request) -> UserContext:
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Not authenticated")
     token = auth[7:]
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        username = payload.get("sub")
-        if not username:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        return username
+        username = str(payload.get("sub") or "").strip()
+        user = _get_web_user(username)
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid token user")
+        return user
     except JWTError:
         raise HTTPException(status_code=401, detail="Token expired or invalid")
 
 # --------------- Routes: Auth ---------------
 @app.post("/api/login", response_model=LoginResponse)
 def login(req: LoginRequest):
-    if req.username != WEB_USERNAME:
+    user = _get_web_user(req.username)
+    if not user:
         raise HTTPException(status_code=403, detail="Invalid username")
-    token = create_token(req.username)
-    return LoginResponse(token=token, username=req.username)
+    token = create_token(user)
+    return LoginResponse(token=token, username=user.username, role=user.role, chat_id=user.chat_id)
 
 # --------------- Routes: Watchlist ---------------
-def _enrich_watchlist_realtime(items_raw: dict) -> list:
+def _enrich_watchlist_realtime(items_raw: dict, username: str = "") -> list:
     """Enrich watchlist items with real-time quotes, market cap, drawdown."""
     import asyncio
     import concurrent.futures
@@ -209,11 +316,17 @@ def _enrich_watchlist_realtime(items_raw: dict) -> list:
         try:
             from modules.monitor.repository import WatchlistRepository
             repo = WatchlistRepository()
-            all_items = repo.load_all()
+            if username:
+                all_items = repo.load_all_for_user(username, primary_username=WEB_USERNAME)
+            else:
+                all_items = repo.load_all()
             for k, ep in _backfill_entry_prices.items():
                 if k in all_items:
                     all_items[k]["entry_price"] = ep
-            repo.save_all(all_items)
+            if username:
+                repo.save_all_for_user(username, all_items, primary_username=WEB_USERNAME)
+            else:
+                repo.save_all(all_items)
         except Exception:
             pass
 
@@ -469,22 +582,22 @@ def _get_sina_us_closes_since(symbol: str, since_date) -> list:
 
 
 @app.get("/api/watchlist")
-def get_watchlist(user: str = Depends(get_current_user)):
+def get_watchlist(user: UserContext = Depends(get_current_user)):
     from modules.monitor.repository import WatchlistRepository
     repo = WatchlistRepository()
-    items_raw = repo.load_all()
-    result = _enrich_watchlist_realtime(items_raw)
+    items_raw = repo.load_all_for_user(user.username, primary_username=WEB_USERNAME)
+    result = _enrich_watchlist_realtime(items_raw, username=user.username)
     return {"items": result}
 
 @app.post("/api/watchlist")
-def add_watchlist(req: WatchlistAddRequest, user: str = Depends(get_current_user)):
+def add_watchlist(req: WatchlistAddRequest, user: UserContext = Depends(get_current_user)):
     from modules.monitor.repository import WatchlistRepository
     import asyncio
     from modules.probing.async_prober import async_prober
 
     repo = WatchlistRepository()
     key = f"{req.market}:{req.symbol}"
-    existing = repo.load_all()
+    existing = repo.load_all_for_user(user.username, primary_username=WEB_USERNAME)
     if key in existing:
         raise HTTPException(status_code=409, detail="Already exists")
 
@@ -524,11 +637,11 @@ def add_watchlist(req: WatchlistAddRequest, user: str = Depends(get_current_user
         "entry_price": entry_price,
     }
     existing[key] = item
-    repo.save_all(existing)
+    repo.save_all_for_user(user.username, existing, primary_username=WEB_USERNAME)
     return {"ok": True, "key": key, "entry_price": entry_price}
 
 @app.get("/api/search-stock")
-def search_stock(q: str = Query(default=""), market: str = Query(default=""), user: str = Depends(get_current_user)):
+def search_stock(q: str = Query(default=""), market: str = Query(default=""), user: UserContext = Depends(get_current_user)):
     """Fuzzy search stocks by name/code for add dialog."""
     from core.db import db_manager
     from domain.meta.asset import Asset
@@ -557,51 +670,51 @@ def search_stock(q: str = Query(default=""), market: str = Query(default=""), us
     return {"results": results}
 
 @app.delete("/api/watchlist/{key}")
-def del_watchlist(key: str, user: str = Depends(get_current_user)):
+def del_watchlist(key: str, user: UserContext = Depends(get_current_user)):
     from modules.monitor.repository import WatchlistRepository
     repo = WatchlistRepository()
-    existing = repo.load_all()
+    existing = repo.load_all_for_user(user.username, primary_username=WEB_USERNAME)
     # key format: "US:AAPL" but URL encodes : so accept both
     key = key.replace("%3A", ":").replace("%3a", ":")
     if key not in existing:
         raise HTTPException(status_code=404, detail="Not found")
     del existing[key]
-    repo.save_all(existing)
+    repo.save_all_for_user(user.username, existing, primary_username=WEB_USERNAME)
     return {"ok": True}
 
 @app.patch("/api/watchlist/{key}/tags")
-def update_tags(key: str, req: TagUpdateRequest, user: str = Depends(get_current_user)):
+def update_tags(key: str, req: TagUpdateRequest, user: UserContext = Depends(get_current_user)):
     from modules.monitor.repository import WatchlistRepository
     repo = WatchlistRepository()
-    existing = repo.load_all()
+    existing = repo.load_all_for_user(user.username, primary_username=WEB_USERNAME)
     key = key.replace("%3A", ":").replace("%3a", ":")
     if key not in existing:
         raise HTTPException(status_code=404, detail="Not found")
     existing[key]["tags"] = req.tags
-    repo.save_all(existing)
+    repo.save_all_for_user(user.username, existing, primary_username=WEB_USERNAME)
     return {"ok": True}
 
 class RatingUpdateRequest(BaseModel):
     rating: int = 0  # 0-5 stars
 
 @app.patch("/api/watchlist/{key}/rating")
-def update_rating(key: str, req: RatingUpdateRequest, user: str = Depends(get_current_user)):
+def update_rating(key: str, req: RatingUpdateRequest, user: UserContext = Depends(get_current_user)):
     from modules.monitor.repository import WatchlistRepository
     repo = WatchlistRepository()
-    existing = repo.load_all()
+    existing = repo.load_all_for_user(user.username, primary_username=WEB_USERNAME)
     key = key.replace("%3A", ":").replace("%3a", ":")
     if key not in existing:
         raise HTTPException(status_code=404, detail="Not found")
     existing[key]["rating"] = max(0, min(5, req.rating))
-    repo.save_all(existing)
+    repo.save_all_for_user(user.username, existing, primary_username=WEB_USERNAME)
     return {"ok": True}
 
 # --------------- Routes: Holds ---------------
 @app.get("/api/holds")
-def get_holds(user: str = Depends(get_current_user)):
+def get_holds(user: UserContext = Depends(get_current_user)):
     from modules.paper_trading.service import PaperTradingService
     svc = PaperTradingService()
-    chat_id = int(os.getenv("ALLOWED_USER_IDS", "0").split(",")[0])
+    chat_id = user.chat_id
     trades = svc.get_active_trades(chat_id)
     result = []
     for t in trades:
@@ -629,7 +742,7 @@ def get_trade_history(
     symbol: str = Query(default=""),
     review_status: str = Query(default=""),
     sort: str = Query(default="exit_date_desc"),
-    user: str = Depends(get_current_user),
+    user: UserContext = Depends(get_current_user),
 ):
     allowed_sort = {
         "exit_date_desc", "exit_date_asc",
@@ -642,8 +755,8 @@ def get_trade_history(
 
     from modules.paper_trading.service import PaperTradingService
     svc = PaperTradingService()
-    scope = os.getenv("WEB_TRADE_HISTORY_SCOPE", "all").strip().lower()
-    chat_id = None if scope in {"all", "admin"} else int(os.getenv("ALLOWED_USER_IDS", "0").split(",")[0])
+    scope = os.getenv("WEB_TRADE_HISTORY_SCOPE", "user").strip().lower()
+    chat_id = None if user.is_admin and scope in {"all", "admin"} else user.chat_id
     return svc.get_trade_history(
         chat_id=chat_id,
         page=page,
@@ -655,10 +768,10 @@ def get_trade_history(
     )
 
 @app.post("/api/trade/buy")
-def trade_buy(req: BuyRequest, user: str = Depends(get_current_user)):
+def trade_buy(req: BuyRequest, user: UserContext = Depends(get_current_user)):
     from modules.paper_trading.service import PaperTradingService
     svc = PaperTradingService()
-    chat_id = int(os.getenv("ALLOWED_USER_IDS", "0").split(",")[0])
+    chat_id = user.chat_id
     ok, msg, trade = svc.open_position(
         query=req.symbol, chat_id=chat_id,
         target_days=req.target_days, reason=req.reason
@@ -668,10 +781,10 @@ def trade_buy(req: BuyRequest, user: str = Depends(get_current_user)):
     return {"ok": True, "message": msg}
 
 @app.post("/api/trade/sell")
-def trade_sell(req: SellRequest, user: str = Depends(get_current_user)):
+def trade_sell(req: SellRequest, user: UserContext = Depends(get_current_user)):
     from modules.paper_trading.service import PaperTradingService
     svc = PaperTradingService()
-    chat_id = int(os.getenv("ALLOWED_USER_IDS", "0").split(",")[0])
+    chat_id = user.chat_id
     ok, msg, trade = svc.close_position(query=req.symbol, chat_id=chat_id)
     if not ok:
         raise HTTPException(status_code=400, detail=msg)
@@ -725,7 +838,7 @@ def get_trend(
     days: int = Query(default=7, ge=3, le=180),
     limit: int = Query(default=100, ge=10, le=200),
     market: str = Query(default=""),
-    user: str = Depends(get_current_user),
+    user: UserContext = Depends(get_current_user),
 ):
     allowed_days = {3, 7, 14, 30, 60, 90, 180}
     if days not in allowed_days:
@@ -878,7 +991,7 @@ def get_trend(
 def get_slow_trend(
     limit: int = Query(default=100, ge=10, le=200),
     market: str = Query(default=""),
-    user: str = Depends(get_current_user),
+    user: UserContext = Depends(get_current_user),
 ):
     """慢趋势机构票 demo：复用现有 trend 候选池，单独做高门槛过滤，不触发推送。"""
     market_filter = _normalize_trend_market(market, {"CN", "HK", "US"})
@@ -1352,7 +1465,7 @@ def get_daily_hot_trend(
     date: str = Query(default=""),
     limit: int = Query(default=100, ge=10, le=200),
     market: str = Query(default=""),
-    user: str = Depends(get_current_user),
+    user: UserContext = Depends(get_current_user),
 ):
     """当日强势榜：只使用本地 DailyRank/TrendDailyBar 截面，避免 Web 打开时触发全市场 API。"""
     market_filter = _normalize_trend_market(market, {"CN", "HK", "US"})
@@ -1753,7 +1866,7 @@ def get_daily_hot_trend(
 def get_heatmap(
     date: str = Query(default=""),
     market: str = Query(default="CN"),
-    user: str = Depends(get_current_user)
+    user: UserContext = Depends(get_current_user)
 ):
     from core.db import db_manager
     from domain.ledger.analytics import TrendDailyBar
@@ -1825,7 +1938,7 @@ def _enrich_heatmap_market_cap(items: list, market: str):
 
 # --------------- Routes: Trading Days ---------------
 @app.get("/api/trading-days")
-def get_trading_days(month: str = Query(default=""), user: str = Depends(get_current_user)):
+def get_trading_days(month: str = Query(default=""), user: UserContext = Depends(get_current_user)):
     """Return list of dates that have heatmap data for the given month."""
     from core.db import db_manager
     from domain.ledger.analytics import TrendDailyBar

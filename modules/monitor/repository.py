@@ -19,6 +19,7 @@ class WatchlistRepository:
     _lock = threading.RLock()
     DATA_DIR = Path(PROJECT_DATA_DIR)
     FILE_PATH = DATA_DIR / "watchlist.json"
+    USER_DIR = DATA_DIR / "watchlists"
     KEY_PATTERN = re.compile(r"^[A-Z]{2,5}:.+$")
 
     def __new__(cls):
@@ -31,6 +32,19 @@ class WatchlistRepository:
         if not self.DATA_DIR.exists():
             self.DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _safe_user_slug(username: str) -> str:
+        slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(username or "").strip())
+        return (slug[:80] or "default")
+
+    @classmethod
+    def file_path_for_user(cls, username: str, primary_username: str = "game2du") -> Path:
+        name = str(username or "").strip()
+        primary = str(primary_username or "game2du").strip() or "game2du"
+        if not name or name == primary:
+            return cls.FILE_PATH
+        return cls.USER_DIR / f"{cls._safe_user_slug(name)}.json"
+
     def load_all(self) -> Dict[str, Any]:
         """Load all watchlist items."""
         with self._lock:
@@ -40,6 +54,16 @@ class WatchlistRepository:
         """Save all watchlist items."""
         with self._lock:
             self._save_all_unlocked(data)
+
+    def load_all_for_user(self, username: str, primary_username: str = "game2du") -> Dict[str, Any]:
+        """Load watchlist data for a web user. Primary user keeps legacy storage."""
+        with self._lock:
+            return self._load_all_unlocked(self.file_path_for_user(username, primary_username))
+
+    def save_all_for_user(self, username: str, data: Dict[str, Any], primary_username: str = "game2du"):
+        """Save watchlist data for a web user. Primary user keeps legacy storage."""
+        with self._lock:
+            self._save_all_unlocked(data, self.file_path_for_user(username, primary_username))
 
     def add_item(self, symbol: str, item: Dict[str, Any]):
         """Add or update a single item."""
@@ -303,21 +327,24 @@ class WatchlistRepository:
 
             return result
 
-    def _load_all_unlocked(self) -> Dict[str, Any]:
+    def _load_all_unlocked(self, file_path: Optional[Path] = None) -> Dict[str, Any]:
         """Load watchlist data. Caller must hold lock."""
-        if not self.FILE_PATH.exists():
+        path = file_path or self.FILE_PATH
+        if not path.exists():
             return {}
         try:
-            with open(self.FILE_PATH, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            logger.error(f"Failed to load watchlist: {e}")
+            logger.error(f"Failed to load watchlist {path}: {e}")
             return {}
 
-    def _save_all_unlocked(self, data: Dict[str, Any]):
+    def _save_all_unlocked(self, data: Dict[str, Any], file_path: Optional[Path] = None):
         """Save watchlist data. Caller must hold lock."""
+        path = file_path or self.FILE_PATH
         try:
-            with open(self.FILE_PATH, "w", encoding="utf-8") as f:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            logger.error(f"Failed to save watchlist: {e}")
+            logger.error(f"Failed to save watchlist {path}: {e}")
