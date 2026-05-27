@@ -1110,6 +1110,7 @@ class TrendCalculator:
                 sym = str(cand.get("symbol", "")).strip()
                 if not sym or sym in used:
                     continue
+                cand["_quota_locked"] = True
                 picked.append(cand)
                 used.add(sym)
                 cnt += 1
@@ -1127,6 +1128,7 @@ class TrendCalculator:
                 sym = str(cand.get("symbol", "")).strip()
                 if not sym or sym in used:
                     continue
+                cand.setdefault("_quota_locked", False)
                 picked.append(cand)
                 used.add(sym)
                 if len(picked) >= topn:
@@ -1148,22 +1150,33 @@ class TrendCalculator:
             floor = old_tail * max(0.0, ratio)
             picked.sort(key=lambda x: x.get("trend_score", x.get("return_pct", 0)), reverse=True)
             picked_syms = {str(x.get("symbol", "")).strip() for x in picked}
-            while picked and float(picked[-1].get("trend_score", 0) or 0) < floor:
+            while picked:
+                replace_idx = None
+                for idx in range(len(picked) - 1, -1, -1):
+                    cand0 = picked[idx]
+                    if bool(cand0.get("_quota_locked", False)):
+                        continue
+                    if float(cand0.get("trend_score", 0) or 0) < floor:
+                        replace_idx = idx
+                        break
+                if replace_idx is None:
+                    break
                 repl = None
                 for cand in ranked:
                     sym = str(cand.get("symbol", "")).strip()
                     if not sym or sym in picked_syms:
                         continue
                     if float(cand.get("trend_score", 0) or 0) >= floor:
+                        cand.setdefault("_quota_locked", False)
                         repl = cand
                         break
                 if repl is None:
                     break
-                old = picked[-1]
+                old = picked[replace_idx]
                 old_sym = str(old.get("symbol", "")).strip()
                 if old_sym:
                     picked_syms.discard(old_sym)
-                picked[-1] = repl
+                picked[replace_idx] = repl
                 picked_syms.add(str(repl.get("symbol", "")).strip())
                 picked.sort(key=lambda x: x.get("trend_score", x.get("return_pct", 0)), reverse=True)
 
@@ -1191,6 +1204,8 @@ class TrendCalculator:
                 unknown_idx = [j for j, x in enumerate(picked) if str(x.get("cap_bucket", "")) == "unknown"]
 
         picked.sort(key=lambda x: x.get("trend_score", x.get("return_pct", 0)), reverse=True)
+        for item in picked:
+            item.pop("_quota_locked", None)
         return picked[:topn]
 
 

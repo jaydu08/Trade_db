@@ -135,8 +135,16 @@ class TrendReportService:
                 if not symbol:
                     return None
                 trade_date = str(s.get("price_date", "") or "")
-                metrics = get_cn_market_metrics(symbol)
-                flow = get_cn_fund_flow(symbol, trade_date=trade_date)
+                metrics = None
+                flow = None
+                try:
+                    metrics = get_cn_market_metrics(symbol)
+                except Exception as e:
+                    logger.debug("Trend CN market metrics failed: symbol=%s err=%s", symbol, e)
+                try:
+                    flow = get_cn_fund_flow(symbol, trade_date=trade_date)
+                except Exception as e:
+                    logger.debug("Trend CN fund flow failed: symbol=%s trade_date=%s err=%s", symbol, trade_date, e)
                 return s, metrics, flow
 
             with ThreadPoolExecutor(max_workers=min(8, len(stks))) as executor:

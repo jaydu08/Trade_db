@@ -833,11 +833,125 @@ def _trend_stale_payload(cache_key: str, warning: str):
         return None
     return _trend_cache_payload(stale, stale=True, warning=warning)
 
+
+def _trend_truthy_env(name: str, default: str = "1") -> bool:
+    raw = str(os.getenv(name, default) or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _trend_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value or default)
+    except Exception:
+        return default
+
+
+def _trend_int_env(name: str, default: int, min_value: int, max_value: int) -> int:
+    try:
+        value = int(str(os.getenv(name, "") or "").strip() or default)
+    except Exception:
+        value = default
+    return max(min_value, min(max_value, value))
+
+
+def _trend_price_symbol(row: Dict[str, Any], market: str) -> str:
+    raw = str(row.get("raw_symbol") or row.get("symbol") or "").strip()
+    if market == "US":
+        return raw.split(".")[-1].strip().upper()
+    return raw
+
+
+def _quote_price_date(quote: Dict[str, Any]) -> str:
+    raw = quote.get("date") or quote.get("trade_date") or quote.get("timestamp") or ""
+    text = str(raw or "").strip()
+    if not text or text.lower() == "now":
+        return dt.date.today().isoformat()
+    if text.isdigit():
+        return dt.date.today().isoformat()
+    return text[:10]
+
+
+def _refresh_trend_display_prices(markets_payload: Dict[str, List[Dict[str, Any]]], market_filter: str = "") -> None:
+    """Refresh only display prices for visible Trend rows; ranking still uses local snapshots."""
+    if not _trend_truthy_env("WEB_TREND_PRICE_REFRESH", "1"):
+        return
+    if not isinstance(markets_payload, dict):
+        return
+
+    max_per_market = _trend_int_env("WEB_TREND_PRICE_REFRESH_LIMIT", 20, 0, 60)
+    if max_per_market <= 0:
+        return
+    workers = _trend_int_env("WEB_TREND_PRICE_REFRESH_WORKERS", 3, 1, 6)
+    timeout_sec = _trend_float(os.getenv("WEB_TREND_PRICE_REFRESH_TIMEOUT_SEC", "12"), 12.0)
+    timeout_sec = max(2.0, min(30.0, timeout_sec))
+
+    jobs = []
+    markets = [market_filter] if market_filter else list(markets_payload.keys())
+    for mkt in markets:
+        market = str(mkt or "").strip().upper()
+        rows = markets_payload.get(market) or []
+        if market not in {"CN", "HK", "US"} or not isinstance(rows, list):
+            continue
+        for row in rows[:max_per_market]:
+            if not isinstance(row, dict):
+                continue
+            symbol = _trend_price_symbol(row, market)
+            if symbol:
+                jobs.append((market, symbol, row))
+    if not jobs:
+        return
+
+    try:
+        import concurrent.futures
+        from modules.ingestion.data_factory import data_manager
+    except Exception as e:
+        logger.debug("Trend display price refresh unavailable: %s", e)
+        return
+
+    def _fetch(job):
+        market, symbol, row = job
+        try:
+            quote = data_manager.get_quote(symbol, market)
+            if not isinstance(quote, dict):
+                return None
+            price = _trend_float(quote.get("price"))
+            if price <= 0:
+                return None
+            return row, price, quote
+        except Exception as e:
+            logger.debug("Trend display quote failed: market=%s symbol=%s err=%s", market, symbol, e)
+            return None
+
+    updated = 0
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(jobs)))
+    futures = [executor.submit(_fetch, job) for job in jobs]
+    try:
+        for future in concurrent.futures.as_completed(futures, timeout=timeout_sec):
+            item = future.result()
+            if not item:
+                continue
+            row, price, quote = item
+            row["price"] = round(price, 4)
+            row["price_date"] = _quote_price_date(quote)
+            row["display_price_source"] = str(quote.get("provider", "") or "")
+            updated += 1
+    except concurrent.futures.TimeoutError:
+        logger.debug("Trend display price refresh timed out after %.1fs", timeout_sec)
+    finally:
+        for future in futures:
+            if not future.done():
+                future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+    if updated:
+        logger.debug("Trend display price refreshed: rows=%s", updated)
+
+
 @app.get("/api/trend")
 def get_trend(
     days: int = Query(default=7, ge=3, le=180),
     limit: int = Query(default=100, ge=10, le=200),
     market: str = Query(default=""),
+    refresh_prices: int = Query(default=0, ge=0, le=1),
     user: UserContext = Depends(get_current_user),
 ):
     allowed_days = {3, 7, 14, 30, 60, 90, 180}
@@ -984,6 +1098,8 @@ def get_trend(
                 "capital_signal_coverage": inst_payload.get("capital_signal_coverage", {}) or {},
             })
         result[mkt] = transformed
+    if refresh_prices:
+        _refresh_trend_display_prices(result, market_filter)
     return {"days": days, "limit": limit, "market": market_filter, "markets": result}
 
 
@@ -991,14 +1107,20 @@ def get_trend(
 def get_slow_trend(
     limit: int = Query(default=100, ge=10, le=200),
     market: str = Query(default=""),
+    refresh_prices: int = Query(default=0, ge=0, le=1),
+    force_refresh: int = Query(default=0, ge=0, le=1),
     user: UserContext = Depends(get_current_user),
 ):
     """慢趋势机构票 demo：复用现有 trend 候选池，单独做高门槛过滤，不触发推送。"""
     market_filter = _normalize_trend_market(market, {"CN", "HK", "US"})
     cache_key = f"api_trend_slow_demo_v5_{market_filter or 'ALL'}_{limit}"
     cached = get_cache(cache_key)
-    if cached:
+    if cached and not force_refresh:
         _ensure_trend_stale_cache(cache_key, cached)
+        if refresh_prices:
+            import copy
+            cached = copy.deepcopy(cached)
+            _refresh_trend_display_prices(cached.get("markets", {}) if isinstance(cached, dict) else {}, market_filter)
         return _trend_cache_payload(cached, stale=False)
 
     try:
@@ -1447,6 +1569,8 @@ def get_slow_trend(
             },
             "markets": result,
         }
+        if refresh_prices:
+            _refresh_trend_display_prices(payload.get("markets", {}), market_filter)
         _set_trend_cache(cache_key, payload, ttl=900)
         return _trend_cache_payload(payload, stale=False)
     except HTTPException:
@@ -1465,14 +1589,20 @@ def get_daily_hot_trend(
     date: str = Query(default=""),
     limit: int = Query(default=100, ge=10, le=200),
     market: str = Query(default=""),
+    refresh_prices: int = Query(default=0, ge=0, le=1),
+    force_refresh: int = Query(default=0, ge=0, le=1),
     user: UserContext = Depends(get_current_user),
 ):
     """当日强势榜：只使用本地 DailyRank/TrendDailyBar 截面，避免 Web 打开时触发全市场 API。"""
     market_filter = _normalize_trend_market(market, {"CN", "HK", "US"})
     cache_key = f"api_trend_daily_hot_v5_{market_filter or 'ALL'}_{date or 'latest'}_{limit}"
     cached = get_cache(cache_key)
-    if cached:
+    if cached and not force_refresh:
         _ensure_trend_stale_cache(cache_key, cached)
+        if refresh_prices:
+            import copy
+            cached = copy.deepcopy(cached)
+            _refresh_trend_display_prices(cached.get("markets", {}) if isinstance(cached, dict) else {}, market_filter)
         return _trend_cache_payload(cached, stale=False)
 
     try:
@@ -1849,6 +1979,8 @@ def get_daily_hot_trend(
             "cap_lookup_limits": cap_lookup_limits,
             "markets": result,
         }
+        if refresh_prices:
+            _refresh_trend_display_prices(payload.get("markets", {}), market_filter)
         _set_trend_cache(cache_key, payload, ttl=600)
         return _trend_cache_payload(payload, stale=False)
     except HTTPException:
@@ -1907,6 +2039,390 @@ def get_heatmap(
     _enrich_heatmap_market_cap(items, market)
 
     return {"date": date, "market": market, "items": items}
+
+
+
+@app.get("/api/heatmap/trend-push")
+def get_heatmap_trend_push(
+    days: int = Query(default=1, ge=1, le=180),
+    market: str = Query(default="CN"),
+    date: str = Query(default=""),
+    user: UserContext = Depends(get_current_user),
+):
+    """Return a date-bound Trend selection for Heatmap-side A/B comparison."""
+    allowed_days = {1, 3, 7, 30, 90, 180}
+    if days not in allowed_days:
+        raise HTTPException(status_code=400, detail=f"days must be one of {sorted(allowed_days)}")
+
+    market_filter = _normalize_trend_market(market, {"CN", "HK", "US"})
+    try:
+        target_date = dt.date.fromisoformat(str(date).strip()) if str(date or "").strip() else dt.date.today()
+    except Exception:
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+
+    cache_key = f"api_heatmap_trend_push_v8_{market_filter}_{target_date}_{days}"
+    cached = get_cache(cache_key)
+    if isinstance(cached, dict):
+        return cached
+
+    try:
+        import math
+        from sqlmodel import select
+        from core.db import get_ledger_session
+        from domain.ledger.analytics import TrendSeedPool, TrendDailyBar, DailyRank
+        from modules.monitor.trend_service import TrendCalculator
+        from modules.monitor.trend_report_service import TrendReportService
+        from modules.monitor.industry_intel import enrich_industry_labels
+
+        quota = {"CN": 10, "HK": 7, "US": 10}.get(market_filter, 10)
+        cutoff_seed = target_date - dt.timedelta(days=max(days, 7))
+        cutoff_rank = target_date - dt.timedelta(days=max(3, min(days, 30)))
+        series_cutoff = target_date - dt.timedelta(days=max(220, days * 3))
+
+        def _safe_float(v, default=0.0):
+            try:
+                if v is None:
+                    return default
+                val = float(v)
+                if math.isnan(val) or math.isinf(val):
+                    return default
+                return val
+            except Exception:
+                return default
+
+        def _fresh_enough(price_date: str) -> bool:
+            try:
+                d = dt.date.fromisoformat(str(price_date)[:10])
+            except Exception:
+                return False
+            max_lag = 4 if market_filter == "US" else 3
+            return 0 <= (target_date - d).days <= max_lag
+
+        def _series_return(series: list, lookback_days: int):
+            if len(series) < 2:
+                return 0.0, 0.0, ""
+            latest_date, latest_price, latest_amount = series[-1]
+            if latest_price <= 0:
+                return 0.0, 0.0, ""
+            cutoff = latest_date - dt.timedelta(days=lookback_days)
+            base_date = None
+            base_price = 0.0
+            for row_date, row_price, row_amount in series:
+                if row_date <= cutoff and row_price > 0:
+                    base_date, base_price = row_date, row_price
+                elif row_date > cutoff:
+                    break
+            if not base_date or base_price <= 0 or base_date == latest_date:
+                return 0.0, latest_price, ""
+
+            # TrendDailyBar/DailyRank are sparse for some symbols. Do not let a stale
+            # base point masquerade as a short-window return (for example 7 calendar
+            # days being shown as 1D/3D).
+            max_base_lag = max(2, min(10, int(round(max(lookback_days, 1) * 0.35)) + 1))
+            if (cutoff - base_date).days > max_base_lag:
+                return 0.0, latest_price, ""
+            return round((latest_price - base_price) / base_price * 100, 2), latest_price, str(latest_date)
+
+        def _market_cap_multiplier(mkt: str, item: dict) -> float:
+            if mkt == "CN":
+                cap = _safe_float(item.get("total_mv_100m"))
+                if cap >= 1200:
+                    return 1.20
+                if cap >= 500:
+                    return 1.10
+                if cap >= 200:
+                    return 1.05
+            if mkt == "US":
+                cap = _safe_float(item.get("market_cap_musd"))
+                if cap >= 300000:
+                    return 2.00
+                if cap >= 100000:
+                    return 1.60
+                if cap >= 50000:
+                    return 1.30
+                if cap >= 15000:
+                    return 1.05
+            if mkt == "HK":
+                cap = _safe_float(item.get("market_cap_100m_hkd"))
+                if cap >= 1500:
+                    return 1.12
+                if cap >= 300:
+                    return 1.05
+            return 1.0
+
+        def _normalize_symbol(sym: str) -> str:
+            s = str(sym or "").strip()
+            return s.split(".")[-1].strip() if market_filter == "US" and s else s
+
+        with get_ledger_session() as session:
+            seed_rows = session.exec(
+                select(TrendSeedPool)
+                .where(TrendSeedPool.market == market_filter)
+                .where(TrendSeedPool.date >= cutoff_seed)
+                .where(TrendSeedPool.date <= target_date)
+                .order_by(TrendSeedPool.date.desc())
+                .limit(520)
+            ).all()
+            rank_rows = session.exec(
+                select(DailyRank)
+                .where(DailyRank.market == market_filter)
+                .where(DailyRank.date >= cutoff_rank)
+                .where(DailyRank.date <= target_date)
+                .order_by(DailyRank.amount.desc(), DailyRank.change_pct.desc())
+                .limit(420)
+            ).all()
+
+            by_symbol = {}
+            reason_records = {}
+            daily_return_map = {}
+            for r in seed_rows:
+                sym = _normalize_symbol(r.symbol)
+                if not sym:
+                    continue
+                rec = by_symbol.setdefault(sym, {
+                    "symbol": sym,
+                    "market": market_filter,
+                    "name": str(r.name or ""),
+                    "reason_records": [],
+                    "amount": 0.0,
+                    "turnover_rate": 0.0,
+                })
+                if r.name and not rec.get("name"):
+                    rec["name"] = str(r.name or "")
+                reason = str(r.daily_reason or "").strip() or "TrendSeedPool"
+                reason_records.setdefault(sym, []).append((r.date, reason))
+
+            for r in rank_rows:
+                sym = _normalize_symbol(r.symbol)
+                if not sym:
+                    continue
+                pct = _safe_float(r.change_pct)
+                amount = _safe_float(r.amount)
+                if market_filter == "CN" and (amount < 200000000 or pct < 2.0):
+                    continue
+                if market_filter == "HK" and (amount < 500000000 or pct < 3.0):
+                    continue
+                if market_filter == "US":
+                    if TrendCalculator._is_leveraged_like(f"{sym} {str(r.name or '')}"):
+                        continue
+                    if amount < 20000000 or pct < 3.0:
+                        continue
+                rec = by_symbol.setdefault(sym, {
+                    "symbol": sym,
+                    "market": market_filter,
+                    "name": str(r.name or ""),
+                    "reason_records": [],
+                    "amount": 0.0,
+                    "turnover_rate": 0.0,
+                })
+                if r.name and not rec.get("name"):
+                    rec["name"] = str(r.name or "")
+                if r.date == target_date:
+                    daily_return_map[sym] = {
+                        "return_pct": pct,
+                        "price": _safe_float(r.price),
+                        "amount": amount,
+                        "turnover_rate": _safe_float(r.turnover_rate),
+                        "name": str(r.name or ""),
+                    }
+                if amount > _safe_float(rec.get("amount")):
+                    rec["amount"] = amount
+                    rec["turnover_rate"] = _safe_float(r.turnover_rate)
+                reason_records.setdefault(sym, []).append((r.date, f"DailyRank高流动性异动 {pct:+.1f}%"))
+
+            symbols = list(by_symbol.keys())[:360]
+            bar_rows = []
+            rank_price_rows = []
+            if symbols:
+                bar_rows = session.exec(
+                    select(TrendDailyBar)
+                    .where(TrendDailyBar.market == market_filter)
+                    .where(TrendDailyBar.symbol.in_(symbols))
+                    .where(TrendDailyBar.date >= series_cutoff)
+                    .where(TrendDailyBar.date <= target_date)
+                    .order_by(TrendDailyBar.symbol, TrendDailyBar.date)
+                ).all()
+                rank_price_rows = session.exec(
+                    select(DailyRank)
+                    .where(DailyRank.market == market_filter)
+                    .where(DailyRank.symbol.in_(symbols))
+                    .where(DailyRank.date >= series_cutoff)
+                    .where(DailyRank.date <= target_date)
+                    .order_by(DailyRank.symbol, DailyRank.date)
+                ).all()
+
+        series_map = {}
+        for b in bar_rows:
+            sym = _normalize_symbol(b.symbol)
+            price = _safe_float(b.close)
+            if sym and price > 0:
+                series_map.setdefault(sym, {})[b.date] = (price, _safe_float(b.amount), str(b.name or ""), _safe_float(b.turnover_rate))
+        for r in rank_price_rows:
+            sym = _normalize_symbol(r.symbol)
+            price = _safe_float(r.price)
+            amount = _safe_float(r.amount)
+            pct = _safe_float(r.change_pct)
+            if sym and r.date == target_date and sym not in daily_return_map:
+                daily_return_map[sym] = {
+                    "return_pct": pct,
+                    "price": price,
+                    "amount": amount,
+                    "turnover_rate": _safe_float(r.turnover_rate),
+                    "name": str(r.name or ""),
+                }
+            if sym and price > 0 and r.date not in series_map.setdefault(sym, {}):
+                series_map[sym][r.date] = (price, amount, str(r.name or ""), _safe_float(r.turnover_rate))
+
+        processed = []
+        for sym, rec in by_symbol.items():
+            if days == 1:
+                daily = daily_return_map.get(sym) or {}
+                ret = _safe_float(daily.get("return_pct"))
+                current_price = _safe_float(daily.get("price"))
+                price_date = str(target_date) if current_price > 0 else ""
+                if current_price <= 0 or not price_date:
+                    continue
+                if _safe_float(daily.get("amount")) > _safe_float(rec.get("amount")):
+                    rec["amount"] = _safe_float(daily.get("amount"))
+                if daily.get("name") and not rec.get("name"):
+                    rec["name"] = str(daily.get("name") or "")
+                if _safe_float(daily.get("turnover_rate")) > 0:
+                    rec["turnover_rate"] = _safe_float(daily.get("turnover_rate"))
+            else:
+                series = [(d, vals[0], vals[1]) for d, vals in sorted((series_map.get(sym) or {}).items()) if vals[0] > 0]
+                ret, current_price, price_date = _series_return(series, days)
+                if current_price <= 0 or not _fresh_enough(price_date):
+                    continue
+                latest_vals = (series_map.get(sym) or {}).get(dt.date.fromisoformat(price_date), None)
+                if latest_vals:
+                    latest_amount = _safe_float(latest_vals[1])
+                    if latest_amount > _safe_float(rec.get("amount")):
+                        rec["amount"] = latest_amount
+                    if latest_vals[2] and not rec.get("name"):
+                        rec["name"] = latest_vals[2]
+                    if latest_vals[3] > 0:
+                        rec["turnover_rate"] = latest_vals[3]
+            reasons = reason_records.get(sym, []) or []
+            aggregated_reason, signal_strength = TrendCalculator._aggregate_reasons_with_decay(reasons, today=target_date)
+            item = dict(rec)
+            item.update({
+                "current_price": current_price,
+                "return_pct": ret,
+                "price_date": price_date,
+                "reason_records": reasons,
+                "aggregated_reason": aggregated_reason,
+                "signal_strength": signal_strength,
+            })
+            processed.append(item)
+
+        processed.sort(
+            key=lambda x: (_safe_float(x.get("return_pct")), _safe_float(x.get("signal_strength")), _safe_float(x.get("amount"))),
+            reverse=True,
+        )
+        enrich_limit = max(quota * 3, int(os.getenv("HEATMAP_TREND_AB_MAX_ENRICH", "60") or 60))
+        if len(processed) > enrich_limit:
+            processed = processed[:enrich_limit]
+
+        if processed:
+            TrendReportService._enrich_market_caps(market_filter, processed)
+            if market_filter == "CN":
+                from modules.ingestion.market_cap import get_cn_market_metrics
+                for item in processed:
+                    if _safe_float(item.get("total_mv_100m")) > 0:
+                        continue
+                    symbol = str(item.get("symbol", "") or "").strip()
+                    if not symbol:
+                        continue
+                    try:
+                        metrics = get_cn_market_metrics(symbol)
+                        total_mv = _safe_float((metrics or {}).get("total_mv_100m"))
+                        circ_mv = _safe_float((metrics or {}).get("circ_mv_100m"))
+                        if total_mv > 0:
+                            item["total_mv_100m"] = total_mv
+                        if circ_mv > 0:
+                            item["circ_mv_100m"] = circ_mv
+                    except Exception as e:
+                        logger.debug("Trend AB CN market-cap fallback failed: symbol=%s err=%s", symbol, e)
+
+        final_rows = []
+        cn_mcap_floor = max(0.0, _safe_float(os.getenv("CN_HARD_TOTAL_MV_100M_MIN", 50)))
+        us_mcap_floor = max(0.0, _safe_float(os.getenv("US_HARD_MCAP_MUSD_MIN", 1000)))
+        for item in processed:
+            if market_filter == "US" and not _safe_float(item.get("market_cap_musd")):
+                cap_100m_usd = _safe_float(item.get("market_cap_100m_usd"))
+                if cap_100m_usd > 0:
+                    item["market_cap_musd"] = cap_100m_usd * 100.0
+
+            if market_filter == "CN":
+                total_mv = _safe_float(item.get("total_mv_100m"))
+                if total_mv > 0 and total_mv < cn_mcap_floor:
+                    continue
+            if market_filter == "US":
+                cap_musd = _safe_float(item.get("market_cap_musd"))
+                if cap_musd <= 0 or cap_musd < us_mcap_floor:
+                    continue
+
+            mcap_mult = _market_cap_multiplier(market_filter, item)
+            signal_strength = _safe_float(item.get("signal_strength"))
+            freshness_factor = min(1.25, 0.85 + signal_strength * 0.18)
+            item["mcap_mult"] = mcap_mult
+            item["trend_score"] = round(_safe_float(item.get("return_pct")) * freshness_factor * 0.95 * mcap_mult, 2)
+            final_rows.append(item)
+
+        picked = TrendCalculator._select_with_quota(final_rows, market_filter, topn_override=quota)
+        try:
+            enrich_industry_labels(picked, market_filter)
+        except Exception as e:
+            logger.debug("Heatmap trend-push industry enrich skipped: %s", e)
+
+        items = []
+        for i, s in enumerate(picked, 1):
+            raw_symbol = str(s.get("symbol", "") or "").strip()
+            display_symbol = raw_symbol.split(".")[-1].strip() if market_filter == "US" and raw_symbol else raw_symbol
+            if market_filter == "CN":
+                market_cap = _safe_float(s.get("total_mv_100m"))
+            elif market_filter == "HK":
+                market_cap = _safe_float(s.get("market_cap_100m_hkd")) or _safe_float(s.get("market_cap_100m_usd"))
+            elif market_filter == "US":
+                market_cap = _safe_float(s.get("market_cap_100m_usd"))
+            else:
+                market_cap = 0.0
+            records = s.get("reason_records", []) or []
+            days_on_list = len(set(str(d) for d, _reason in records)) if records else 1
+            catalyst = str(s.get("aggregated_reason", "") or s.get("catalyst_tags", "") or s.get("daily_reason", "") or "").strip()
+            items.append({
+                "rank": i,
+                "symbol": display_symbol,
+                "raw_symbol": raw_symbol,
+                "name": s.get("name", ""),
+                "close": _safe_float(s.get("current_price")),
+                "change_pct": _safe_float(s.get("return_pct")),
+                "amount": _safe_float(s.get("amount")),
+                "market_cap": market_cap,
+                "catalyst_tags": catalyst,
+                "industry_label": str(s.get("industry_label", "") or ""),
+                "trend_score": _safe_float(s.get("trend_score")),
+                "signal_strength": _safe_float(s.get("signal_strength")),
+                "mcap_mult": _safe_float(s.get("mcap_mult"), 1.0),
+                "days_on_list": days_on_list,
+                "price_date": str(s.get("price_date", "") or ""),
+            })
+
+        payload = {
+            "mode": "trend_push_daily",
+            "date": str(target_date),
+            "days": days,
+            "market": market_filter,
+            "quota": quota,
+            "items": items,
+        }
+        set_cache(cache_key, payload, ttl=600)
+        return payload
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Heatmap trend-push daily comparison failed")
+        raise HTTPException(status_code=503, detail=f"Trend日榜实验数据暂不可用: {e}")
 
 
 def _enrich_heatmap_market_cap(items: list, market: str):

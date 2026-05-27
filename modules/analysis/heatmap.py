@@ -56,6 +56,10 @@ class MarketHeatMap:
         self.fomo_penalty_factor = float(os.getenv("FOMO_PENALTY_FACTOR", "0.95"))
         self.heat_w_news = float(os.getenv("HEATMAP_W_NEWS", "0"))
         self.heat_news_lookback_days = int(os.getenv("HEATMAP_NEWS_LOOKBACK_DAYS", "3") or 3)
+        try:
+            self.us_heat_max_leveraged = max(0, int(os.getenv("US_HEAT_MAX_LEVERAGED", "1") or 1))
+        except Exception:
+            self.us_heat_max_leveraged = 1
 
         self.cn_mcap_fetch_cap = int(os.getenv("CN_HEAT_MCAP_FETCH_CAP", "260"))
         self.cn_trend_lookback_days = int(os.getenv("CN_HEAT_TREND_LOOKBACK_DAYS", "20"))
@@ -563,6 +567,161 @@ class MarketHeatMap:
             return pd.DataFrame()
         return frame[pd.to_numeric(frame.get("amount", 0), errors="coerce").fillna(0.0) >= float(self.hk_hard_amount_min or 0)].copy()
 
+
+    @staticmethod
+    def _normalize_us_symbol(symbol: str) -> str:
+        return str(symbol or "").split(".")[-1].strip().upper()
+
+    def _us_leveraged_meta(self, symbol: str, name: str) -> Dict[str, str]:
+        """Classify US leveraged/derivative products and map single-stock products to the underlying ticker."""
+        import re as _re
+
+        sym = self._normalize_us_symbol(symbol)
+        text = str(name or "")
+        low = text.lower()
+
+        single_map = {
+            "MULL": "MU", "MUU": "MU",
+            "AMDL": "AMD", "AMDS": "AMD",
+            "NVDL": "NVDA", "NVDU": "NVDA", "NVDS": "NVDA",
+            "TSLL": "TSLA", "TSLS": "TSLA", "TSLT": "TSLA", "TSLQ": "TSLA", "TSLZ": "TSLA", "TSDD": "TSLA",
+            "AAPU": "AAPL", "AAPD": "AAPL",
+            "GGLL": "GOOGL", "GGLS": "GOOGL",
+            "MSTU": "MSTR", "MSTX": "MSTR", "MSTZ": "MSTR",
+            "CONL": "COIN", "BABX": "BABA", "NOWL": "NOW",
+            "AVGU": "AVGO", "AVGS": "AVGO",
+        }
+        broad_map = {
+            "SOXL": "SOX", "SOXS": "SOX",
+            "TQQQ": "QQQ", "SQQQ": "QQQ",
+            "SPXL": "SPX", "SPXS": "SPX",
+            "TECL": "TECH", "TECS": "TECH",
+            "FNGU": "FANG", "FNGD": "FANG",
+            "LABU": "BIOTECH", "LABD": "BIOTECH",
+            "YINN": "CHINA", "YANG": "CHINA",
+            "WEBL": "WEB", "WEBS": "WEB",
+        }
+
+        if sym in single_map:
+            return {"is_leveraged": "1", "underlying": single_map[sym], "kind": "single"}
+        if sym in broad_map:
+            return {"is_leveraged": "1", "underlying": broad_map[sym], "kind": "broad"}
+
+        leveraged = bool(_re.search(
+            r"(?i)\b(?:2x|3x|1\.5x|bull|bear|leveraged|inverse)\b|\d[\d.]*[Xx]\s+(?:long|short|bull|bear)",
+            text,
+        )) or any(k in text for k in ("二倍", "三倍", "做多", "做空", "杠杆"))
+        issuer_like = any(k in low for k in ("direxion", "graniteshar", "graniteshares", "proshares", "defiance", "t-rex"))
+        if not leveraged and not issuer_like:
+            return {"is_leveraged": "0", "underlying": "", "kind": ""}
+
+        # Company-name hints for Chinese localized product names returned by Sina.
+        cn_company_map = {
+            "美光": "MU", "超威": "AMD", "英伟达": "NVDA", "苹果": "AAPL", "特斯拉": "TSLA",
+            "谷歌": "GOOGL", "微软": "MSFT", "亚马逊": "AMZN", "博通": "AVGO", "甲骨文": "ORCL",
+            "Coinbase": "COIN", "阿里巴巴": "BABA", "Palantir": "PLTR",
+        }
+        for key, underlying in cn_company_map.items():
+            if key in text:
+                return {"is_leveraged": "1", "underlying": underlying, "kind": "single"}
+
+        if "半导体" in text:
+            return {"is_leveraged": "1", "underlying": "SOX", "kind": "broad"}
+
+        patterns = [
+            _re.compile(r"\d[\d.]*[Xx]\s+(?:Long\s+|Short\s+)?([A-Z]{2,6})"),
+            _re.compile(r"(?:T-Rex|Defiance|ProShares|GraniteShares|Direxion)\s+.*?([A-Z]{2,6})(?:\s|$)", _re.I),
+        ]
+        for pat in patterns:
+            m = pat.search(text)
+            if m:
+                token = m.group(1).upper()
+                if token not in {"ETF", "USD", "NYSE", "NASDAQ"}:
+                    return {"is_leveraged": "1", "underlying": token, "kind": "single"}
+
+        return {"is_leveraged": "1", "underlying": sym, "kind": "unknown"}
+
+    def _dedupe_us_leveraged_products(self, sorted_df: pd.DataFrame) -> pd.DataFrame:
+        """Remove single-stock leveraged duplicates and keep only the best product per leveraged group."""
+        if sorted_df is None or sorted_df.empty:
+            return sorted_df
+
+        work = sorted_df.copy()
+        meta_by_idx = {}
+        ordinary_syms = set()
+        for idx, row in work.iterrows():
+            meta = self._us_leveraged_meta(row.get("symbol", ""), row.get("name", ""))
+            meta_by_idx[idx] = meta
+            if meta.get("is_leveraged") != "1":
+                sym = self._normalize_us_symbol(row.get("symbol", ""))
+                if sym:
+                    ordinary_syms.add(sym)
+
+        drop_idx = []
+        for idx, meta in meta_by_idx.items():
+            underlying = str(meta.get("underlying", ""))
+            if meta.get("is_leveraged") == "1" and meta.get("kind") == "single" and underlying in ordinary_syms:
+                drop_idx.append(idx)
+
+        if drop_idx:
+            work = work.drop(index=drop_idx, errors="ignore")
+            logger.info("US heatmap leverage dedupe: dropped %s single-stock leveraged duplicates", len(drop_idx))
+
+        groups = {}
+        for idx, row in work.iterrows():
+            meta = self._us_leveraged_meta(row.get("symbol", ""), row.get("name", ""))
+            if meta.get("is_leveraged") != "1":
+                continue
+            key = f"{meta.get('kind') or 'unknown'}:{meta.get('underlying') or self._normalize_us_symbol(row.get('symbol', ''))}"
+            groups.setdefault(key, []).append(idx)
+
+        group_drop = []
+        for _key, indices in groups.items():
+            if len(indices) <= 1:
+                continue
+            ranked = sorted(
+                indices,
+                key=lambda i: (
+                    float(work.at[i, "heat_score"] if "heat_score" in work.columns else 0) if i in work.index else 0,
+                    float(work.at[i, "amount"] if "amount" in work.columns else 0) if i in work.index else 0,
+                    float(work.at[i, "pct_chg"] if "pct_chg" in work.columns else 0) if i in work.index else 0,
+                ),
+                reverse=True,
+            )
+            group_drop.extend(ranked[1:])
+
+        if group_drop:
+            work = work.drop(index=group_drop, errors="ignore")
+            logger.info("US heatmap leverage dedupe: dropped %s duplicate leveraged products", len(group_drop))
+
+        return work
+
+    def _cap_us_leveraged_ranked(self, stocks: List[Dict], limit: int) -> List[Dict]:
+        """Keep leveraged exposure visible but prevent it from crowding out alpha stocks in TG Top10."""
+        if not stocks:
+            return []
+        max_lev = max(0, int(self.us_heat_max_leveraged or 0))
+        picked: List[Dict] = []
+        skipped: List[Dict] = []
+        lev_count = 0
+        for stock in stocks:
+            meta = self._us_leveraged_meta(stock.get("symbol", ""), stock.get("name", ""))
+            is_lev = meta.get("is_leveraged") == "1"
+            stock["is_leveraged_product"] = bool(is_lev)
+            stock["leverage_underlying"] = meta.get("underlying", "")
+            if is_lev and lev_count >= max_lev:
+                skipped.append(stock)
+                continue
+            picked.append(stock)
+            if is_lev:
+                lev_count += 1
+            if len(picked) >= limit:
+                break
+
+        if len(picked) < limit:
+            picked.extend(skipped[: max(0, limit - len(picked))])
+        return picked[:limit]
+
     def _apply_us_hard_funnel(self, frame: pd.DataFrame) -> pd.DataFrame:
         if frame is None or frame.empty:
             return pd.DataFrame()
@@ -605,7 +764,7 @@ class MarketHeatMap:
         
         import re as _re
         is_leveraged = work["name"].astype(str).str.contains(
-            r'(?i)\b(2x|3x|1\.5x|bull|bear|leveraged|inverse)\b|\d[\d.]*[Xx]\s+(?:long|short|bull|bear)',
+            r'(?i)\b(?:2x|3x|1\.5x|bull|bear|leveraged|inverse)\b|\d[\d.]*[Xx]\s+(?:long|short|bull|bear)',
             regex=True, na=False
         )
         # 保留：有市值>=floor 的 或 无市值但不是杠杆ETF的
@@ -836,7 +995,7 @@ class MarketHeatMap:
 
                 _LETF_RE1 = _re.compile(r'\d[\d.]*[Xx]\s+(?:Long\s+|Short\s+)?([A-Z]{2,6})')
                 _LETF_RE2 = _re.compile(r'(?:T-Rex|Defiance|ProShares|GraniteShares|Direxion)\s+.*?([A-Z]{2,6})(?:\s|$)')
-                _LETF_RE3 = _re.compile(r'(?i)\b(2x|3x|1\.5x|bull|bear|leveraged|inverse)\b|\d[\d.]*[Xx]\s+(?:long|short|bull|bear)')
+                _LETF_RE3 = _re.compile(r'(?i)\b(?:2x|3x|1\.5x|bull|bear|leveraged|inverse)\b|\d[\d.]*[Xx]\s+(?:long|short|bull|bear)')
                 _WARRANT_RE = _re.compile(r'(?i)\b(wt|warrant|rights|rts|units?)\b')
 
                 def _extract_letf_underlying(name: str) -> str:
@@ -894,6 +1053,8 @@ class MarketHeatMap:
                         for idx in indices:
                             if idx != best_idx:
                                 sorted_df = sorted_df.drop(idx)
+
+                sorted_df = self._dedupe_us_leveraged_products(sorted_df)
 
         # 先取初筛 Top 50（多取一些供下游过滤）
         candidates = sorted_df.head(50).to_dict(orient="records")
@@ -960,8 +1121,16 @@ class MarketHeatMap:
                 symbol = str(stock.get("symbol", "")).strip()
                 if not symbol:
                     return None
-                metrics = get_cn_market_metrics(symbol)
-                flow = get_cn_fund_flow(symbol, trade_date=trade_date)
+                metrics = None
+                flow = None
+                try:
+                    metrics = get_cn_market_metrics(symbol)
+                except Exception as e:
+                    logger.debug("Heatmap CN market metrics failed: symbol=%s err=%s", symbol, e)
+                try:
+                    flow = get_cn_fund_flow(symbol, trade_date=trade_date)
+                except Exception as e:
+                    logger.debug("Heatmap CN fund flow failed: symbol=%s trade_date=%s err=%s", symbol, trade_date, e)
                 return stock, metrics, flow
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(stocks))) as ex:
@@ -1094,7 +1263,10 @@ class MarketHeatMap:
             push_n = 5
 
         persist_stocks = self._generate_heatmap(df, market, top_n=persist_n, min_amount=min_amt)
-        top_stocks = persist_stocks[:push_n]
+        if market == "US":
+            top_stocks = self._cap_us_leveraged_ranked(persist_stocks, push_n)
+        else:
+            top_stocks = persist_stocks[:push_n]
         
         if not top_stocks:
             logger.warning(f"No stocks found for {market} heat map. Fallback to daily top ranks.")
@@ -1115,7 +1287,10 @@ class MarketHeatMap:
                 }
                 for _, row in fallback_df.iterrows()
             ]
-            top_stocks = persist_stocks[:push_n]
+            if market == "US":
+                top_stocks = self._cap_us_leveraged_ranked(persist_stocks, push_n)
+            else:
+                top_stocks = persist_stocks[:push_n]
 
         persist_results = [dict(stock) for stock in persist_stocks]
 

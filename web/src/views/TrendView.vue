@@ -57,6 +57,10 @@ interface TrendItem {
 }
 
 type TrendMode = 'hot' | 'daily' | 'slow'
+interface TrendCacheEntry {
+  items: TrendItem[]
+  ts: number
+}
 
 const markets = ['CN', 'HK', 'US']
 const daysOptions = [3, 7, 14, 30, 60, 90, 180]
@@ -65,7 +69,9 @@ const activeMarket = ref('CN')
 const activeDays = ref(7)
 const loading = ref(false)
 const loadingKey = ref('')
-const trendCache = ref<Record<string, TrendItem[]>>({})
+const refreshingKey = ref('')
+const trendCache = ref<Record<string, TrendCacheEntry>>({})
+const CACHE_TTL_MS = 5 * 60 * 1000
 
 const pageSize = ref(20)
 const currentPage = ref(1)
@@ -133,17 +139,25 @@ async function fetchTrend(force = false) {
   const market = activeMarket.value
   const days = activeDays.value
   const key = makeCacheKey(mode, market, days)
+  const cached = trendCache.value[key]
+  const isFresh = cached && (Date.now() - cached.ts < CACHE_TTL_MS)
 
-  if (!force && trendCache.value[key]) {
+  if (!force && isFresh) {
     if (loadingKey.value !== key) loading.value = false
     return
   }
 
-  loadingKey.value = key
-  loading.value = true
+  const hasCachedRows = Boolean(cached?.items?.length)
+  if (hasCachedRows) {
+    refreshingKey.value = key
+    if (loadingKey.value !== key) loading.value = false
+  } else {
+    loadingKey.value = key
+    loading.value = true
+  }
   try {
     let endpoint = '/trend'
-    const params: Record<string, number | string> = { limit: 100, market }
+    const params: Record<string, number | string> = { limit: 100, market, refresh_prices: 1, force_refresh: force ? 1 : 0 }
     if (mode === 'hot') {
       params.days = days
     } else if (mode === 'daily') {
@@ -170,20 +184,37 @@ async function fetchTrend(force = false) {
     const raw = res.data.markets || {}
     const sourceItems = Array.isArray(raw[market]) ? raw[market] : []
     const nextItems = normalizeTrendItems(market, sourceItems, mode)
-    trendCache.value = { ...trendCache.value, [key]: nextItems }
+    trendCache.value = { ...trendCache.value, [key]: { items: nextItems, ts: Date.now() } }
   } catch (e: any) {
-    if (loadingKey.value === key) {
+    if (!hasCachedRows || force) {
       ElMessage.error(e?.response?.data?.detail || '加载趋势数据失败')
+    } else {
+      console.warn('Trend background refresh failed:', e)
     }
   } finally {
     if (loadingKey.value === key) {
       loading.value = false
       loadingKey.value = ''
     }
+    if (refreshingKey.value === key) {
+      refreshingKey.value = ''
+    }
   }
 }
 
-const currentItems = computed<TrendItem[]>(() => trendCache.value[makeCacheKey()] || [])
+const currentCache = computed<TrendCacheEntry | undefined>(() => trendCache.value[makeCacheKey()])
+const currentItems = computed<TrendItem[]>(() => currentCache.value?.items || [])
+const isRefreshingCurrent = computed(() => refreshingKey.value === makeCacheKey())
+const currentCacheAgeText = computed(() => {
+  const ts = currentCache.value?.ts || 0
+  if (!ts) return ''
+  const ageMs = Date.now() - ts
+  if (ageMs < 60_000) return '刚刚更新'
+  const mins = Math.max(1, Math.round(ageMs / 60_000))
+  if (mins < 60) return `${mins}分钟前更新`
+  const hours = Math.round(mins / 60)
+  return `${hours}小时前更新`
+})
 
 const sortedItems = computed<TrendItem[]>(() => {
   const list = [...currentItems.value]
@@ -383,7 +414,14 @@ onMounted(fetchTrend)
       </div>
       <div v-else-if="activeMode === 'daily'" class="mode-criteria daily-criteria">本地日榜 · 基础过滤 · 不触发全市场 API</div>
       <div v-else class="mode-criteria slow-criteria">20日≥12% · 60日≥30% · 高市值/高成交额</div>
-      <div class="meta-text">{{ metaPrefix() }} {{ totalItems }} 个标的</div>
+      <div class="meta-text">
+        {{ metaPrefix() }} {{ totalItems }} 个标的
+        <span v-if="currentCacheAgeText"> · {{ currentCacheAgeText }}</span>
+        <span v-if="isRefreshingCurrent"> · 后台刷新中</span>
+      </div>
+      <button class="refresh-btn" :class="{ refreshing: isRefreshingCurrent }" :disabled="isRefreshingCurrent" @click="fetchTrend(true)">
+        {{ isRefreshingCurrent ? '更新中' : '刷新' }}
+      </button>
     </div>
 
     <el-table :data="pagedItems" v-loading="loading" size="small" @sort-change="handleSortChange">
@@ -469,7 +507,8 @@ onMounted(fetchTrend)
 .toolbar {
   display: flex;
   align-items: center;
-  gap: 24px;
+  flex-wrap: wrap;
+  gap: 10px 18px;
   margin-bottom: 16px;
 }
 .mode-group, .tab-group, .days-group {
@@ -493,8 +532,31 @@ onMounted(fetchTrend)
   box-shadow: 0 1px 2px rgba(0,0,0,0.06);
 }
 .meta-text {
+  margin-left: auto;
   font-size: 12px;
   color: var(--text-secondary);
+}
+.refresh-btn {
+  padding: 5px 11px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  background: white;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  transition: all 0.15s ease;
+}
+.refresh-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 3px 10px rgba(15, 23, 42, 0.08);
+}
+.refresh-btn.refreshing,
+.refresh-btn:disabled {
+  color: var(--text-secondary);
+  cursor: default;
+  background: var(--bg-hover);
+  box-shadow: none;
 }
 .mode-criteria {
   padding: 4px 10px;
