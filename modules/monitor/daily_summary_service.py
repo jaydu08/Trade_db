@@ -40,6 +40,22 @@ class DailySummaryService:
     """
 
     @staticmethod
+    def generate_all_and_save(target_date: datetime.date = None) -> Dict[str, str]:
+        """Generate both the original push summary and the daily Trend algorithm summary."""
+        paths = {"daily_summary": "", "trend_summary": ""}
+        try:
+            paths["daily_summary"] = DailySummaryService.generate_and_save(target_date)
+        except Exception as e:
+            logger.error("每日推送标的汇总生成失败: %s", e, exc_info=True)
+
+        try:
+            paths["trend_summary"] = DailySummaryService.generate_trend_summary_and_save(target_date)
+        except Exception as e:
+            logger.error("当日Trend算法榜汇总生成失败: %s", e, exc_info=True)
+
+        return paths
+
+    @staticmethod
     def generate_and_save(target_date: datetime.date = None) -> str:
         """
         生成并保存当日汇总。
@@ -234,6 +250,146 @@ class DailySummaryService:
             logger.info("每日汇总已成功通过 Telegram 广播。")
         except Exception as e:
             logger.error("每日汇总推送到 Telegram 失败: %s", e)
+
+        return filepath
+
+    @staticmethod
+    def generate_trend_summary_and_save(target_date: datetime.date = None) -> str:
+        """
+        生成并推送当日 Trend 算法榜 TXT。
+        数据口径复用 Heatmap 页面里的 Trend算法榜(days=1)，避免 UI 与 TXT 分叉。
+        """
+        if target_date is None:
+            from zoneinfo import ZoneInfo
+            target_date = datetime.datetime.now(ZoneInfo("Asia/Shanghai")).date()
+
+        logger.info("生成当日Trend算法榜汇总: %s", target_date)
+
+        try:
+            from interface.api import get_heatmap_trend_push
+        except Exception as e:
+            logger.error("无法加载 Heatmap Trend 算法榜接口: %s", e)
+            return ""
+
+        def _safe_float(value) -> float:
+            try:
+                return float(value or 0)
+            except Exception:
+                return 0.0
+
+        def _format_amount(value: float, market: str) -> str:
+            amount = _safe_float(value)
+            if amount <= 0:
+                return "成交额:N/A"
+            unit = "美元" if market == "US" else "港币" if market == "HK" else "元"
+            if amount >= 100_000_000:
+                return f"成交额:{amount / 100_000_000:.1f}亿{unit}"
+            if amount >= 10_000:
+                return f"成交额:{amount / 10_000:.0f}万{unit}"
+            return f"成交额:{amount:.0f}{unit}"
+
+        def _format_market_cap(value: float, market: str) -> str:
+            cap = _safe_float(value)
+            if cap <= 0:
+                return "市值:N/A"
+            unit = "亿美元" if market == "US" else "亿港币" if market == "HK" else "亿元"
+            if cap >= 10000:
+                return f"市值:{cap / 10000:.2f}万{unit}"
+            if cap >= 1000:
+                return f"市值:{cap:.0f}{unit}"
+            if cap >= 100:
+                return f"市值:{cap:.1f}{unit}"
+            return f"市值:{cap:.2f}{unit}"
+
+        market_labels = {
+            "CN": "🇨🇳 A股 - 当日Trend算法榜",
+            "HK": "🇭🇰 港股 - 当日Trend算法榜",
+            "US": "🇺🇸 美股 - 当日Trend算法榜",
+        }
+
+        payloads = {}
+        total = 0
+        for market in ["CN", "HK", "US"]:
+            try:
+                payload = get_heatmap_trend_push(
+                    days=1,
+                    market=market,
+                    date=target_date.isoformat(),
+                    user=None,
+                )
+                items = list((payload or {}).get("items") or [])
+                payloads[market] = items
+                total += len(items)
+            except Exception as e:
+                logger.error("当日Trend算法榜生成失败: market=%s err=%s", market, e)
+                payloads[market] = []
+
+        if total == 0:
+            logger.info("当日暂无Trend算法榜标的，跳过汇总写入。")
+            return ""
+
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines = [
+            "=" * 48,
+            "   TradeDB 当日Trend算法榜汇总",
+            "=" * 48,
+            f"生成时间: {now_str}",
+            f"统计日期: {target_date}",
+            "数据口径: Heatmap页面 Trend算法榜(days=1)",
+            "=" * 48,
+            "",
+        ]
+
+        for market in ["CN", "HK", "US"]:
+            items = payloads.get(market) or []
+            if not items:
+                continue
+            lines.append(f"【{market_labels[market]}】")
+            for idx, item in enumerate(items, 1):
+                symbol = str(item.get("symbol", "") or "").strip()
+                name = str(item.get("name", "") or "").strip() or symbol
+                price = _safe_float(item.get("close"))
+                pct = _safe_float(item.get("change_pct"))
+                score = _safe_float(item.get("trend_score"))
+                industry = str(item.get("industry_label", "") or "").strip()
+                catalyst = str(item.get("catalyst_tags", "") or "").strip()
+                pct_str = f"+{pct:.2f}%" if pct >= 0 else f"{pct:.2f}%"
+                industry_str = f" | 行业:{industry}" if industry else ""
+                catalyst_str = f" | 催化:[{catalyst}]" if catalyst else ""
+                lines.append(
+                    f"  {idx:>2}. {name} ({symbol})"
+                    f" | 现价:{price:.2f}"
+                    f" | 涨幅:{pct_str}"
+                    f" | {_format_market_cap(item.get('market_cap'), market)}"
+                    f" | {_format_amount(item.get('amount'), market)}"
+                    f" | 评分:{score:.2f}"
+                    f"{industry_str}"
+                    f"{catalyst_str}"
+                )
+            lines.append("")
+
+        lines += [
+            "=" * 48,
+            f"合计Trend标的数: {total}",
+            "=" * 48,
+        ]
+
+        content = "\n".join(lines)
+        os.makedirs(SUMMARY_DIR, exist_ok=True)
+        filename = f"trend_summary_{target_date.strftime('%Y%m%d')}.txt"
+        filepath = os.path.join(SUMMARY_DIR, filename)
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        logger.info("当日Trend算法榜汇总已写入: %s  (共 %d 条标的)", filepath, total)
+
+        caption = f"📈 TradeDB 当日Trend算法榜汇总 ({target_date})\n合计标的数: {total}"
+        try:
+            Notifier.broadcast_document(filepath, caption=caption)
+            logger.info("当日Trend算法榜汇总已成功通过 Telegram 广播。")
+        except Exception as e:
+            logger.error("当日Trend算法榜汇总推送到 Telegram 失败: %s", e)
 
         return filepath
 

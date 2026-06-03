@@ -424,9 +424,9 @@ class TaskScheduler:
         self._run_job("trend_30d", TrendReportService.generate_and_push, 30)
 
     def _job_daily_summary(self):
-        """Job: 每日推送标的汇总 → 写入 logs/daily_summary_YYYYMMDD.txt"""
+        """Job: 每日推送标的汇总 + 当日Trend算法榜汇总 TXT。"""
         from modules.monitor.daily_summary_service import DailySummaryService
-        self._run_job("daily_summary", DailySummaryService.generate_and_save)
+        self._run_job("daily_summary", DailySummaryService.generate_all_and_save)
 
     def _job_sync_fundamentals(self):
         """Job: 全市场基本面更新 (仅财务数据入 SQLite)"""

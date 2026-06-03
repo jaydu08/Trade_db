@@ -167,6 +167,10 @@ class USPremarketScannerService:
         mapping = USPremarketScannerService._local_prev_close_map([r.get("symbol", "") for r in rows])
         updated = 0
         for row in rows:
+            # Sina usually carries the pre-market reference close. Local EOD is only a
+            # fallback because sparse daily caches can lag by one trading session.
+            if USPremarketScannerService._to_float(row.get("sina_prev_close")) > 0:
+                continue
             sym = USPremarketScannerService._normalize_us_symbol(row.get("symbol", ""))
             local = mapping.get(sym)
             if not local:
@@ -227,10 +231,16 @@ class USPremarketScannerService:
                 if resp.status_code != 200:
                     return None
                 data = resp.json() or {}
-                prev = USPremarketScannerService._to_float(data.get("pc"))
+                # At the NY 08:00 pre-market slot Finnhub `c` is the latest regular
+                # close; `pc` is the close before that and will overstate gaps.
+                prev = USPremarketScannerService._to_float(data.get("c"))
+                source = "finnhub_c"
+                if prev <= 0:
+                    prev = USPremarketScannerService._to_float(data.get("pc"))
+                    source = "finnhub_pc_fallback"
                 if prev <= 0:
                     return None
-                return row, prev
+                return row, prev, source
             except Exception as e:
                 logger.debug("US premarket Finnhub prev-close failed: symbol=%s err=%s", sym, e)
                 return None
@@ -240,8 +250,8 @@ class USPremarketScannerService:
             for item in executor.map(fetch, selected):
                 if not item:
                     continue
-                row, prev = item
-                if USPremarketScannerService._recalculate_pct(row, prev, "finnhub_pc"):
+                row, prev, source = item
+                if USPremarketScannerService._recalculate_pct(row, prev, source):
                     updated += 1
         return updated
 
@@ -446,6 +456,7 @@ class USPremarketScannerService:
                     "name": name,
                     "price": pre_price,
                     "prev_close": prev_close,
+                    "sina_prev_close": prev_close,
                     "regular_close": regular_close,
                     "pct": pct_chg,
                     "pre_change": round(pre_price - prev_close, 4),
