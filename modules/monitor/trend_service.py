@@ -813,7 +813,26 @@ class TrendCalculator:
         if market == "US" and "." in sym:
             # 例如 105.NVDA -> NVDA
             sym = sym.split(".")[-1].strip()
+        if market == "US":
+            sym = sym.upper()
         return sym
+
+    @staticmethod
+    def _symbol_candidates(symbol: str, market: str) -> List[str]:
+        raw = str(symbol or "").strip()
+        if not raw:
+            return []
+        out = [raw]
+        if market == "US":
+            ticker = TrendCalculator._normalize_symbol_for_api(raw, market)
+            out.extend([ticker, f"105.{ticker}", f"106.{ticker}", f"107.{ticker}"])
+        seen = set()
+        deduped = []
+        for s in out:
+            if s and s not in seen:
+                deduped.append(s)
+                seen.add(s)
+        return deduped
 
     @staticmethod
     def _get_return_from_daily_rank_db(symbol: str, market: str, d_days: int) -> Tuple[float, float, str]:
@@ -821,10 +840,9 @@ class TrendCalculator:
         if market == "CF":
             return 0.0, 0.0, ""
 
-        raw = str(symbol or "").strip()
-        candidates = [raw]
-        if market == "US" and "." in raw:
-            candidates.append(raw.split(".")[-1].strip())
+        candidates = TrendCalculator._symbol_candidates(symbol, market)
+        if not candidates:
+            return 0.0, 0.0, ""
 
         with get_ledger_session() as session:
             max_rows = max(90, int(d_days) * 25)
@@ -864,10 +882,9 @@ class TrendCalculator:
     @staticmethod
     def _get_return_from_daily_bar_db(symbol: str, market: str, d_days: int) -> Tuple[float, float, str]:
         """优先使用本地 TrendDailyBar 序列计算 N 日收益"""
-        raw = str(symbol or "").strip()
-        candidates = [raw]
-        if market == "US" and "." in raw:
-            candidates.append(raw.split(".")[-1].strip())
+        candidates = TrendCalculator._symbol_candidates(symbol, market)
+        if not candidates:
+            return 0.0, 0.0, ""
 
         with get_ledger_session() as session:
             max_rows = max(120, int(d_days) * 30)
@@ -1243,7 +1260,16 @@ class TrendCalculator:
             by_market.setdefault(str(it.get("market", "")), []).append(it)
 
         merged = list(items)
-        existing = {(str(it.get("market", "")), str(it.get("symbol", ""))) for it in items}
+        existing = {
+            (
+                str(it.get("market", "")),
+                TrendCalculator._normalize_symbol_for_api(
+                    str(it.get("symbol", "")),
+                    str(it.get("market", "")),
+                ),
+            )
+            for it in items
+        }
 
         with get_ledger_session() as session:
             for market in ["CN", "HK", "US"]:
@@ -1257,7 +1283,7 @@ class TrendCalculator:
 
                 picked = 0
                 for r in rows:
-                    sym = str(r.symbol or "").strip()
+                    sym = TrendCalculator._normalize_symbol_for_api(str(r.symbol or "").strip(), market)
                     key = (market, sym)
                     if (not sym) or (key in existing):
                         continue
@@ -1301,14 +1327,12 @@ class TrendCalculator:
                         except Exception:
                             pass
 
-                    merged.append(
-                        {
-                            "market": market,
-                            "symbol": sym,
-                            "name": str(r.name or ""),
-                            "reason_records": [],
-                        }
-                    )
+                    merged.append({
+                        "market": market,
+                        "symbol": sym,
+                        "name": str(r.name or ""),
+                        "reason_records": [],
+                    })
                     existing.add(key)
                     picked += 1
                     if picked >= fetch_n:
@@ -1318,6 +1342,14 @@ class TrendCalculator:
                     logger.info("Trend secondary pool added: market=%s added=%s", market, picked)
 
         return merged
+
+    @staticmethod
+    def _min_return_pct(market: str) -> float:
+        raw = os.getenv(f"TREND_MIN_RETURN_PCT_{market}", os.getenv("TREND_MIN_RETURN_PCT", "0"))
+        try:
+            return float(raw or 0)
+        except Exception:
+            return 0.0
 
     @staticmethod
     def calculate_trend(days: int = 7, topn_override: Optional[int] = None) -> Dict[str, List[Dict]]:
@@ -1348,14 +1380,20 @@ class TrendCalculator:
         # 2. 按市场和代码去重合并理由；无 heatmap 种子时仍允许 DailyRank 二级池补漏
         grouped = defaultdict(dict)
         for r in records:
-            key = (r["market"], r["symbol"])
+            market = str(r.get("market", "") or "").strip()
+            symbol = TrendCalculator._normalize_symbol_for_api(str(r.get("symbol", "") or ""), market)
+            if not market or not symbol:
+                continue
+            key = (market, symbol)
             if key not in grouped:
                 grouped[key] = {
-                    "market": r["market"],
-                    "symbol": r["symbol"],
+                    "market": market,
+                    "symbol": symbol,
                     "name": r["name"],
                     "reason_records": []
                 }
+            elif r["name"] and not grouped[key].get("name"):
+                grouped[key]["name"] = r["name"]
             if r["daily_reason"]:
                 grouped[key]["reason_records"].append((r["date"], r["daily_reason"].strip()))
                 
@@ -1453,7 +1491,18 @@ class TrendCalculator:
         # 4. 按市场分组排序并取 Top 10
         market_tops = defaultdict(list)
         for res in results:
-            market_tops[res["market"]].append(res)
+            market = str(res.get("market", "") or "")
+            if market in {"CN", "HK", "US"}:
+                try:
+                    ret = float(res.get("return_pct", 0) or 0)
+                    price = float(res.get("current_price", 0) or 0)
+                except Exception:
+                    continue
+                if ret <= TrendCalculator._min_return_pct(market):
+                    continue
+                if price <= 0 or not str(res.get("price_date", "") or "").strip():
+                    continue
+            market_tops[market].append(res)
             
         final_tops = {}
         for mkt, stks in market_tops.items():

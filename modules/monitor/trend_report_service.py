@@ -224,11 +224,29 @@ class TrendReportService:
 
     @staticmethod
     def _pick_market_items(market: str, stks: List[dict]) -> List[dict]:
+        cleaned: List[dict] = []
+        seen = set()
+        for s in stks:
+            try:
+                if float(s.get("return_pct", 0) or 0) <= 0:
+                    continue
+            except Exception:
+                continue
+            symbol = str(s.get("symbol", "") or "").strip()
+            display_symbol = symbol.split(".")[-1].strip().upper() if market == "US" else symbol
+            if not display_symbol or display_symbol in seen:
+                continue
+            seen.add(display_symbol)
+            if market == "US":
+                s = dict(s)
+                s["symbol"] = display_symbol
+            cleaned.append(s)
+
         # 港股推前7
         if market == "HK":
-            return stks[:7]
+            return cleaned[:7]
         # CN/US 推前10
-        return stks[:10]
+        return cleaned[:10]
 
     @staticmethod
     def _pick_cf_items(stks: List[dict], min_n: int = 3, max_n: int = 5) -> List[dict]:
