@@ -223,11 +223,13 @@ ak.futures_display_main_sina()（拉取全市场约 80+ 个实物主力合约）
 ### 5.4 热门榜单（`MarketHeatMap` + 新闻强度重排）
 
 **CN 热榜（当前版本：五因子评分 + 市场状态切换）**
-- 候选池：`成交额 >= 5000万`，并按板块涨停幅度做归一化涨幅过滤
-  - 主板按 10%，创业板/科创板按 20%，北交所按 30%
-- 入池阈值：
-  - 常态：`normalized_pct >= 0.60`
-  - 弱市降级：`normalized_pct >= 0.50`
+- 候选池硬漏斗：`成交额 >= 2亿`，总市值已知时要求 `总市值 >= 50亿`
+- 入池阈值：按板块使用绝对涨幅线，避免 20cm 大票被统一归一化门槛误杀
+  - 主板：`涨幅 >= 5%`
+  - 创业板/科创板：`涨幅 >= 6%`
+  - 北交所：`涨幅 >= 8%`
+  - 极弱市兜底：默认降级为 `4% / 5% / 6%`
+- 归一化涨幅：仍按主板 10%、创业板/科创板 20%、北交所 30% 计算，作为涨幅评分因子
 - 近涨停抹平：`0.97~1.03` 统一视作 `1.0`，避免 19.98/19.99 这类噪声
 - 换手率因子：
   - 优先使用实时换手率
@@ -397,8 +399,12 @@ TREND_NEWS_BOOST=0.18
 TREND_NEWS_LOOKBACK_DAYS=7
 
 # A股 Heatmap 五因子参数（可选）
-CN_HEAT_NORM_MIN=0.60
-CN_HEAT_NORM_FALLBACK_MIN=0.50
+CN_HEAT_MAIN_PCT_MIN=5.0
+CN_HEAT_20CM_PCT_MIN=6.0
+CN_HEAT_BJ_PCT_MIN=8.0
+CN_HEAT_MAIN_PCT_FALLBACK_MIN=4.0
+CN_HEAT_20CM_PCT_FALLBACK_MIN=5.0
+CN_HEAT_BJ_PCT_FALLBACK_MIN=6.0
 CN_HEAT_NEAR_LIMIT_LOW=0.97
 CN_HEAT_NEAR_LIMIT_HIGH=1.03
 CN_HEAT_GEM_BONUS=1.10

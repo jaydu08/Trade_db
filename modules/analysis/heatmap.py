@@ -41,8 +41,13 @@ class MarketHeatMap:
             os.getenv("ENABLE_HEATMAP_MARKET_BRIEF", "1")
         ).strip().lower() in {"1", "true", "yes", "on"}
         # A股热榜参数（可通过环境变量在线调参）
-        self.cn_norm_min = float(os.getenv("CN_HEAT_NORM_MIN", "0.60"))
-        self.cn_norm_fallback_min = float(os.getenv("CN_HEAT_NORM_FALLBACK_MIN", "0.50"))
+        # 入池使用分板块绝对涨幅门槛，避免 20cm 大票涨 6~10% 被统一归一化门槛误杀。
+        self.cn_pct_min_main = float(os.getenv("CN_HEAT_MAIN_PCT_MIN", "5.0"))
+        self.cn_pct_min_20cm = float(os.getenv("CN_HEAT_20CM_PCT_MIN", "6.0"))
+        self.cn_pct_min_bj = float(os.getenv("CN_HEAT_BJ_PCT_MIN", "8.0"))
+        self.cn_pct_fallback_min_main = float(os.getenv("CN_HEAT_MAIN_PCT_FALLBACK_MIN", "4.0"))
+        self.cn_pct_fallback_min_20cm = float(os.getenv("CN_HEAT_20CM_PCT_FALLBACK_MIN", "5.0"))
+        self.cn_pct_fallback_min_bj = float(os.getenv("CN_HEAT_BJ_PCT_FALLBACK_MIN", "6.0"))
         self.cn_near_limit_low = float(os.getenv("CN_HEAT_NEAR_LIMIT_LOW", "0.97"))
         self.cn_near_limit_high = float(os.getenv("CN_HEAT_NEAR_LIMIT_HIGH", "1.03"))
         self.cn_gem_bonus = float(os.getenv("CN_HEAT_GEM_BONUS", "1.10"))
@@ -151,6 +156,26 @@ class MarketHeatMap:
             return self.cn_weights_trend
         return self.cn_weights_range
 
+    def _cn_pct_gate_thresholds(self, frame: pd.DataFrame, fallback: bool = False) -> pd.Series:
+        """返回A股分板块绝对涨幅入池线：主板/20cm/北交所分别配置。"""
+        if frame is None or frame.empty:
+            return pd.Series(dtype=float)
+
+        if fallback:
+            main = self.cn_pct_fallback_min_main
+            twenty_cm = self.cn_pct_fallback_min_20cm
+            bj = self.cn_pct_fallback_min_bj
+        else:
+            main = self.cn_pct_min_main
+            twenty_cm = self.cn_pct_min_20cm
+            bj = self.cn_pct_min_bj
+
+        thresholds = pd.Series(float(main), index=frame.index, dtype=float)
+        symbols = frame.get("symbol", pd.Series("", index=frame.index)).astype(str)
+        thresholds.loc[symbols.str.startswith(("30", "688"))] = float(twenty_cm)
+        thresholds.loc[symbols.str.startswith(("8", "4"))] = float(bj)
+        return thresholds
+
     def _build_cn_market_cap_factor(self, filtered: pd.DataFrame) -> pd.Series:
         """构建A股市值因子：总市值越大得分越高（log后百分位）。"""
         if filtered.empty:
@@ -158,16 +183,20 @@ class MarketHeatMap:
 
         work = filtered.copy()
         out = pd.Series(0.5, index=work.index, dtype=float)
+        mcap_vals = {}
+
+        if "total_mv_100m" in work.columns:
+            cached = pd.to_numeric(work["total_mv_100m"], errors="coerce").fillna(0.0)
+            mcap_vals.update(cached[cached > 0].to_dict())
 
         symbols = []
         top_idx = work.sort_values(by="amount", ascending=False).head(self.cn_mcap_fetch_cap).index
         for idx in top_idx:
+            if idx in mcap_vals:
+                continue
             sym = str(work.at[idx, "symbol"]).strip()
             if sym:
                 symbols.append((idx, sym))
-
-        if not symbols:
-            return out
 
         def _fetch_one(item):
             idx, symbol = item
@@ -175,16 +204,16 @@ class MarketHeatMap:
             total_mv_100m = float((metrics or {}).get("total_mv_100m", 0) or 0)
             return idx, max(total_mv_100m, 0.0)
 
-        mcap_vals = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
-            futures = [ex.submit(_fetch_one, item) for item in symbols]
-            for f in concurrent.futures.as_completed(futures):
-                try:
-                    idx, mv = f.result()
-                    if mv > 0:
-                        mcap_vals[idx] = mv
-                except Exception:
-                    continue
+        if symbols:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+                futures = [ex.submit(_fetch_one, item) for item in symbols]
+                for f in concurrent.futures.as_completed(futures):
+                    try:
+                        idx, mv = f.result()
+                        if mv > 0:
+                            mcap_vals[idx] = mv
+                    except Exception:
+                        continue
 
         if not mcap_vals:
             return out
@@ -286,8 +315,20 @@ class MarketHeatMap:
         work["turnover_effective"] = work["turnover"].clip(lower=0.0)
 
         missing_idx = work.index[work["turnover_effective"] <= 0].tolist()
+        if missing_idx and "circ_mv_100m" in work.columns:
+            cached_circ = pd.to_numeric(work["circ_mv_100m"], errors="coerce").fillna(0.0)
+            for i in list(missing_idx):
+                circ_mv_100m = float(cached_circ.get(i, 0.0) or 0.0)
+                if circ_mv_100m <= 0:
+                    continue
+                amount = float(work.at[i, "amount"] or 0)
+                turnover_approx = (amount / (circ_mv_100m * 1e8)) * 100.0
+                if turnover_approx > 0:
+                    work.at[i, "turnover_effective"] = max(turnover_approx, 0.0)
+            missing_idx = work.index[work["turnover_effective"] <= 0].tolist()
+
         if missing_idx:
-            # 仅对候选池中缺失换手率的标的补拉市值，避免全市场逐个请求过慢
+            # 仅对候选池中仍缺失换手率的标的补拉市值，避免全市场逐个请求过慢
             symbols = []
             for i in missing_idx[: self.cn_turnover_fetch_cap]:
                 symbol = str(work.at[i, "symbol"]).strip()
@@ -532,26 +573,31 @@ class MarketHeatMap:
         if not idx_syms:
             return pd.DataFrame()
 
-        total_mv_map = {}
+        metric_map = {}
 
         def _fetch_one(item):
             idx, sym = item
-            m = get_cn_market_metrics(sym)
-            return idx, float((m or {}).get("total_mv_100m", 0) or 0)
+            m = get_cn_market_metrics(sym) or {}
+            total_mv = float(m.get("total_mv_100m", 0) or 0)
+            circ_mv = float(m.get("circ_mv_100m", 0) or 0)
+            return idx, max(total_mv, 0.0), max(circ_mv, 0.0)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(idx_syms))) as ex:
             futures = [ex.submit(_fetch_one, it) for it in idx_syms]
             for f in concurrent.futures.as_completed(futures):
                 try:
-                    idx, mv = f.result()
-                    if mv > 0:
-                        total_mv_map[idx] = mv
+                    idx, total_mv, circ_mv = f.result()
+                    if total_mv > 0 or circ_mv > 0:
+                        metric_map[idx] = (total_mv, circ_mv)
                 except Exception:
                     continue
 
-       # 市值获取失败（0）不剔除，仅不参与市值因子加权；
+        # 市值获取失败（0）不剔除，仅不参与市值因子加权；
         # 仅对"成功拿到市值"的标的执行市值硬过滤。
+        total_mv_map = {idx: vals[0] for idx, vals in metric_map.items()}
+        circ_mv_map = {idx: vals[1] for idx, vals in metric_map.items()}
         work["total_mv_100m"] = work.index.to_series().map(total_mv_map).fillna(0.0)
+        work["circ_mv_100m"] = work.index.to_series().map(circ_mv_map).fillna(0.0)
         known_mask = work["total_mv_100m"] > 0
         floor = float(self.cn_hard_total_mv_100m_min or 0)
         work = work[(~known_mask) | (work["total_mv_100m"] >= floor)].copy()
@@ -846,29 +892,23 @@ class MarketHeatMap:
 
             normalized_pct = filtered["pct_chg"] / limits
 
-            # 入池门槛（可配置）：归一化涨幅 >= 0.60
-            pool_mask = normalized_pct >= self.cn_norm_min
-            filtered = filtered[pool_mask].copy()
-            limits = limits.loc[filtered.index]
-            normalized_pct = normalized_pct.loc[filtered.index]
-
-            # 弱市降级（可配置）：默认放宽到 0.50
-            if filtered.empty:
+            # 入池门槛（可配置）：主板/20cm/北交所分别使用绝对涨幅线。
+            pct_thresholds = self._cn_pct_gate_thresholds(filtered)
+            pool_mask = filtered["pct_chg"] >= pct_thresholds
+            if not bool(pool_mask.any()):
+                fallback_thresholds = self._cn_pct_gate_thresholds(filtered, fallback=True)
                 logger.warning(
-                    "CN: normalized_pct>=%.2f 无满足标的，降级到 >=%.2f",
-                    self.cn_norm_min,
-                    self.cn_norm_fallback_min,
+                    "CN: pct gate main/20cm/bj >= %.1f/%.1f/%.1f 无满足标的，降级到 %.1f/%.1f/%.1f",
+                    self.cn_pct_min_main,
+                    self.cn_pct_min_20cm,
+                    self.cn_pct_min_bj,
+                    self.cn_pct_fallback_min_main,
+                    self.cn_pct_fallback_min_20cm,
+                    self.cn_pct_fallback_min_bj,
                 )
-                fallback_df = filtered.copy()
-                fallback_limits = pd.Series(10.0, index=fallback_df.index)
-                fallback_limits[fallback_df["symbol"].str.startswith(("30", "688"))] = 20.0
-                fallback_limits[fallback_df["symbol"].str.startswith(("8", "4"))] = 30.0
-                fallback_norm = fallback_df["pct_chg"] / fallback_limits
-                fallback_pool = fallback_norm >= self.cn_norm_fallback_min
-                filtered = fallback_df[fallback_pool].copy()
-                limits = fallback_limits.loc[filtered.index]
-                normalized_pct = fallback_norm.loc[filtered.index]
+                pool_mask = filtered["pct_chg"] >= fallback_thresholds
 
+            filtered = filtered[pool_mask].copy()
             limits = limits.loc[filtered.index]
             normalized_pct = normalized_pct.loc[filtered.index]
 
