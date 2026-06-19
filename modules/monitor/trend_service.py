@@ -1034,9 +1034,9 @@ class TrendCalculator:
     @staticmethod
     def _market_quota(market: str, topn: int) -> Tuple[int, int, int]:
         defaults = {
-            # Heatmap Trend daily CN view uses 12 slots, split evenly across cap buckets.
+            # Heatmap Trend daily CN view uses 12 slots: 4 large + 5 mid + 3 small.
             # Other Trend reports keep the older 10-slot shape unless explicitly overridden.
-            "CN": (4, 4, 4) if int(topn or 0) == 12 else (3, 4, 3),
+            "CN": (4, 5, 3) if int(topn or 0) == 12 else (3, 4, 3),
             "HK": (3, 3, 1),
             "US": (3, 5, 2),
         }
