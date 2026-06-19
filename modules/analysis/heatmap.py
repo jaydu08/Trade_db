@@ -1282,8 +1282,18 @@ class MarketHeatMap:
             return
             
         # 2. 生成榜单配置：TG 推送仍保持精简，Web 当日强势额外落库更宽候选池。
+        def _env_int(name: str, default: int) -> int:
+            try:
+                val = int(os.getenv(name, str(default)) or default)
+                return val if val > 0 else default
+            except Exception:
+                return default
+
+        def _push_limit(default: int) -> int:
+            return _env_int(f"HEATMAP_PUSH_TOP_N_{market}", _env_int("HEATMAP_PUSH_TOP_N", default))
+
         min_amt = 50_000_000   # CN/HK: 5000万人民币
-        push_n = 10
+        push_n = _push_limit(10)
         persist_n = int(os.getenv("DAILY_HOT_PERSIST_TOP_N", "80") or 80)
         persist_n = max(push_n, min(200, persist_n))
         cn_total_amount = 0.0
@@ -1299,8 +1309,9 @@ class MarketHeatMap:
         elif market == 'US':
             # 回调至 2000万美元（配合 Finnhub 接口做 1亿美金市值精确过滤）
             min_amt = 20_000_000
+            push_n = _push_limit(12)
         elif market == 'HK':
-            push_n = 5
+            push_n = _push_limit(7)
 
         persist_stocks = self._generate_heatmap(df, market, top_n=persist_n, min_amount=min_amt)
         if market == "US":

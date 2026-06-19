@@ -2060,7 +2060,7 @@ def get_heatmap_trend_push(
     except Exception:
         raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
 
-    cache_key = f"api_heatmap_trend_push_v8_{market_filter}_{target_date}_{days}"
+    cache_key = f"api_heatmap_trend_push_v9_{market_filter}_{target_date}_{days}"
     cached = get_cache(cache_key)
     if isinstance(cached, dict):
         return cached
@@ -2074,7 +2074,18 @@ def get_heatmap_trend_push(
         from modules.monitor.trend_report_service import TrendReportService
         from modules.monitor.industry_intel import enrich_industry_labels
 
-        quota = {"CN": 10, "HK": 7, "US": 10}.get(market_filter, 10)
+        def _env_int(name: str, default: int) -> int:
+            try:
+                val = int(os.getenv(name, str(default)) or default)
+                return val if val > 0 else default
+            except Exception:
+                return default
+
+        quota = {
+            "CN": _env_int("HEATMAP_TREND_CN_TOP_N", 12),
+            "HK": _env_int("HEATMAP_TREND_HK_TOP_N", 7),
+            "US": _env_int("HEATMAP_TREND_US_TOP_N", 10),
+        }.get(market_filter, 10)
         cutoff_seed = target_date - dt.timedelta(days=max(days, 7))
         cutoff_rank = target_date - dt.timedelta(days=max(3, min(days, 30)))
         series_cutoff = target_date - dt.timedelta(days=max(220, days * 3))
@@ -2128,7 +2139,7 @@ def get_heatmap_trend_push(
                 cap = _safe_float(item.get("total_mv_100m"))
                 if cap >= 1200:
                     return 1.20
-                if cap >= 500:
+                if cap >= 400:
                     return 1.10
                 if cap >= 200:
                     return 1.05

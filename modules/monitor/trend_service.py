@@ -1034,7 +1034,9 @@ class TrendCalculator:
     @staticmethod
     def _market_quota(market: str, topn: int) -> Tuple[int, int, int]:
         defaults = {
-            "CN": (3, 4, 3),
+            # Heatmap Trend daily CN view uses 12 slots, split evenly across cap buckets.
+            # Other Trend reports keep the older 10-slot shape unless explicitly overridden.
+            "CN": (4, 4, 4) if int(topn or 0) == 12 else (3, 4, 3),
             "HK": (3, 3, 1),
             "US": (3, 5, 2),
         }
@@ -1063,13 +1065,14 @@ class TrendCalculator:
         market = str(item.get("market", "")).strip().upper()
         if market == "CN":
             cap = float(item.get("total_mv_100m", 0) or 0)
-            large = float(os.getenv("TREND_CN_LARGE_100M", "1000") or 1000)
-            mid = float(os.getenv("TREND_CN_MID_100M", "200") or 200)
+            large = float(os.getenv("TREND_CN_LARGE_100M", "1200") or 1200)
+            mid = float(os.getenv("TREND_CN_MID_100M", "400") or 400)
+            small = float(os.getenv("TREND_CN_SMALL_100M", "1") or 1)
             if cap >= large:
                 return "large"
             if cap >= mid:
                 return "mid"
-            if cap > 0:
+            if cap >= small:
                 return "small"
             return "unknown"
 
