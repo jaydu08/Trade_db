@@ -203,7 +203,7 @@ ak.futures_display_main_sina()（拉取全市场约 80+ 个实物主力合约）
 ### 5.3 每日榜单（`DailyRankService`）
 
 补充：每日 19:00 汇总 TXT（`daily_summary`）已合并为单文件口径：
-- A股：复用 Heatmap 页面 `Trend算法榜(days=1)`，默认 `12` 支，市值分层为 `large>=1200亿 / mid=400~1200亿 / small=1~400亿`，默认配额 `large/mid/small = 4/5/3`
+- A股：复用 Heatmap 页面 `Trend算法榜(days=1)`，默认 `12` 支，市值分层为 `large>=1200亿 / mid=400~1200亿 / small=1~400亿`，默认配额 `large/mid/small = 4/5/3`；日榜评分按涨停幅度归一化（主板10%、创业/科创20%、北交30%），近涨停边界抹平，并对创业/科创强势标的默认 `1.05x` 轻量提权
 - 港股：复用 Heatmap 日榜，默认 `7` 支
 - 美股：复用 Heatmap 日榜，默认 `12` 支
 - 大宗商品：保留原战报标的段

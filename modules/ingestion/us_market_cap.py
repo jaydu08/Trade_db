@@ -9,6 +9,12 @@ from core.cache import cached
 
 logger = logging.getLogger(__name__)
 _YF_COOLDOWN_UNTIL = 0.0
+_LOCAL_CCY_BY_SYMBOL = {
+    # Finnhub can report the underlying local-listing market cap for these ADRs.
+    "UMC": "TWD",
+    "TSM": "TWD",
+    "ASX": "TWD",
+}
 
 
 def _to_float(value) -> float:
@@ -20,6 +26,41 @@ def _to_float(value) -> float:
 
 def _to_sina_symbol(raw: str) -> str:
     return "gb_" + str(raw or "").strip().lower().replace(".", "$")
+
+
+def _fx_per_usd(currency: str) -> float:
+    """Return local-currency units per USD for common non-USD market-cap payloads."""
+    ccy = str(currency or "").strip().upper()
+    defaults = {
+        "TWD": 31.0,
+        "HKD": 7.8,
+        "CNY": 7.2,
+        "CNH": 7.2,
+        "JPY": 155.0,
+        "KRW": 1350.0,
+        "EUR": 0.92,
+        "GBP": 0.79,
+    }
+    if not ccy:
+        return 0.0
+    return _to_float(os.getenv(f"FX_{ccy}_PER_USD", defaults.get(ccy, 0.0)))
+
+
+def _finnhub_cap_to_musd(symbol: str, cap_m: float, payload: Dict) -> tuple[float, str]:
+    """Finnhub marketCapitalization is in millions, but not always USD for ADRs."""
+    raw = str(symbol or "").strip().upper()
+    ccy = str((payload or {}).get("currency", "") or "").strip().upper()
+    if not ccy:
+        ccy = _LOCAL_CCY_BY_SYMBOL.get(raw, "USD")
+
+    if ccy == "USD":
+        return cap_m, "USD"
+
+    fx = _fx_per_usd(ccy)
+    if fx <= 0:
+        logger.info("US market cap finnhub skipped: symbol=%s unsupported currency=%s", raw, ccy)
+        return 0.0, ccy
+    return cap_m / fx, ccy
 
 
 def _market_cap_from_sina(raw: str) -> Dict[str, float]:
@@ -52,7 +93,7 @@ def _market_cap_from_sina(raw: str) -> Dict[str, float]:
         return {}
 
 
-@cached("us_market_metrics", ttl=1800)
+@cached("us_market_metrics_v2", ttl=1800)
 def get_us_market_metrics(symbol: str) -> Dict[str, float]:
     raw = str(symbol or "").split(".")[-1].strip().upper()
     if not raw:
@@ -70,13 +111,15 @@ def get_us_market_metrics(symbol: str) -> Dict[str, float]:
                 payload = resp.json() if resp is not None else {}
                 cap_m = _to_float((payload or {}).get("marketCapitalization"))
                 if cap_m > 0:
-                    return {
-                        "provider": "finnhub",
-                        "symbol": raw,
-                        "market_cap_musd": round(cap_m, 4),
-                        "market_cap_100m_usd": round(cap_m / 100.0, 4),
-                        "finnhub_industry": str((payload or {}).get("finnhubIndustry", "") or ""),
-                    }
+                    cap_musd, source_ccy = _finnhub_cap_to_musd(raw, cap_m, payload)
+                    if cap_musd > 0:
+                        return {
+                            "provider": "finnhub" if source_ccy == "USD" else f"finnhub_{source_ccy.lower()}_fx",
+                            "symbol": raw,
+                            "market_cap_musd": round(cap_musd, 4),
+                            "market_cap_100m_usd": round(cap_musd / 100.0, 4),
+                            "finnhub_industry": str((payload or {}).get("finnhubIndustry", "") or ""),
+                        }
             elif getattr(resp, "status_code", 0) in (401, 403, 429):
                 logger.info("US market cap finnhub unavailable: symbol=%s status=%s", raw, resp.status_code)
         except Exception as e:
@@ -108,7 +151,7 @@ def get_us_market_metrics(symbol: str) -> Dict[str, float]:
     return {}
 
 
-@cached("us_market_metrics_light", ttl=1800)
+@cached("us_market_metrics_light_v2", ttl=1800)
 def get_us_market_metrics_light(symbol: str) -> Dict[str, float]:
     """Lightweight US market-cap lookup for UI list enrichment: Sina only."""
     raw = str(symbol or "").split(".")[-1].strip().upper()

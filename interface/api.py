@@ -2060,7 +2060,7 @@ def get_heatmap_trend_push(
     except Exception:
         raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
 
-    cache_key = f"api_heatmap_trend_push_v9_{market_filter}_{target_date}_{days}"
+    cache_key = f"api_heatmap_trend_push_v10_{market_filter}_{target_date}_{days}"
     cached = get_cache(cache_key)
     if isinstance(cached, dict):
         return cached
@@ -2133,6 +2133,42 @@ def get_heatmap_trend_push(
             if (cutoff - base_date).days > max_base_lag:
                 return 0.0, latest_price, ""
             return round((latest_price - base_price) / base_price * 100, 2), latest_price, str(latest_date)
+
+        def _env_float(name: str, default: float) -> float:
+            try:
+                val = float(os.getenv(name, str(default)) or default)
+                return val
+            except Exception:
+                return default
+
+        cn_near_limit_low = _env_float("CN_HEAT_NEAR_LIMIT_LOW", 0.97)
+        cn_near_limit_high = _env_float("CN_HEAT_NEAR_LIMIT_HIGH", 1.03)
+        cn_trend_20cm_bonus = _env_float("HEATMAP_TREND_CN_20CM_BONUS", 1.05)
+
+        def _cn_daily_limit_pct(symbol: str) -> float:
+            sym = str(symbol or "").strip()
+            if sym.startswith(("30", "688")):
+                return 20.0
+            if sym.startswith(("8", "4")):
+                return 30.0
+            return 10.0
+
+        def _return_score(mkt: str, item: dict) -> float:
+            ret = _safe_float(item.get("return_pct"))
+            if mkt != "CN" or days != 1:
+                return ret
+
+            symbol = str(item.get("symbol", "") or "").strip()
+            limit = _cn_daily_limit_pct(symbol)
+            normalized = ret / limit if limit > 0 else 0.0
+            if cn_near_limit_low <= normalized <= cn_near_limit_high:
+                normalized = 1.0
+            normalized = max(0.0, min(1.2, normalized))
+
+            score = normalized * 10.0
+            if symbol.startswith(("30", "688")) and ret > 10.0:
+                score *= max(1.0, cn_trend_20cm_bonus)
+            return score
 
         def _market_cap_multiplier(mkt: str, item: dict) -> float:
             if mkt == "CN":
@@ -2326,8 +2362,11 @@ def get_heatmap_trend_push(
             })
             processed.append(item)
 
+        for item in processed:
+            item["return_score"] = round(_return_score(market_filter, item), 4)
+
         processed.sort(
-            key=lambda x: (_safe_float(x.get("return_pct")), _safe_float(x.get("signal_strength")), _safe_float(x.get("amount"))),
+            key=lambda x: (_safe_float(x.get("return_score", x.get("return_pct"))), _safe_float(x.get("signal_strength")), _safe_float(x.get("amount"))),
             reverse=True,
         )
         enrich_limit = max(quota * 3, int(os.getenv("HEATMAP_TREND_AB_MAX_ENRICH", "60") or 60))
@@ -2377,7 +2416,8 @@ def get_heatmap_trend_push(
             signal_strength = _safe_float(item.get("signal_strength"))
             freshness_factor = min(1.25, 0.85 + signal_strength * 0.18)
             item["mcap_mult"] = mcap_mult
-            item["trend_score"] = round(_safe_float(item.get("return_pct")) * freshness_factor * 0.95 * mcap_mult, 2)
+            item["return_score"] = round(_return_score(market_filter, item), 4)
+            item["trend_score"] = round(_safe_float(item.get("return_score", item.get("return_pct"))) * freshness_factor * 0.95 * mcap_mult, 2)
             final_rows.append(item)
 
         picked = TrendCalculator._select_with_quota(final_rows, market_filter, topn_override=quota)
@@ -2413,6 +2453,7 @@ def get_heatmap_trend_push(
                 "catalyst_tags": catalyst,
                 "industry_label": str(s.get("industry_label", "") or ""),
                 "trend_score": _safe_float(s.get("trend_score")),
+                "return_score": _safe_float(s.get("return_score", s.get("return_pct"))),
                 "signal_strength": _safe_float(s.get("signal_strength")),
                 "mcap_mult": _safe_float(s.get("mcap_mult"), 1.0),
                 "days_on_list": days_on_list,
