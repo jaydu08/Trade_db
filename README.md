@@ -125,7 +125,7 @@ Trade_db/
 | `sync_news` | `NEWS_SYNC_INTERVAL_MINUTES`（默认120分钟） | 定向新闻同步（trend/heatmap + 自选/持仓）到 `market_events` |
 | `monitor_scan` | **每 1 分钟** | 自选股异动监控 → Telegram推送 |
 | `commodity_scan` | 周二至周六 08:00 | 大宗商品每日固定战报 → Telegram推送 |
-| `cn_heatmap` | 工作日 18:35 | A股热门榜单 → Telegram推送 |
+| `cn_heatmap` | 工作日 18:35 | A股当日Trend算法榜 → Telegram推送（与daily_summary A股段同源） |
 | `hk_heatmap` | 工作日 18:30 | 港股热门榜单 → Telegram推送 |
 | `us_heatmap` | 周二至周六 08:00 | 美股热门榜单 → Telegram推送 |
 | `us_premarket_hunter` | 工作日 20:00/21:00 | 美股盘前猎手（函数内按纽约08:00守卫，自动兼容DST） |

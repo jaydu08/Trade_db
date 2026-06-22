@@ -2048,6 +2048,7 @@ def get_heatmap_trend_push(
     market: str = Query(default="CN"),
     date: str = Query(default=""),
     user: UserContext = Depends(get_current_user),
+    force_refresh: bool = False,
 ):
     """Return a date-bound Trend selection for Heatmap-side A/B comparison."""
     allowed_days = {1, 3, 7, 30, 90, 180}
@@ -2061,7 +2062,7 @@ def get_heatmap_trend_push(
         raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
 
     cache_key = f"api_heatmap_trend_push_v10_{market_filter}_{target_date}_{days}"
-    cached = get_cache(cache_key)
+    cached = get_cache(cache_key) if not force_refresh else None
     if isinstance(cached, dict):
         return cached
 
