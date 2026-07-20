@@ -97,8 +97,18 @@ class AssetSyncer:
         if market == "HK":
             return akshare_client.get_stock_info_hk()
         if market == "US":
-            return akshare_client.get_stock_info_us()
+            return akshare_client.get_us_asset_universe()
         raise ValueError(f"Unsupported market: {market}")
+
+    @staticmethod
+    def _market_symbol_key(symbol: str, market: str) -> str:
+        raw = str(symbol or "").strip()
+        if market == "US":
+            parts = raw.split(".", 1)
+            if len(parts) == 2 and parts[0] in {"105", "106", "107"}:
+                raw = parts[1]
+            return raw.upper()
+        return raw
 
     def sync_market(self, market: str, full_sync: bool = True) -> dict:
         sync_type = "FULL" if full_sync else "INCREMENTAL"
@@ -122,6 +132,16 @@ class AssetSyncer:
             logger.info(f"Processing {len(df)} stocks for {market}...")
             
             with db_manager.meta_session() as session:
+                existing_by_market_key = {}
+                if market == "US":
+                    existing_assets = session.exec(
+                        select(Asset).where(Asset.market == market)
+                    ).all()
+                    existing_by_market_key = {
+                        self._market_symbol_key(asset.symbol, market): asset
+                        for asset in existing_assets
+                    }
+
                 for _, row in df.iterrows():
                     try:
                         symbol, name = self._extract_symbol_name(row)
@@ -130,7 +150,11 @@ class AssetSyncer:
                             continue
                         
                         # 检查是否存在
-                        existing = session.get(Asset, symbol)
+                        existing = (
+                            existing_by_market_key.get(self._market_symbol_key(symbol, market))
+                            if market == "US"
+                            else session.get(Asset, symbol)
+                        )
                         
                         if existing:
                             # 更新
@@ -148,6 +172,8 @@ class AssetSyncer:
                                 listing_status="ACTIVE",
                             )
                             session.add(asset)
+                            if market == "US":
+                                existing_by_market_key[self._market_symbol_key(symbol, market)] = asset
                             result["inserted"] += 1
                     
                     except Exception as e:

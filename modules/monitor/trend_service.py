@@ -471,7 +471,7 @@ class TrendService:
     def _get_symbols_need_backfill(market: str, symbols: List[str], cutoff: dt.date, lookback_days: int) -> List[str]:
         if not symbols:
             return []
-        earliest: Dict[str, dt.date] = {}
+        dates_by_symbol: Dict[str, set[dt.date]] = {}
         with get_ledger_session() as session:
             rows = session.exec(
                 select(TrendDailyBar.symbol, TrendDailyBar.date).where(
@@ -481,12 +481,32 @@ class TrendService:
                 )
             ).all()
         for sym, d in rows:
-            if sym not in earliest or d < earliest[sym]:
-                earliest[sym] = d
+            if sym and d:
+                dates_by_symbol.setdefault(sym, set()).add(d)
 
         tolerance_days = 3 if lookback_days >= 14 else 1
-        threshold = cutoff + dt.timedelta(days=tolerance_days)
-        return [sym for sym in symbols if sym not in earliest or earliest[sym] > threshold]
+        earliest_threshold = cutoff + dt.timedelta(days=tolerance_days)
+        latest_threshold = dt.date.today() - dt.timedelta(days=7 if market == "US" else 5)
+        # Calendar windows contain roughly 70% trading days. Requiring 35% leaves
+        # room for holidays while still detecting the large sparse-series gaps
+        # that previously produced false 20/60-day returns.
+        min_observations = max(8, int(max(1, lookback_days) * 0.35))
+
+        targets = []
+        for sym in symbols:
+            dates = dates_by_symbol.get(sym) or set()
+            if not dates:
+                targets.append(sym)
+                continue
+            if min(dates) > earliest_threshold:
+                targets.append(sym)
+                continue
+            if max(dates) < latest_threshold:
+                targets.append(sym)
+                continue
+            if len(dates) < min_observations:
+                targets.append(sym)
+        return targets
 
     @staticmethod
     def backfill_pool_history(markets: List[str], lookback_days: int = 60) -> Dict[str, Dict[str, int]]:
@@ -835,6 +855,64 @@ class TrendCalculator:
         return deduped
 
     @staticmethod
+    def _calculate_period_return(
+        price_by_date: Dict[dt.date, float],
+        d_days: int,
+    ) -> Tuple[float, float, str]:
+        """Calculate a calendar-window return only when a valid base point exists."""
+        if not price_by_date:
+            return 0.0, 0.0, ""
+
+        dates = sorted(price_by_date)
+        current_date = dates[-1]
+        current_price = float(price_by_date[current_date] or 0)
+        if current_price <= 0:
+            return 0.0, 0.0, ""
+
+        target_date = current_date - dt.timedelta(days=max(1, int(d_days)))
+        past_dates = [d for d in dates if d <= target_date and float(price_by_date.get(d, 0) or 0) > 0]
+        if not past_dates:
+            return 0.0, round(current_price, 4), ""
+
+        base_date = past_dates[-1]
+        # Sparse data must not make a 35-day observation masquerade as a 60-day return.
+        max_base_lag = max(4, min(14, int(round(max(1, int(d_days)) * 0.10)) + 3))
+        if (target_date - base_date).days > max_base_lag:
+            return 0.0, round(current_price, 4), ""
+
+        past_price = float(price_by_date[base_date] or 0)
+        if past_price <= 0:
+            return 0.0, round(current_price, 4), ""
+        if TrendCalculator._has_suspicious_corporate_action_gap(
+            price_by_date,
+            base_date,
+            current_date,
+        ):
+            return 0.0, round(current_price, 4), ""
+        ret = round((current_price - past_price) / past_price * 100, 2)
+        return ret, round(current_price, 4), str(current_date)
+
+    @staticmethod
+    def _has_suspicious_corporate_action_gap(
+        price_by_date: Dict[dt.date, float],
+        start_date: dt.date,
+        end_date: dt.date,
+    ) -> bool:
+        """Reject multi-day returns dominated by an unadjusted split/reverse split."""
+        points = [
+            (d, float(price_by_date.get(d, 0) or 0))
+            for d in sorted(price_by_date)
+            if start_date <= d <= end_date and float(price_by_date.get(d, 0) or 0) > 0
+        ]
+        for (_prev_date, previous), (_date, current) in zip(points, points[1:]):
+            ratio = current / previous if previous > 0 else 0.0
+            # Deliberately conservative: catch common 3x/5x/10x corporate-action
+            # gaps without suppressing ordinary high-volatility trading days.
+            if ratio >= 2.5 or ratio <= 0.4:
+                return True
+        return False
+
+    @staticmethod
     def _get_return_from_daily_rank_db(symbol: str, market: str, d_days: int) -> Tuple[float, float, str]:
         """接口失败时，回退使用本地 DailyRank 价格序列计算 N 日收益"""
         if market == "CF":
@@ -863,21 +941,7 @@ class TrendCalculator:
         if not uniq:
             return 0.0, 0.0, ""
 
-        dates = sorted(uniq.keys())
-        current_date = dates[-1]
-        current_price = uniq[current_date]
-        target_date = current_date - dt.timedelta(days=d_days)
-
-        past_dates = [d for d in dates if d <= target_date]
-        if past_dates:
-            past_price = uniq[past_dates[-1]]
-        else:
-            past_price = uniq[dates[0]]
-
-        if past_price <= 0:
-            return 0.0, round(current_price, 4), str(current_date)
-        ret = round((current_price - past_price) / past_price * 100, 2)
-        return ret, round(current_price, 4), str(current_date)
+        return TrendCalculator._calculate_period_return(uniq, d_days)
 
     @staticmethod
     def _get_return_from_daily_bar_db(symbol: str, market: str, d_days: int) -> Tuple[float, float, str]:
@@ -904,17 +968,7 @@ class TrendCalculator:
         if not uniq:
             return 0.0, 0.0, ""
 
-        dates = sorted(uniq.keys())
-        current_date = dates[-1]
-        current_price = uniq[current_date]
-        target_date = current_date - dt.timedelta(days=d_days)
-        past_dates = [d for d in dates if d <= target_date]
-        past_price = uniq[past_dates[-1]] if past_dates else uniq[dates[0]]
-
-        if past_price <= 0:
-            return 0.0, round(current_price, 4), str(current_date)
-        ret = round((current_price - past_price) / past_price * 100, 2)
-        return ret, round(current_price, 4), str(current_date)
+        return TrendCalculator._calculate_period_return(uniq, d_days)
 
     @staticmethod
     def _normalize_reason(reason: str) -> str:
@@ -1496,6 +1550,10 @@ class TrendCalculator:
         for res in results:
             market = str(res.get("market", "") or "")
             if market in {"CN", "HK", "US"}:
+                if market == "US" and TrendCalculator._is_leveraged_like(
+                    f"{res.get('symbol', '')} {res.get('name', '')}"
+                ):
+                    continue
                 try:
                     ret = float(res.get("return_pct", 0) or 0)
                     price = float(res.get("current_price", 0) or 0)

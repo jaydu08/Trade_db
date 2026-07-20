@@ -871,21 +871,23 @@ def _quote_price_date(quote: Dict[str, Any]) -> str:
     return text[:10]
 
 
-def _refresh_trend_display_prices(markets_payload: Dict[str, List[Dict[str, Any]]], market_filter: str = "") -> None:
-    """Refresh only display prices for visible Trend rows; ranking still uses local snapshots."""
+def _refresh_trend_display_prices(
+    markets_payload: Dict[str, List[Dict[str, Any]]],
+    market_filter: str = "",
+    return_mode: str = "period",
+    period_days: int = 0,
+) -> int:
+    """Refresh prices and keep every displayed return aligned to the same endpoint."""
     if not _trend_truthy_env("WEB_TREND_PRICE_REFRESH", "1"):
-        return
+        return 0
     if not isinstance(markets_payload, dict):
-        return
+        return 0
 
-    max_per_market = _trend_int_env("WEB_TREND_PRICE_REFRESH_LIMIT", 20, 0, 60)
+    max_per_market = _trend_int_env("WEB_TREND_PRICE_REFRESH_LIMIT", 100, 0, 200)
     if max_per_market <= 0:
-        return
-    workers = _trend_int_env("WEB_TREND_PRICE_REFRESH_WORKERS", 3, 1, 6)
-    timeout_sec = _trend_float(os.getenv("WEB_TREND_PRICE_REFRESH_TIMEOUT_SEC", "12"), 12.0)
-    timeout_sec = max(2.0, min(30.0, timeout_sec))
+        return 0
 
-    jobs = []
+    jobs_by_market: Dict[str, List[tuple[str, Dict[str, Any]]]] = {}
     markets = [market_filter] if market_filter else list(markets_payload.keys())
     for mkt in markets:
         market = str(mkt or "").strip().upper()
@@ -897,53 +899,152 @@ def _refresh_trend_display_prices(markets_payload: Dict[str, List[Dict[str, Any]
                 continue
             symbol = _trend_price_symbol(row, market)
             if symbol:
-                jobs.append((market, symbol, row))
-    if not jobs:
-        return
+                jobs_by_market.setdefault(market, []).append((symbol, row))
+    if not jobs_by_market:
+        return 0
 
     try:
-        import concurrent.futures
-        from modules.ingestion.data_factory import data_manager
+        from modules.ingestion.akshare_client import AkShareClient
     except Exception as e:
         logger.debug("Trend display price refresh unavailable: %s", e)
-        return
+        return 0
 
-    def _fetch(job):
-        market, symbol, row = job
+    period_price_maps: Dict[str, Dict[str, Dict[dt.date, float]]] = {}
+    period_calculator = None
+    if return_mode == "period" and period_days > 0:
         try:
-            quote = data_manager.get_quote(symbol, market)
-            if not isinstance(quote, dict):
-                return None
-            price = _trend_float(quote.get("price"))
-            if price <= 0:
-                return None
-            return row, price, quote
+            from core.db import get_ledger_session
+            from domain.ledger.analytics import DailyRank, TrendDailyBar
+            from modules.monitor.trend_service import TrendCalculator
+            from sqlmodel import select
+
+            period_calculator = TrendCalculator
+            history_cutoff = dt.date.today() - dt.timedelta(days=int(period_days) + 24)
+            with get_ledger_session() as session:
+                for market, jobs in jobs_by_market.items():
+                    aliases = set()
+                    for _symbol, row in jobs:
+                        raw = str(row.get("raw_symbol") or row.get("symbol") or "").strip()
+                        aliases.update(TrendCalculator._symbol_candidates(raw, market))
+                    if not aliases:
+                        continue
+
+                    market_series: Dict[str, Dict[dt.date, float]] = {}
+                    bar_rows = session.exec(
+                        select(TrendDailyBar.symbol, TrendDailyBar.date, TrendDailyBar.close)
+                        .where(
+                            TrendDailyBar.market == market,
+                            TrendDailyBar.symbol.in_(list(aliases)),
+                            TrendDailyBar.date >= history_cutoff,
+                        )
+                    ).all()
+                    for raw_symbol, trade_date, close in bar_rows:
+                        key = _trend_price_symbol({"symbol": raw_symbol}, market)
+                        value = _trend_float(close)
+                        if key and trade_date and value > 0:
+                            market_series.setdefault(key, {})[trade_date] = value
+
+                    rank_rows = session.exec(
+                        select(DailyRank.symbol, DailyRank.date, DailyRank.price)
+                        .where(
+                            DailyRank.market == market,
+                            DailyRank.symbol.in_(list(aliases)),
+                            DailyRank.date >= history_cutoff,
+                        )
+                    ).all()
+                    for raw_symbol, trade_date, close in rank_rows:
+                        key = _trend_price_symbol({"symbol": raw_symbol}, market)
+                        value = _trend_float(close)
+                        if key and trade_date and value > 0:
+                            market_series.setdefault(key, {}).setdefault(trade_date, value)
+                    period_price_maps[market] = market_series
         except Exception as e:
-            logger.debug("Trend display quote failed: market=%s symbol=%s err=%s", market, symbol, e)
-            return None
+            logger.warning("Trend period history batch unavailable; keep snapshot endpoints: %s", e)
+
+    def _rebased_return(old_price: float, old_return: float, new_price: float) -> float:
+        denominator = 1.0 + old_return / 100.0
+        if old_price <= 0 or new_price <= 0 or denominator <= 0:
+            return old_return
+        base_price = old_price / denominator
+        if base_price <= 0:
+            return old_return
+        return round((new_price / base_price - 1.0) * 100.0, 2)
 
     updated = 0
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(jobs)))
-    futures = [executor.submit(_fetch, job) for job in jobs]
-    try:
-        for future in concurrent.futures.as_completed(futures, timeout=timeout_sec):
-            item = future.result()
-            if not item:
+    for market, jobs in jobs_by_market.items():
+        try:
+            quotes = AkShareClient.get_realtime_quotes_batch([symbol for symbol, _row in jobs], market)
+        except Exception as e:
+            logger.debug("Trend display quote batch failed: market=%s err=%s", market, e)
+            continue
+        for symbol, row in jobs:
+            quote = quotes.get(symbol)
+            if not isinstance(quote, dict):
                 continue
-            row, price, quote = item
+            price = _trend_float(quote.get("price"))
+            if price <= 0:
+                continue
+
+            old_price = _trend_float(row.get("price"))
+            old_return = _trend_float(row.get("return_pct"))
+            old_score = _trend_float(row.get("trend_score"))
+
+            if return_mode == "daily":
+                row["return_pct"] = round(_trend_float(quote.get("pct_chg")), 2)
+            else:
+                exact_period_return = None
+                exact_period_date = ""
+                if period_days > 0:
+                    if period_calculator is None or market not in period_price_maps:
+                        continue
+                    prices = dict((period_price_maps.get(market) or {}).get(symbol, {}))
+                    try:
+                        quote_date = dt.date.fromisoformat(_quote_price_date(quote)[:10])
+                    except Exception:
+                        quote_date = dt.date.today()
+                    prices[quote_date] = price
+                    exact_period_return, _current, exact_period_date = (
+                        period_calculator._calculate_period_return(prices, period_days)
+                        if prices
+                        else (0.0, price, "")
+                    )
+                    if not exact_period_date:
+                        # Preserve the old internally aligned snapshot instead of
+                        # displaying a live price against an invalid return window.
+                        continue
+
+                if exact_period_return is not None:
+                    row["return_pct"] = exact_period_return
+                elif "return_20d" in row:
+                    row["return_20d"] = _rebased_return(
+                        old_price,
+                        _trend_float(row.get("return_20d")),
+                        price,
+                    )
+                if exact_period_return is None and "return_60d" in row:
+                    row["return_60d"] = _rebased_return(
+                        old_price,
+                        _trend_float(row.get("return_60d")),
+                        price,
+                    )
+                    row["return_pct"] = row["return_60d"]
+                elif exact_period_return is None and "return_20d" not in row:
+                    row["return_pct"] = _rebased_return(old_price, old_return, price)
+
+                new_return = _trend_float(row.get("return_pct"))
+                if abs(old_return) > 1e-9 and old_score:
+                    row["trend_score"] = round(old_score * new_return / old_return, 2)
+
             row["price"] = round(price, 4)
             row["price_date"] = _quote_price_date(quote)
             row["display_price_source"] = str(quote.get("provider", "") or "")
+            quote_amount = _trend_float(quote.get("amount"))
+            if quote_amount > 0:
+                row["amount"] = quote_amount
             updated += 1
-    except concurrent.futures.TimeoutError:
-        logger.debug("Trend display price refresh timed out after %.1fs", timeout_sec)
-    finally:
-        for future in futures:
-            if not future.done():
-                future.cancel()
-        executor.shutdown(wait=False, cancel_futures=True)
     if updated:
-        logger.debug("Trend display price refreshed: rows=%s", updated)
+        logger.debug("Trend display price/return refreshed: rows=%s mode=%s", updated, return_mode)
+    return updated
 
 
 @app.get("/api/trend")
@@ -1099,7 +1200,26 @@ def get_trend(
             })
         result[mkt] = transformed
     if refresh_prices:
-        _refresh_trend_display_prices(result, market_filter)
+        _refresh_trend_display_prices(
+            result,
+            market_filter,
+            return_mode="period",
+            period_days=days,
+        )
+        for mkt, rows in result.items():
+            min_return = TrendCalculator._min_return_pct(mkt)
+            rows[:] = [
+                row for row in rows
+                if _trend_float(row.get("return_pct")) > min_return
+                and _trend_float(row.get("price")) > 0
+            ]
+            rows.sort(
+                key=lambda row: (
+                    _trend_float(row.get("trend_score")),
+                    _trend_float(row.get("return_pct")),
+                ),
+                reverse=True,
+            )
     return {"days": days, "limit": limit, "market": market_filter, "markets": result}
 
 
@@ -1113,14 +1233,10 @@ def get_slow_trend(
 ):
     """慢趋势机构票 demo：复用现有 trend 候选池，单独做高门槛过滤，不触发推送。"""
     market_filter = _normalize_trend_market(market, {"CN", "HK", "US"})
-    cache_key = f"api_trend_slow_demo_v5_{market_filter or 'ALL'}_{limit}"
+    cache_key = f"api_trend_slow_demo_v6_{market_filter or 'ALL'}_{limit}"
     cached = get_cache(cache_key)
     if cached and not force_refresh:
         _ensure_trend_stale_cache(cache_key, cached)
-        if refresh_prices:
-            import copy
-            cached = copy.deepcopy(cached)
-            _refresh_trend_display_prices(cached.get("markets", {}) if isinstance(cached, dict) else {}, market_filter)
         return _trend_cache_payload(cached, stale=False)
 
     try:
@@ -1131,6 +1247,7 @@ def get_slow_trend(
         from sqlmodel import select
         from modules.ingestion.market_cap import get_cn_market_metrics, get_hk_market_metrics
         from modules.ingestion.us_market_cap import get_us_market_metrics, get_us_market_metrics_light
+        from modules.ingestion.akshare_client import AkShareClient
         import math
 
         def _env_float(name: str, default: float) -> float:
@@ -1252,7 +1369,7 @@ def get_slow_trend(
 
         def _series_return(series: List[Dict], days: int):
             if not series:
-                return 0.0, 0.0, ""
+                return None, 0.0, ""
             cur = series[-1]
             cur_date = cur["date"]
             cur_price = float(cur.get("close", 0) or 0)
@@ -1263,11 +1380,56 @@ def get_slow_trend(
                     past = p
                 else:
                     break
-            past = past or series[0]
+            if past is None:
+                return None, cur_price, str(cur_date)
+            max_base_lag = max(4, min(14, int(round(max(1, days) * 0.10)) + 3))
+            if (target - past["date"]).days > max_base_lag:
+                return None, cur_price, str(cur_date)
             past_price = float(past.get("close", 0) or 0)
             if cur_price <= 0 or past_price <= 0:
-                return 0.0, cur_price, str(cur_date)
+                return None, cur_price, str(cur_date)
+            price_by_date = {
+                point["date"]: float(point.get("close", 0) or 0)
+                for point in series
+                if point.get("date") and float(point.get("close", 0) or 0) > 0
+            }
+            if TrendCalculator._has_suspicious_corporate_action_gap(
+                price_by_date,
+                past["date"],
+                cur_date,
+            ):
+                return None, cur_price, str(cur_date)
             return round((cur_price - past_price) / past_price * 100, 2), round(cur_price, 4), str(cur_date)
+
+        def _merge_live_quote(series: List[Dict], quote: Dict) -> List[Dict]:
+            if not series or not isinstance(quote, dict):
+                return series
+            price = _trend_float(quote.get("price"))
+            if price <= 0:
+                return series
+            try:
+                quote_date = dt.date.fromisoformat(_quote_price_date(quote)[:10])
+            except Exception:
+                quote_date = dt.date.today()
+
+            merged = [dict(point) for point in series]
+            last_date = merged[-1]["date"]
+            if quote_date < last_date:
+                return merged
+
+            amount = _trend_float(quote.get("amount"))
+            live_point = {
+                "date": quote_date,
+                "close": price,
+                "amount": amount,
+            }
+            if quote_date == last_date:
+                if amount <= 0:
+                    live_point["amount"] = _trend_float(merged[-1].get("amount"))
+                merged[-1] = live_point
+            else:
+                merged.append(live_point)
+            return merged
 
         def _build_slow_candidates() -> Dict[str, List[Dict]]:
             """Build an independent slow-trend universe from local seeds and high-liquidity history."""
@@ -1400,6 +1562,56 @@ def get_slow_trend(
         high_gap_min = _env_float("SLOW_TREND_HIGH_GAP_MIN", -12.0)
 
         raw = _build_slow_candidates()
+        live_quotes: Dict[str, Dict[str, Dict]] = {}
+        for mkt, items in raw.items():
+            symbols = [
+                str((item or {}).get("symbol", "") or "").strip()
+                for item in items or []
+                if str((item or {}).get("symbol", "") or "").strip()
+            ]
+            try:
+                live_quotes[mkt] = AkShareClient.get_realtime_quotes_batch(symbols, mkt)
+            except Exception as e:
+                logger.debug("Slow trend live quote batch failed: market=%s err=%s", mkt, e)
+                live_quotes[mkt] = {}
+        history_repair_limit = max(0, min(60, _env_int("SLOW_TREND_HISTORY_REPAIR_MAX", 20)))
+        history_repairs = {mkt: 0 for mkt in raw}
+
+        def _repair_local_series(mkt: str, item: Dict, current_series: List[Dict]) -> List[Dict]:
+            if history_repairs.get(mkt, 0) >= history_repair_limit:
+                return current_series
+            symbol = str(item.get("symbol", "") or "").strip()
+            if not symbol:
+                return current_series
+            history_repairs[mkt] = history_repairs.get(mkt, 0) + 1
+            try:
+                cutoff = dt.date.today() - dt.timedelta(days=135)
+                frame = TrendService._fetch_symbol_history(mkt, symbol)
+                history_items = TrendService._build_history_items(
+                    mkt,
+                    symbol,
+                    str(item.get("name", "") or ""),
+                    frame,
+                    cutoff,
+                )
+                if not history_items:
+                    return current_series
+                # Keep query-time repair read-only. The scheduled 120-day pool
+                # backfill owns persistence and anomaly handling.
+                repaired = [
+                    {
+                        "date": point["date"],
+                        "close": _trend_float(point.get("close")),
+                        "amount": _trend_float(point.get("amount")),
+                    }
+                    for point in history_items
+                    if point.get("date") and _trend_float(point.get("close")) > 0
+                ]
+                return sorted(repaired, key=lambda point: point["date"]) or current_series
+            except Exception as e:
+                logger.debug("Slow trend history repair failed: market=%s symbol=%s err=%s", mkt, symbol, e)
+                return current_series
+
         filtered = {}
 
         for mkt, items in raw.items():
@@ -1411,11 +1623,23 @@ def get_slow_trend(
                 if not symbol:
                     continue
                 display_symbol = _display_symbol(symbol, mkt)
+                if mkt == "US" and TrendCalculator._is_leveraged_like(f"{display_symbol} {item.get('name', '')}"):
+                    continue
                 series = _local_series(symbol, mkt)
                 if len(series) < 30 or (series[-1]["date"] - series[0]["date"]).days < 45:
-                    continue
+                    series = _repair_local_series(mkt, item, series)
+                    if len(series) < 30 or (series[-1]["date"] - series[0]["date"]).days < 45:
+                        continue
+                series = _merge_live_quote(series, (live_quotes.get(mkt) or {}).get(symbol, {}))
                 ret20, current_price, price_date = _series_return(series, 20)
                 ret60, _, _ = _series_return(series, 60)
+                if ret20 is None or ret60 is None:
+                    series = _repair_local_series(mkt, item, series)
+                    series = _merge_live_quote(series, (live_quotes.get(mkt) or {}).get(symbol, {}))
+                    ret20, current_price, price_date = _series_return(series, 20)
+                    ret60, _, _ = _series_return(series, 60)
+                    if ret20 is None or ret60 is None:
+                        continue
                 if ret60 < min60 or ret20 < min20:
                     continue
                 if mkt == "HK" and current_price < hk_price_min:
@@ -1431,9 +1655,6 @@ def get_slow_trend(
                 high60 = max(ma60_window)
                 high_gap_pct = (current_price / high60 - 1.0) * 100 if high60 > 0 else 0.0
                 if ma_gap_pct < ma_gap_min or current_price < ma20 or high_gap_pct < high_gap_min:
-                    continue
-
-                if mkt == "US" and TrendCalculator._is_leveraged_like(f"{display_symbol} {item.get('name', '')}"):
                     continue
 
                 cap_value = 0.0
@@ -1569,8 +1790,6 @@ def get_slow_trend(
             },
             "markets": result,
         }
-        if refresh_prices:
-            _refresh_trend_display_prices(payload.get("markets", {}), market_filter)
         _set_trend_cache(cache_key, payload, ttl=900)
         return _trend_cache_payload(payload, stale=False)
     except HTTPException:
@@ -1595,14 +1814,39 @@ def get_daily_hot_trend(
 ):
     """当日强势榜：只使用本地 DailyRank/TrendDailyBar 截面，避免 Web 打开时触发全市场 API。"""
     market_filter = _normalize_trend_market(market, {"CN", "HK", "US"})
-    cache_key = f"api_trend_daily_hot_v5_{market_filter or 'ALL'}_{date or 'latest'}_{limit}"
+    cache_key = f"api_trend_daily_hot_v6_{market_filter or 'ALL'}_{date or 'latest'}_{limit}"
+
+    def _refresh_current_daily_payload(payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            return
+        today_text = dt.date.today().isoformat()
+        markets_payload = payload.get("markets") or {}
+        market_dates = payload.get("market_dates") or {}
+        for mkt, rows in markets_payload.items():
+            if str(market_dates.get(mkt, "") or "") != today_text:
+                continue
+            _refresh_trend_display_prices({mkt: rows}, mkt, return_mode="daily")
+            rows[:] = [
+                row for row in rows
+                if _trend_float(row.get("return_pct")) > 0
+                and _trend_float(row.get("price")) > 0
+            ]
+            rows.sort(
+                key=lambda row: (
+                    _trend_float(row.get("return_pct")),
+                    _trend_float(row.get("trend_score")),
+                    _trend_float(row.get("amount")),
+                ),
+                reverse=True,
+            )
+
     cached = get_cache(cache_key)
     if cached and not force_refresh:
         _ensure_trend_stale_cache(cache_key, cached)
         if refresh_prices:
             import copy
             cached = copy.deepcopy(cached)
-            _refresh_trend_display_prices(cached.get("markets", {}) if isinstance(cached, dict) else {}, market_filter)
+            _refresh_current_daily_payload(cached)
         return _trend_cache_payload(cached, stale=False)
 
     try:
@@ -1980,7 +2224,7 @@ def get_daily_hot_trend(
             "markets": result,
         }
         if refresh_prices:
-            _refresh_trend_display_prices(payload.get("markets", {}), market_filter)
+            _refresh_current_daily_payload(payload)
         _set_trend_cache(cache_key, payload, ttl=600)
         return _trend_cache_payload(payload, stale=False)
     except HTTPException:
@@ -2132,6 +2376,17 @@ def get_heatmap_trend_push(
             # days being shown as 1D/3D).
             max_base_lag = max(2, min(10, int(round(max(lookback_days, 1) * 0.35)) + 1))
             if (cutoff - base_date).days > max_base_lag:
+                return 0.0, latest_price, ""
+            price_by_date = {
+                row_date: row_price
+                for row_date, row_price, _row_amount in series
+                if row_price > 0
+            }
+            if TrendCalculator._has_suspicious_corporate_action_gap(
+                price_by_date,
+                base_date,
+                latest_date,
+            ):
                 return 0.0, latest_price, ""
             return round((latest_price - base_price) / base_price * 100, 2), latest_price, str(latest_date)
 

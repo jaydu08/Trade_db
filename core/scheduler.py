@@ -97,30 +97,39 @@ class TaskScheduler:
             replace_existing=True
         )
         
-        # 4. CN 热度榜单 (工作日 18:35，错开港股避免OOM)
+        # 4. CN 热度榜单 (工作日 17:35，错开港股避免OOM)
         self.scheduler.add_job(
             self._job_cn_heatmap,
-            CronTrigger(day_of_week='mon-fri', hour=18, minute=35),
+            CronTrigger(day_of_week='mon-fri', hour=17, minute=35),
             id="cn_heatmap",
             name="A股热门榜单",
             replace_existing=True
         )
 
-        # 4.1 HK 热度榜单 (工作日 18:30，留时间发酵盘后新闻)
+        # 4.1 HK 热度榜单 (工作日 17:30，留时间发酵盘后新闻)
         self.scheduler.add_job(
             self._job_hk_heatmap,
-            CronTrigger(day_of_week='mon-fri', hour=18, minute=30),
+            CronTrigger(day_of_week='mon-fri', hour=17, minute=30),
             id="hk_heatmap",
             name="港股热门榜单",
             replace_existing=True
         )
 
-        # 5. US 热度榜单 (周二至周六 08:00，对应美股周一到周五收盘后)
+        # 5. US 热度榜单 (周二至周六 07:00，对应美股周一到周五收盘后)
         self.scheduler.add_job(
             self._job_us_heatmap,
-            CronTrigger(day_of_week='tue-sat', hour=8, minute=0),
+            CronTrigger(day_of_week='tue-sat', hour=7, minute=0),
             id="us_heatmap",
             name="美股热门榜单",
+            replace_existing=True
+        )
+
+        # 5.0 美股证券表增量同步（每日 05:30，先于盘后热榜）
+        self.scheduler.add_job(
+            self._job_us_asset_universe_sync,
+            CronTrigger(hour=5, minute=30),
+            id="us_asset_universe_sync",
+            name="美股证券表增量同步",
             replace_existing=True
         )
 
@@ -167,10 +176,10 @@ class TaskScheduler:
             replace_existing=True
         )
 
-        # 9. 每日推送标的汇总 TXT (工作日 19:00，北京时间)
+        # 9. 每日推送标的汇总 TXT (工作日 18:00，北京时间)
         self.scheduler.add_job(
             self._job_daily_summary,
-            CronTrigger(day_of_week='mon-fri', hour=19, minute=0),
+            CronTrigger(day_of_week='mon-fri', hour=18, minute=0),
             id="daily_summary",
             name="每日推送标的汇总",
             replace_existing=True
@@ -386,6 +395,11 @@ class TaskScheduler:
         """Job: 生成美股热门榜单"""
         self._run_job("us_heatmap", heatmap_service.process_and_notify, "US")
 
+    def _job_us_asset_universe_sync(self):
+        """Job: 从 Nasdaq 官方证券表增量补齐美股新股/改码。"""
+        from modules.ingestion.sync_asset import asset_syncer
+        self._run_job("us_asset_universe_sync", asset_syncer.sync_market, "US", False)
+
 
     @staticmethod
     def _is_us_premarket_slot() -> bool:
@@ -465,7 +479,7 @@ class TaskScheduler:
             "trend_pool_refresh_cn_hk",
             TrendService.refresh_pool_daily_bars,
             ["CN", "HK"],
-            60,
+            120,
             "trend_pool_refresh_eod",
             True,
         )
@@ -477,7 +491,7 @@ class TaskScheduler:
             "trend_pool_refresh_cn_hk_retry",
             TrendService.refresh_pool_daily_bars,
             ["CN", "HK"],
-            60,
+            120,
             "trend_pool_refresh_eod",
             False,
         )
@@ -489,7 +503,7 @@ class TaskScheduler:
             "trend_pool_refresh_us_cf",
             TrendService.refresh_pool_daily_bars,
             ["US", "CF"],
-            60,
+            120,
             "trend_pool_refresh_eod",
             True,
         )
@@ -501,7 +515,7 @@ class TaskScheduler:
             "trend_pool_refresh_us_cf_retry",
             TrendService.refresh_pool_daily_bars,
             ["US", "CF"],
-            60,
+            120,
             "trend_pool_refresh_eod",
             False,
         )

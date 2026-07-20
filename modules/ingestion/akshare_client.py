@@ -91,6 +91,163 @@ class AkShareClient:
         return df
 
     @staticmethod
+    @cached("nasdaq_us_asset_universe_v1", ttl=21600)
+    def get_us_asset_universe() -> pd.DataFrame:
+        """Fetch the current listed US universe without crawling per-symbol pages."""
+        url = "https://api.nasdaq.com/api/screener/stocks"
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://www.nasdaq.com",
+            "Referer": "https://www.nasdaq.com/",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+            ),
+        }
+        params = {
+            "tableonly": "true",
+            "limit": "10000",
+            "offset": "0",
+            "download": "true",
+        }
+        resp = requests.get(url, params=params, headers=headers, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+        rows = ((payload.get("data") or {}).get("rows") or [])
+
+        records = []
+        seen = set()
+        for row in rows:
+            symbol = str((row or {}).get("symbol", "") or "").strip().upper()
+            name = str((row or {}).get("name", "") or "").strip()
+            if not symbol or not name or symbol in seen:
+                continue
+            seen.add(symbol)
+            records.append({
+                "symbol": symbol,
+                "name": name,
+                "ipo_year": str((row or {}).get("ipoyear", "") or "").strip(),
+                "sector": str((row or {}).get("sector", "") or "").strip(),
+                "industry": str((row or {}).get("industry", "") or "").strip(),
+            })
+
+        # A short/blocked response must not replace the established local universe.
+        if len(records) < 1000:
+            raise RuntimeError(f"Nasdaq universe response is unexpectedly small: {len(records)}")
+        logger.info("Fetched %s current US symbols from Nasdaq screener", len(records))
+        return pd.DataFrame(records)
+
+    @staticmethod
+    def _sina_symbol(symbol: str, market: str) -> str:
+        raw = str(symbol or "").strip()
+        if market == "CN":
+            return f"sh{raw}" if raw.startswith("6") else f"sz{raw}"
+        if market == "HK":
+            return f"hk{raw}"
+        if market == "US":
+            parts = raw.split(".", 1)
+            ticker = parts[1].strip() if len(parts) == 2 and parts[0] in {"105", "106", "107"} else raw
+            return f"gb_{ticker.lower().replace('.', '$')}"
+        return raw
+
+    @staticmethod
+    def get_realtime_quotes_batch(symbols: list[str], market: str) -> dict[str, dict]:
+        """Fetch a small/medium symbol set from Sina in batches."""
+        import concurrent.futures
+
+        query_map = {}
+        for symbol in symbols or []:
+            raw = str(symbol or "").strip()
+            if not raw:
+                continue
+            query_map.setdefault(AkShareClient._sina_symbol(raw, market), raw)
+        if not query_map:
+            return {}
+
+        sina_symbols = list(query_map)
+        batch_size = 300
+        batches = [sina_symbols[i:i + batch_size] for i in range(0, len(sina_symbols), batch_size)]
+
+        def _fetch_batch(batch):
+            try:
+                url = "http://hq.sinajs.cn/list=" + ",".join(batch)
+                resp = requests.get(
+                    url,
+                    headers={"Referer": "http://finance.sina.com.cn"},
+                    timeout=12,
+                )
+                resp.raise_for_status()
+                resp.encoding = "gbk"
+                return resp.text.splitlines()
+            except Exception as e:
+                logger.debug("Sina quote batch failed: market=%s size=%s err=%s", market, len(batch), e)
+                return []
+
+        results = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(batches))) as executor:
+            for text_lines in executor.map(_fetch_batch, batches):
+                for line in text_lines:
+                    if '=""' in line or '="' not in line:
+                        continue
+                    try:
+                        parts = line.split('="')[1].split('";')[0].split(',')
+                        sina_id = line.split('="')[0].split('hq_str_')[1]
+                        original = query_map.get(sina_id, "")
+                        if not original:
+                            continue
+
+                        name = ""
+                        price = 0.0
+                        pct_chg = 0.0
+                        amount = 0.0
+                        volume = 0.0
+                        timestamp = ""
+                        if market == "CN":
+                            if len(parts) < 32:
+                                continue
+                            name = parts[0]
+                            prev = float(parts[2] or 0)
+                            price = float(parts[3] or 0)
+                            volume = float(parts[8] or 0)
+                            amount = float(parts[9] or 0)
+                            timestamp = f"{parts[30]} {parts[31]}"
+                            if prev > 0:
+                                pct_chg = round((price - prev) / prev * 100, 4)
+                        elif market == "HK":
+                            if len(parts) < 19:
+                                continue
+                            name = parts[1]
+                            price = float(parts[6] or 0)
+                            pct_chg = float(parts[8] or 0)
+                            amount = float(parts[11] or 0)
+                            volume = float(parts[12] or 0) if len(parts) > 12 else 0.0
+                            timestamp = f"{parts[17]} {parts[18]}"
+                        elif market == "US":
+                            if len(parts) < 11:
+                                continue
+                            name = parts[0]
+                            price = float(parts[1] or 0)
+                            pct_chg = float(parts[2] or 0)
+                            timestamp = parts[3]
+                            volume = float(parts[10] or 0)
+                            amount = volume * price
+                        if price <= 0:
+                            continue
+                        results[original] = {
+                            "symbol": original,
+                            "name": name,
+                            "price": price,
+                            "pct_chg": pct_chg,
+                            "amount": amount,
+                            "volume": volume,
+                            "timestamp": timestamp,
+                            "provider": "Sina",
+                        }
+                    except Exception:
+                        continue
+        return results
+
+    @staticmethod
     def _fetch_bulk_sina(market: str) -> pd.DataFrame:
         """从本地库读取股票列表，分批向新浪请求实时行情"""
         import sqlite3
@@ -106,17 +263,39 @@ class AkShareClient:
             conn.close()
         except:
             return pd.DataFrame()
+
+        if market == "US":
+            try:
+                current = AkShareClient.get_us_asset_universe()
+                known_tickers = {
+                    (
+                        str(sym or "").split(".", 1)[1].strip().upper()
+                        if "." in str(sym or "") and str(sym or "").split(".", 1)[0] in {"105", "106", "107"}
+                        else str(sym or "").strip().upper()
+                    )
+                    for sym, _name in rows
+                    if str(sym or "").strip()
+                }
+                additions = [
+                    (str(row.get("symbol", "") or "").strip(), str(row.get("name", "") or "").strip())
+                    for _, row in current.iterrows()
+                    if str(row.get("symbol", "") or "").strip().upper() not in known_tickers
+                ]
+                if additions:
+                    rows.extend(additions)
+                    logger.info("US quote universe augmented with %s newly listed symbols", len(additions))
+            except Exception as e:
+                logger.warning("US current-universe augmentation failed; using local assets: %s", e)
             
         query_map = {}
         for row in rows:
             sym, name = row[0], row[1]
             if market == "CN":
-                s = f"sh{sym}" if sym.startswith("6") else f"sz{sym}"
+                s = AkShareClient._sina_symbol(sym, market)
             elif market == "HK":
-                s = f"hk{sym}"
+                s = AkShareClient._sina_symbol(sym, market)
             elif market == "US":
-                clean_sym = sym.split(".")[-1]
-                s = f"gb_{clean_sym.lower().replace('.', '$')}"
+                s = AkShareClient._sina_symbol(sym, market)
             query_map[s] = (sym, name)
             
         sina_symbols = list(query_map.keys())
