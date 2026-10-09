@@ -392,6 +392,7 @@ onMounted(fetchTrend)
 
 <template>
   <div class="trend-view">
+    <div style="margin-bottom: 16px"><router-link to="/trend/crypto">◈ 加密 Trend · 现货 / 合约 / 链上 →</router-link></div>
     <div class="toolbar">
       <div class="mode-group">
         <button class="mode-btn" :class="{ active: activeMode === 'hot' }" @click="activeMode = 'hot'">热门趋势</button>

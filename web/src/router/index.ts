@@ -35,6 +35,12 @@ const routes = [
     component: () => import('../views/HeatmapView.vue'),
     meta: { requiresAuth: true },
   },
+  {
+    path: '/trend/crypto',
+    name: 'CryptoTrend',
+    component: () => import('../views/CryptoTrendView.vue'),
+    meta: { requiresAuth: true },
+  },
 ]
 
 const router = createRouter({

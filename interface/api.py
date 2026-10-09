@@ -2791,6 +2791,23 @@ def get_trading_days(month: str = Query(default=""), user: UserContext = Depends
 
     return {"month": month, "days": sorted(set(str(d) for d in dates))}
 
+# --------------- Crypto Trend (shared alpha_news evidence) ---------------
+@app.get('/api/crypto/trend')
+def crypto_trend(
+    market: str = Query(default='spot'), period: str = Query(default='12h'),
+    risk: str = Query(default='pass'), q: str = Query(default='', max_length=120),
+    pushed_only: bool = Query(default=False), user: UserContext = Depends(get_current_user),
+):
+    from modules.monitor.crypto_trend import get_crypto_trend
+    try:
+        return get_crypto_trend(market, period, risk, q, pushed_only)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        logger.exception('Crypto trend unavailable')
+        raise HTTPException(status_code=503, detail='加密数据暂不可用，请稍后重试')
+
+
 # --------------- SPA Fallback ---------------
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web", "dist")
 

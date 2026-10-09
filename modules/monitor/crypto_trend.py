@@ -1,0 +1,127 @@
+"""Read-only Trend views over alpha_news public market/security evidence."""
+import json
+import os
+import sqlite3
+import time
+from collections import Counter
+
+DB_PATH = os.getenv('CRYPTO_TREND_DB', '/root/alpha_news/data/crypto_trend.sqlite')
+ALPHA_ROOT = os.getenv('ALPHA_NEWS_ROOT', '/root/alpha_news')
+PERIODS = {'12h': 12 * 3600, '24h': 86400, '3d': 3 * 86400, '7d': 7 * 86400, '30d': 30 * 86400}
+
+
+def read_json(path):
+    try:
+        with open(path, encoding='utf-8') as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def period_return(db, item, seconds):
+    target = item['updated'] - seconds
+    source = 'dex:' + item.get('pair', '') if item['market'] == 'onchain' else 'binance'
+    row = db.execute('SELECT ts,price FROM bars WHERE id=? AND source=? AND ts<=? ORDER BY ts DESC LIMIT 1',
+                     (item['id'], source, target)).fetchone()
+    if row and 0 <= target - row['ts'] <= 3700 and row['price'] > 0 and item.get('price'):
+        return (item['price'] / row['price'] - 1) * 100, row['ts'], 'hourly_or_sampled_history'
+    if item['market'] == 'onchain' and seconds == 86400 and item.get('provider_change_24h') is not None:
+        return item['provider_change_24h'], None, 'DexScreener 24h'
+    return None, None, 'insufficient_history'
+
+
+def effective_security(payload, pair, now):
+    result = dict(payload) if payload else {'status': 'unknown', 'label': '待核验', 'reasons': ['尚未完成检测']}
+    if result.get('status') == 'pass' and (
+        result.get('expires_at', 0) < now or result.get('pair') != pair
+    ):
+        result.update(status='unknown', label='检测已过期/定价池变化', allow_push=False,
+                      reasons=['需重新检测；旧结果不能作为当前通过依据'])
+    result.pop('evidence', None)
+    return result
+
+
+def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_only=False):
+    if market not in ('spot', 'futures', 'onchain'):
+        raise ValueError('invalid market')
+    allowed = ('24h', '3d', '7d', '30d') if market == 'onchain' else ('12h', '3d', '7d', '30d')
+    if period not in allowed or risk not in ('pass', 'review', 'unknown', 'blocked', 'all'):
+        raise ValueError('invalid period or risk')
+    now = time.time()
+    if not os.path.exists(DB_PATH):
+        return {'items': [], 'health': {}, 'warning': '采集器正在初始化', 'asof': now, 'counts': {}}
+    db = sqlite3.connect('file:' + DB_PATH + '?mode=ro', uri=True, timeout=5)
+    db.row_factory = sqlite3.Row
+    try:
+        health = {r['component']: dict(json.loads(r['payload']), updated=r['updated'],
+                                      stale=now - r['updated'] > 900)
+                  for r in db.execute('SELECT * FROM health')}
+        state = read_json(os.path.join(ALPHA_ROOT, 'data/bn_monitor_v2_state.json'))
+        push_data = read_json(os.path.join(ALPHA_ROOT, 'data/dex_stat/dex_push_records.json'))
+        # Existing DEX records are displayed only when an exact chain/address match exists.
+        pushes = {}
+        def visit(value):
+            if isinstance(value, list):
+                for v in value:
+                    visit(v)
+            elif isinstance(value, dict):
+                chain = value.get('chain')
+                address = value.get('address') or value.get('token_address') or value.get('ca')
+                if chain and address:
+                    key = str(chain).lower() + ':' + (address.lower() if address.startswith('0x') else address)
+                    pushes[key] = value
+                else:
+                    for v in value.values():
+                        if isinstance(v, (dict, list)):
+                            visit(v)
+        visit(push_data)
+        rows = list(db.execute('SELECT a.payload,s.payload AS security FROM assets a LEFT JOIN security s ON a.id=s.id WHERE a.market=?', (market,)))
+        all_items = [json.loads(row['payload']) for row in rows]
+        names = Counter(i.get('symbol', '').casefold() for i in all_items)
+        counts = Counter()
+        items = []
+        for row, item in zip(rows, all_items):
+            security = effective_security(json.loads(row['security']) if row['security'] else None,
+                                          item.get('pair', ''), now)
+            if market == 'onchain':
+                counts[security['status']] += 1
+                if risk != 'all' and security['status'] != risk:
+                    continue
+            if query and query.casefold() not in ' '.join(str(item.get(k, '')) for k in ('symbol', 'name', 'address')).casefold():
+                continue
+            item['security'] = security if market == 'onchain' else None
+            item['same_name_count'] = names[item.get('symbol', '').casefold()] if market == 'onchain' else 1
+            alert = state.get('relative:' + item['symbol'], {}) if market != 'onchain' else {}
+            item['last_alert_at'] = alert.get('last_alert_at')
+            item['has_alert'] = bool(alert.get('last_alert_at')) if market != 'onchain' else item['id'] in pushes
+            item['alert_note'] = '现货/合约共振告警' if market != 'onchain' and item['has_alert'] else ''
+            if pushed_only and not item['has_alert']:
+                continue
+            value, baseline, source = period_return(db, item, PERIODS[period])
+            item.update(period_change=value, baseline_at=baseline, return_source=source,
+                        stale=now - item['updated'] > 900, oi_change_percent=None)
+            oi_rows = item.pop('oi_history', [])
+            if oi_rows:
+                end = oi_rows[-1]
+                target = end['ts'] - PERIODS[period]
+                bases = [r for r in oi_rows if r['ts'] <= target and target - r['ts'] <= 7300]
+                if bases and bases[-1].get('quantity') and end.get('quantity') is not None:
+                    item['oi_change_percent'] = (end['quantity'] / bases[-1]['quantity'] - 1) * 100
+                item['oi_asof'] = end['ts']
+            item['history_available'] = value is not None
+            items.append(item)
+        items.sort(key=lambda x: (not x['stale'] and x['period_change'] is not None,
+                                   x['period_change'] if x['period_change'] is not None else float('-inf')), reverse=True)
+        rank = 0
+        for item in items:
+            if item['history_available'] and not item['stale']:
+                rank += 1
+                item['rank'] = rank
+            else:
+                item['rank'] = None
+        return {'market': market, 'period': period, 'items': items, 'health': health,
+                'asof': now, 'counts': dict(counts), 'universe_count': len(rows),
+                'ranked_count': rank, 'warning': '链上仅覆盖已发现标的；通过筛查不等于官方认证或保证可卖出。'
+                if market == 'onchain' else 'USDT现货 / USDT永续按24h成交额选取，覆盖上限见采集状态；历史基准为小时级。'}
+    finally:
+        db.close()
