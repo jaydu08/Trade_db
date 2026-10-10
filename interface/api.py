@@ -2796,11 +2796,13 @@ def get_trading_days(month: str = Query(default=""), user: UserContext = Depends
 def crypto_trend(
     market: str = Query(default='spot'), period: str = Query(default='12h'),
     risk: str = Query(default='pass'), q: str = Query(default='', max_length=120),
-    pushed_only: bool = Query(default=False), user: UserContext = Depends(get_current_user),
+    pushed_only: bool = Query(default=False), chain: str = Query(default='all', max_length=30),
+    sort_by: str = Query(default='period_change'), sort_dir: str = Query(default='desc'),
+    user: UserContext = Depends(get_current_user),
 ):
     from modules.monitor.crypto_trend import get_crypto_trend
     try:
-        return get_crypto_trend(market, period, risk, q, pushed_only)
+        return get_crypto_trend(market, period, risk, q, pushed_only, chain, sort_by, sort_dir)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception:

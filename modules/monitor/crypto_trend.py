@@ -1,6 +1,7 @@
 """Read-only Trend views over alpha_news public market/security evidence."""
 import json
 import os
+import re
 import sqlite3
 import time
 from collections import Counter
@@ -9,6 +10,8 @@ from datetime import datetime
 DB_PATH = os.getenv('CRYPTO_TREND_DB', '/root/alpha_news/data/crypto_trend.sqlite')
 ALPHA_ROOT = os.getenv('ALPHA_NEWS_ROOT', '/root/alpha_news')
 PERIODS = {'12h': 12 * 3600, '24h': 86400, '3d': 3 * 86400, '7d': 7 * 86400, '30d': 30 * 86400}
+ONCHAIN_SORTS = {'period_change', 'price', 'volume_24h', 'liquidity', 'market_cap', 'fdv', 'age_hours', 'updated'}
+ONCHAIN_DISPLAY_LIMIT = 10
 
 
 def read_json(path):
@@ -51,11 +54,20 @@ def trading_pool_age_hours(created_at, now):
         return None
 
 
-def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_only=False):
+def english_dominant(text):
+    raw = str(text or '')
+    latin = len(re.findall(r'[A-Za-z]', raw))
+    han = len(re.findall(r'[\u4e00-\u9fff]', raw))
+    return latin >= 25 and latin > han * 4
+
+
+def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_only=False,
+                     chain='all', sort_by='period_change', sort_dir='desc'):
     if market not in ('spot', 'futures', 'onchain'):
         raise ValueError('invalid market')
     allowed = ('24h', '3d', '7d', '30d') if market == 'onchain' else ('12h', '3d', '7d', '30d')
-    if period not in allowed or risk not in ('pass', 'review', 'unknown', 'blocked', 'all'):
+    if (period not in allowed or risk not in ('pass', 'review', 'unknown', 'blocked', 'all')
+            or sort_by not in ONCHAIN_SORTS or sort_dir not in ('asc', 'desc')):
         raise ValueError('invalid period or risk')
     now = time.time()
     if not os.path.exists(DB_PATH):
@@ -105,16 +117,25 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
             if len(changes) == 2:
                 benchmark = sum(changes) / 2
         names = Counter(i.get('symbol', '').casefold() for i in all_items)
+        global_inventory_counts = Counter()
+        inventory_counts = Counter()
+        history_counts = Counter()
         counts = Counter()
         items = []
         for row, item in zip(rows, all_items):
             security = effective_security(json.loads(row['security']) if row['security'] else None,
                                           item.get('pair', ''), now)
             if market == 'onchain':
-                counts[security['status']] += 1
+                global_inventory_counts[security['status']] += 1
+                if chain != 'all' and item.get('chain') != chain:
+                    continue
+                inventory_counts[security['status']] += 1
             if query and query.casefold() not in ' '.join(str(item.get(k, '')) for k in ('symbol', 'name', 'address', 'narrative')).casefold():
                 continue
             item['security'] = security if market == 'onchain' else None
+            if market == 'onchain' and english_dominant(item.get('narrative')):
+                item['narrative'] = '该合约的公开项目资料为英文，中文摘要整理中；暂不据此推断项目背景。'
+                item['narrative_source'] = '原始资料：' + str(item.get('narrative_source') or '公开元数据')
             item['same_name_count'] = names[item.get('symbol', '').casefold()] if market == 'onchain' else 1
             alert = state.get('relative:' + item['symbol'], {}) if market != 'onchain' else {}
             item['last_alert_at'] = alert.get('last_alert_at')
@@ -142,11 +163,31 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
                     item['oi_change_percent'] = (end['quantity'] / bases[-1]['quantity'] - 1) * 100
                 item['oi_asof'] = end['ts']
             item['history_available'] = value is not None
+            if market == 'onchain' and not item['stale'] and value is not None:
+                history_counts[security['status']] += 1
+            if market == 'onchain' and not item['stale'] and value is not None and value > 0:
+                counts[security['status']] += 1
             if market == 'onchain' and risk != 'all' and security['status'] != risk:
                 continue
+            if market == 'onchain':
+                if item['stale'] or value is None or value <= 0:
+                    continue
             items.append(item)
-        items.sort(key=lambda x: (not x['stale'] and x['period_change'] is not None,
-                                   x['period_change'] if x['period_change'] is not None else float('-inf')), reverse=True)
+        if market == 'onchain':
+            # Counts must represent the current period's eligible rising assets, not the
+            # historical security inventory. Calculate all statuses even under a risk tab.
+            status_order = {'pass': 0, 'review': 1, 'unknown': 2, 'blocked': 3}
+            items.sort(key=lambda x: (status_order[x['security']['status']] if risk == 'all' else 0,
+                                      x.get(sort_by) is None,
+                                      -(x.get(sort_by) or 0) if sort_dir == 'desc' else x.get(sort_by) or 0,
+                                      -x['period_change']))
+            matching_count = len(items)
+            if risk != 'pass':
+                items = items[:ONCHAIN_DISPLAY_LIMIT]
+        else:
+            items.sort(key=lambda x: (not x['stale'] and x['period_change'] is not None,
+                                       x['period_change'] if x['period_change'] is not None else float('-inf')), reverse=True)
+            matching_count = len(items)
         rank = 0
         for item in items:
             if item['history_available'] and not item['stale']:
@@ -156,7 +197,11 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
                 item['rank'] = None
         return {'market': market, 'period': period, 'items': items, 'health': health,
                 'available_chains': available_chains,
-                'asof': now, 'counts': dict(counts), 'universe_count': len(rows),
+                'asof': now, 'counts': dict(counts), 'history_counts': dict(history_counts),
+                'inventory_counts': dict(inventory_counts), 'global_inventory_counts': dict(global_inventory_counts),
+                'matching_count': matching_count, 'display_limit': ONCHAIN_DISPLAY_LIMIT if market == 'onchain' and risk != 'pass' else None,
+                'risk': risk, 'chain': chain,
+                'universe_count': len(rows),
                 'ranked_count': rank, 'warning': '链上仅覆盖已发现标的；通过筛查不等于官方认证或保证可卖出。'
                 if market == 'onchain' else 'USDT现货 / USDT永续各按24h成交额选前150；历史基准为小时级。相对强度是同期涨幅减去BTC/ETH等权涨幅；盘口冲击为$5k模拟，不含手续费。'}
     finally:
