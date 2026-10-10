@@ -87,7 +87,7 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
                 counts[security['status']] += 1
                 if risk != 'all' and security['status'] != risk:
                     continue
-            if query and query.casefold() not in ' '.join(str(item.get(k, '')) for k in ('symbol', 'name', 'address')).casefold():
+            if query and query.casefold() not in ' '.join(str(item.get(k, '')) for k in ('symbol', 'name', 'address', 'narrative')).casefold():
                 continue
             item['security'] = security if market == 'onchain' else None
             item['same_name_count'] = names[item.get('symbol', '').casefold()] if market == 'onchain' else 1
