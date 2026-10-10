@@ -76,7 +76,22 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
                             visit(v)
         visit(push_data)
         rows = list(db.execute('SELECT a.payload,s.payload AS security FROM assets a LEFT JOIN security s ON a.id=s.id WHERE a.market=?', (market,)))
+        selected = health.get(market, {}).get('selected_symbols') if market != 'onchain' else None
+        if isinstance(selected, list):
+            selected = set(selected)
+            rows = [row for row in rows if json.loads(row['payload']).get('symbol') in selected]
         all_items = [json.loads(row['payload']) for row in rows]
+        benchmark = None
+        if market != 'onchain':
+            changes = []
+            for symbol in ('BTCUSDT', 'ETHUSDT'):
+                base = next((item for item in all_items if item['symbol'] == symbol), None)
+                if base and now - base['updated'] <= 900:
+                    change = period_return(db, base, PERIODS[period])[0]
+                    if change is not None:
+                        changes.append(change)
+            if len(changes) == 2:
+                benchmark = sum(changes) / 2
         names = Counter(i.get('symbol', '').casefold() for i in all_items)
         counts = Counter()
         items = []
@@ -99,7 +114,13 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
                 continue
             value, baseline, source = period_return(db, item, PERIODS[period])
             item.update(period_change=value, baseline_at=baseline, return_source=source,
-                        stale=now - item['updated'] > 900, oi_change_percent=None)
+                        stale=now - item['updated'] > 900, oi_change_percent=None,
+                        relative_change_percent=(value - benchmark if value is not None and benchmark is not None else None))
+            if market != 'onchain':
+                if now - item.get('depth_updated', 0) > 3600:
+                    item['depth_impact_percent'] = None
+                if now - item.get('volume_ratio_updated', 0) > 7200:
+                    item['hourly_volume_ratio'] = None
             oi_rows = item.pop('oi_history', [])
             if oi_rows:
                 end = oi_rows[-1]
@@ -122,6 +143,6 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
         return {'market': market, 'period': period, 'items': items, 'health': health,
                 'asof': now, 'counts': dict(counts), 'universe_count': len(rows),
                 'ranked_count': rank, 'warning': '链上仅覆盖已发现标的；通过筛查不等于官方认证或保证可卖出。'
-                if market == 'onchain' else 'USDT现货 / USDT永续按24h成交额选取，覆盖上限见采集状态；历史基准为小时级。'}
+                if market == 'onchain' else 'USDT现货 / USDT永续各按24h成交额选前150；历史基准为小时级。相对强度是同期涨幅减去BTC/ETH等权涨幅；盘口冲击为$5k模拟，不含手续费。'}
     finally:
         db.close()
