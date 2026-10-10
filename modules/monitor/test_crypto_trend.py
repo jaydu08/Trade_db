@@ -1,6 +1,7 @@
 import sqlite3
 import unittest
-from modules.monitor.crypto_trend import period_return, effective_security
+from datetime import datetime, timezone
+from modules.monitor.crypto_trend import period_return, effective_security, review_priority, trading_pool_age_hours
 
 
 class TrendTest(unittest.TestCase):
@@ -27,3 +28,17 @@ class TrendTest(unittest.TestCase):
         payload = {'status': 'pass', 'expires_at': 100, 'pair': 'a'}
         self.assertEqual(effective_security(payload, 'a', 101)['status'], 'unknown')
         self.assertEqual(effective_security(payload, 'b', 99)['status'], 'unknown')
+
+    def test_review_priority_has_quality_floors_and_capped_spikes(self):
+        item = {'chain': 'bsc', 'stale': False, 'period_change': 100,
+                'volume_24h': 2_000_000, 'liquidity': 500_000, 'market_cap': 3_000_000}
+        self.assertEqual(review_priority(item)['score'], 100)
+        self.assertEqual(review_priority(dict(item, period_change=10000))['score'], 100)
+        self.assertIsNone(review_priority(dict(item, liquidity=100)))
+        self.assertIsNone(review_priority(dict(item, chain='solana')))
+        self.assertIsNone(review_priority(dict(item, stale=True)))
+
+    def test_trading_pool_age_uses_pair_creation_timestamp(self):
+        now = datetime(2026, 10, 10, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(trading_pool_age_hours('2026-10-09T00:00:00+00:00', now), 24)
+        self.assertIsNone(trading_pool_age_hours('invalid', now))

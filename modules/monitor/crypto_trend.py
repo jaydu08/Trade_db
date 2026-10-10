@@ -1,13 +1,16 @@
 """Read-only Trend views over alpha_news public market/security evidence."""
 import json
+import math
 import os
 import sqlite3
 import time
 from collections import Counter
+from datetime import datetime
 
 DB_PATH = os.getenv('CRYPTO_TREND_DB', '/root/alpha_news/data/crypto_trend.sqlite')
 ALPHA_ROOT = os.getenv('ALPHA_NEWS_ROOT', '/root/alpha_news')
 PERIODS = {'12h': 12 * 3600, '24h': 86400, '3d': 3 * 86400, '7d': 7 * 86400, '30d': 30 * 86400}
+ONCHAIN_CAP_FLOORS = {'ethereum': 1_500_000, 'base': 300_000, 'bsc': 2_000_000}
 
 
 def read_json(path):
@@ -41,6 +44,39 @@ def effective_security(payload, pair, now):
     return result
 
 
+def trading_pool_age_hours(created_at, now):
+    """Mirror the TG pool-age clock; do not imply contract deployment time."""
+    try:
+        created = datetime.fromisoformat(str(created_at).replace('Z', '+00:00')).timestamp()
+        return round((now - created) / 3600, 1) if 0 < created <= now else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def review_priority(item):
+    """Attention ranking only, deliberately unrelated to contract safety."""
+    def metric(key):
+        try:
+            value = float(item.get(key))
+            return value if math.isfinite(value) else 0
+        except (TypeError, ValueError):
+            return 0
+    change, volume, liquidity, cap = (metric(k) for k in
+                                      ('period_change', 'volume_24h', 'liquidity', 'market_cap'))
+    if (item.get('chain') not in ONCHAIN_CAP_FLOORS or item.get('stale') or change <= 0
+            or volume < 200_000 or liquidity < 50_000
+            or cap < ONCHAIN_CAP_FLOORS[item['chain']]):
+        return None
+    momentum = 30 * min(change / 100, 1)
+    volume_points = 35 * min(max(math.log10(volume / 200_000), 0), 1)
+    liquidity_points = 35 * min(max(math.log10(liquidity / 50_000), 0), 1)
+    return {'score': round(momentum + volume_points + liquidity_points, 1),
+            'momentum_points': round(momentum, 1), 'volume_points': round(volume_points, 1),
+            'liquidity_points': round(liquidity_points, 1),
+            'volume_liquidity_ratio': round(volume / liquidity, 1),
+            'turnover_warning': volume / liquidity > 20}
+
+
 def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_only=False):
     if market not in ('spot', 'futures', 'onchain'):
         raise ValueError('invalid market')
@@ -49,7 +85,8 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
         raise ValueError('invalid period or risk')
     now = time.time()
     if not os.path.exists(DB_PATH):
-        return {'items': [], 'health': {}, 'warning': '采集器正在初始化', 'asof': now, 'counts': {}}
+        return {'items': [], 'review_candidates': [], 'review_eligible_count': 0,
+                'health': {}, 'warning': '采集器正在初始化', 'asof': now, 'counts': {}}
     db = sqlite3.connect('file:' + DB_PATH + '?mode=ro', uri=True, timeout=5)
     db.row_factory = sqlite3.Row
     try:
@@ -95,13 +132,15 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
         names = Counter(i.get('symbol', '').casefold() for i in all_items)
         counts = Counter()
         items = []
+        review_candidates = []
+        unsupported_count = 0
         for row, item in zip(rows, all_items):
             security = effective_security(json.loads(row['security']) if row['security'] else None,
                                           item.get('pair', ''), now)
             if market == 'onchain':
                 counts[security['status']] += 1
-                if risk != 'all' and security['status'] != risk:
-                    continue
+                if security['status'] == 'unknown' and item.get('chain') not in ONCHAIN_CAP_FLOORS:
+                    unsupported_count += 1
             if query and query.casefold() not in ' '.join(str(item.get(k, '')) for k in ('symbol', 'name', 'address', 'narrative')).casefold():
                 continue
             item['security'] = security if market == 'onchain' else None
@@ -116,6 +155,8 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
             item.update(period_change=value, baseline_at=baseline, return_source=source,
                         stale=now - item['updated'] > 900, oi_change_percent=None,
                         relative_change_percent=(value - benchmark if value is not None and benchmark is not None else None))
+            if market == 'onchain':
+                item['age_hours'] = trading_pool_age_hours(item.get('pair_created_at'), now)
             if market != 'onchain':
                 if now - item.get('depth_updated', 0) > 3600:
                     item['depth_impact_percent'] = None
@@ -130,7 +171,16 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
                     item['oi_change_percent'] = (end['quantity'] / bases[-1]['quantity'] - 1) * 100
                 item['oi_asof'] = end['ts']
             item['history_available'] = value is not None
+            if market == 'onchain' and security['status'] in ('review', 'unknown') and value is not None:
+                priority = review_priority(item)
+                if priority is not None:
+                    item['review_priority'] = priority
+                    review_candidates.append(item)
+            if market == 'onchain' and risk != 'all' and security['status'] != risk:
+                continue
             items.append(item)
+        review_candidates.sort(key=lambda x: (x['review_priority']['score'], x['period_change'],
+                                              x.get('liquidity') or 0), reverse=True)
         items.sort(key=lambda x: (not x['stale'] and x['period_change'] is not None,
                                    x['period_change'] if x['period_change'] is not None else float('-inf')), reverse=True)
         rank = 0
@@ -142,6 +192,9 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
                 item['rank'] = None
         return {'market': market, 'period': period, 'items': items, 'health': health,
                 'asof': now, 'counts': dict(counts), 'universe_count': len(rows),
+                'review_candidates': review_candidates[:10],
+                'review_eligible_count': len(review_candidates),
+                'unsupported_count': unsupported_count,
                 'ranked_count': rank, 'warning': '链上仅覆盖已发现标的；通过筛查不等于官方认证或保证可卖出。'
                 if market == 'onchain' else 'USDT现货 / USDT永续各按24h成交额选前150；历史基准为小时级。相对强度是同期涨幅减去BTC/ETH等权涨幅；盘口冲击为$5k模拟，不含手续费。'}
     finally:
