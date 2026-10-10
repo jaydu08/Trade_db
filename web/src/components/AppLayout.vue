@@ -12,6 +12,7 @@ const navItems = [
   { path: '/holds', label: 'Holds', icon: '💼' },
   { path: '/trend', label: 'Trend', icon: '📈' },
   { path: '/trend/crypto', label: 'Crypto Trend', icon: '◈' },
+  { path: '/macro', label: 'Macro & Commodities', icon: '◉' },
   { path: '/heatmap', label: 'Heatmap', icon: '🔥' },
 ]
 

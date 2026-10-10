@@ -41,6 +41,12 @@ const routes = [
     component: () => import('../views/CryptoTrendView.vue'),
     meta: { requiresAuth: true },
   },
+  {
+    path: '/macro',
+    name: 'MacroDashboard',
+    component: () => import('../views/MacroDashboardView.vue'),
+    meta: { requiresAuth: true },
+  },
 ]
 
 const router = createRouter({

@@ -2808,6 +2808,17 @@ def crypto_trend(
         raise HTTPException(status_code=503, detail='加密数据暂不可用，请稍后重试')
 
 
+# --------------- Macro and commodities dashboard ---------------
+@app.get('/api/macro/dashboard')
+def macro_dashboard(user: UserContext = Depends(get_current_user)):
+    from modules.monitor.macro_dashboard import get_dashboard
+    try:
+        return get_dashboard()
+    except Exception:
+        logger.exception('Macro dashboard unavailable')
+        raise HTTPException(status_code=503, detail='宏观数据暂不可用，请稍后重试')
+
+
 # --------------- SPA Fallback ---------------
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web", "dist")
 

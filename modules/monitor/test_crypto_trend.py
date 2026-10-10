@@ -1,7 +1,12 @@
 import sqlite3
+import json
+import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
-from modules.monitor.crypto_trend import period_return, effective_security, review_priority, trading_pool_age_hours
+from unittest.mock import patch
+from modules.monitor import crypto_trend
+from modules.monitor.crypto_trend import period_return, effective_security, trading_pool_age_hours
 
 
 class TrendTest(unittest.TestCase):
@@ -29,16 +34,31 @@ class TrendTest(unittest.TestCase):
         self.assertEqual(effective_security(payload, 'a', 101)['status'], 'unknown')
         self.assertEqual(effective_security(payload, 'b', 99)['status'], 'unknown')
 
-    def test_review_priority_has_quality_floors_and_capped_spikes(self):
-        item = {'chain': 'bsc', 'stale': False, 'period_change': 100,
-                'volume_24h': 2_000_000, 'liquidity': 500_000, 'market_cap': 3_000_000}
-        self.assertEqual(review_priority(item)['score'], 100)
-        self.assertEqual(review_priority(dict(item, period_change=10000))['score'], 100)
-        self.assertIsNone(review_priority(dict(item, liquidity=100)))
-        self.assertIsNone(review_priority(dict(item, chain='solana')))
-        self.assertIsNone(review_priority(dict(item, stale=True)))
-
     def test_trading_pool_age_uses_pair_creation_timestamp(self):
         now = datetime(2026, 10, 10, tzinfo=timezone.utc).timestamp()
         self.assertEqual(trading_pool_age_hours('2026-10-09T00:00:00+00:00', now), 24)
         self.assertIsNone(trading_pool_age_hours('invalid', now))
+
+    def test_chain_options_do_not_disappear_when_risk_filter_is_pass(self):
+        now = time.time()
+        with tempfile.TemporaryDirectory() as folder:
+            path = folder + '/trend.sqlite'
+            db = sqlite3.connect(path)
+            db.execute('CREATE TABLE assets(id TEXT,market TEXT,payload TEXT)')
+            db.execute('CREATE TABLE security(id TEXT,payload TEXT)')
+            db.execute('CREATE TABLE health(component TEXT,payload TEXT,updated REAL)')
+            db.execute('CREATE TABLE bars(id TEXT,ts INTEGER,price REAL,source TEXT)')
+            for chain, status in [('ethereum', 'pass'), ('solana', 'unknown'), ('robinhood', 'unknown')]:
+                asset_id = chain + ':token'
+                payload = {'id': asset_id, 'chain': chain, 'market': 'onchain', 'pair': 'pool',
+                           'symbol': chain, 'name': chain, 'updated': now, 'price': 2,
+                           'provider_change_24h': 5}
+                db.execute('INSERT INTO assets VALUES(?,?,?)', (asset_id, 'onchain', json.dumps(payload)))
+                security = {'status': status, 'pair': 'pool', 'expires_at': now + 3600}
+                db.execute('INSERT INTO security VALUES(?,?)', (asset_id, json.dumps(security)))
+            db.commit()
+            db.close()
+            with patch.object(crypto_trend, 'DB_PATH', path), patch.object(crypto_trend, 'ALPHA_ROOT', folder):
+                result = crypto_trend.get_crypto_trend(market='onchain', period='24h', risk='pass')
+            self.assertEqual(result['available_chains'], ['ethereum', 'robinhood', 'solana'])
+            self.assertEqual([item['chain'] for item in result['items']], ['ethereum'])

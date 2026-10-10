@@ -96,6 +96,14 @@ class TaskScheduler:
             name="大宗商品每日战报",
             replace_existing=True
         )
+
+        self.scheduler.add_job(
+            self._job_macro_dashboard,
+            IntervalTrigger(minutes=15),
+            id="macro_dashboard",
+            name="宏观与外盘商品看板快照",
+            replace_existing=True
+        )
         
         # 4. CN 热度榜单 (工作日 17:35，错开港股避免OOM)
         self.scheduler.add_job(
@@ -426,6 +434,11 @@ class TaskScheduler:
         """Job: 大宗商品每日战报"""
         from modules.monitor.commodity_scanner import CommodityScanner
         self._run_job("commodity_scan", CommodityScanner.generate_daily_report)
+
+    def _job_macro_dashboard(self):
+        """Job: independently refresh read-only macro/commodity snapshots."""
+        from modules.monitor.macro_dashboard import refresh_snapshot
+        self._run_job("macro_dashboard", refresh_snapshot)
 
     def _job_trend_7d(self):
         """Job: 7日趋势简报"""

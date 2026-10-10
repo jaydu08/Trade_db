@@ -62,6 +62,7 @@ venv.bak/
 data/*.db
 data/vector_store/
 data/cache/
+data/macro_dashboard_snapshot.json
 
 # Logs
 *.log
