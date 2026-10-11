@@ -105,7 +105,10 @@ async function openNarrative(row: TrendItem) {
   const requestId = ++narrativeRequestId
   const cached = narrativeCache.get(key)
   narrative.value = cached || null
-  if (cached) return
+  if (cached) {
+    narrativeLoading.value = false
+    return
+  }
   narrativeLoading.value = true
   try {
     const res = await api.get('/trend/narrative', {
