@@ -20,6 +20,23 @@ interface CapitalSignalCoverage {
   latest_asof?: string
 }
 
+interface StockNarrative {
+  market: string
+  symbol: string
+  name: string
+  available: boolean
+  industry?: string
+  industry_source?: string
+  main_business?: string
+  company_profile?: string
+  products?: string
+  growth_clue?: string
+  profile_updated?: string
+  profile_stale?: boolean
+  profile_source?: string
+  market_focus?: string
+}
+
 interface TrendItem {
   rank: number
   symbol: string
@@ -72,6 +89,39 @@ const loadingKey = ref('')
 const refreshingKey = ref('')
 const trendCache = ref<Record<string, TrendCacheEntry>>({})
 const CACHE_TTL_MS = 5 * 60 * 1000
+const narrativeVisible = ref(false)
+const narrativeLoading = ref(false)
+const narrativeError = ref('')
+const narrativeRow = ref<TrendItem | null>(null)
+const narrative = ref<StockNarrative | null>(null)
+const narrativeCache = new Map<string, StockNarrative>()
+let narrativeRequestId = 0
+
+async function openNarrative(row: TrendItem) {
+  narrativeRow.value = row
+  narrativeVisible.value = true
+  narrativeError.value = ''
+  const key = `${row.market}:${row.symbol}`
+  const requestId = ++narrativeRequestId
+  const cached = narrativeCache.get(key)
+  narrative.value = cached || null
+  if (cached) return
+  narrativeLoading.value = true
+  try {
+    const res = await api.get('/trend/narrative', {
+      params: { market: row.market, symbol: row.symbol }, timeout: 20000,
+    })
+    const detail = res.data as StockNarrative
+    narrativeCache.set(key, detail)
+    if (requestId === narrativeRequestId) narrative.value = detail
+  } catch (e: any) {
+    if (requestId === narrativeRequestId) {
+      narrativeError.value = e?.response?.data?.detail || '公司资料暂时无法读取'
+    }
+  } finally {
+    if (requestId === narrativeRequestId) narrativeLoading.value = false
+  }
+}
 
 const pageSize = ref(20)
 const currentPage = ref(1)
@@ -429,6 +479,11 @@ onMounted(fetchTrend)
       <el-table-column prop="rank" label="#" width="46" />
       <el-table-column prop="symbol" label="代码" width="98" />
       <el-table-column prop="name" label="名称" width="110" />
+      <el-table-column label="公司" width="74">
+        <template #default="{ row }">
+          <button class="profile-link" @click="openNarrative(row)">了解 ↗</button>
+        </template>
+      </el-table-column>
       <el-table-column label="现价" width="78">
         <template #default="{ row }">{{ row.price ? row.price.toFixed(2) : '-' }}</template>
       </el-table-column>
@@ -500,6 +555,46 @@ onMounted(fetchTrend)
         background
       />
     </div>
+
+    <el-drawer v-model="narrativeVisible" :title="`${narrativeRow?.name || narrativeRow?.symbol || '公司'} · 公司脉络`" size="min(520px, 100vw)">
+      <div v-loading="narrativeLoading" class="narrative-panel">
+        <p class="narrative-note">公司资料与行情榜分开更新；行业可能为规则推断。以下不是投资建议，也不把涨幅当作新闻催化。</p>
+        <p v-if="narrativeError" class="narrative-error">{{ narrativeError }}</p>
+        <template v-if="narrative && narrative.available">
+          <div class="narrative-meta">
+            <span>{{ narrative.market }} · {{ narrative.symbol }}</span>
+            <span v-if="narrative.profile_updated">资料同步 {{ narrative.profile_updated }}</span>
+            <span v-if="narrative.profile_stale" class="narrative-stale">资料超过 180 天</span>
+          </div>
+          <section class="narrative-section">
+            <h3>所属行业</h3>
+            <p>{{ narrative.industry || '暂无可核实分类' }}</p>
+            <small v-if="narrative.industry_source">{{ narrative.industry_source }}</small>
+          </section>
+          <section class="narrative-section">
+            <h3>主营业务</h3>
+            <p>{{ narrative.main_business || narrative.company_profile || '暂无公司业务资料' }}</p>
+            <small v-if="narrative.products">产品线：{{ narrative.products }}</small>
+          </section>
+          <section v-if="narrative.main_business && narrative.company_profile" class="narrative-section">
+            <h3>公司简介补充</h3>
+            <p>{{ narrative.company_profile }}</p>
+          </section>
+          <section class="narrative-section">
+            <h3>资料中的增长方向</h3>
+            <p>{{ narrative.growth_clue || '现有公司简介没有明确的扩张或研发方向描述；需以较新财报、公告核验。' }}</p>
+            <small>摘自公司资料中的明确表述，不是业绩预测。</small>
+          </section>
+          <section class="narrative-section">
+            <h3>市场在交易什么？</h3>
+            <p>{{ narrative.market_focus }}</p>
+            <small v-if="narrativeRow?.catalyst_tags">榜单规则线索（未经新闻核实）：{{ narrativeRow.catalyst_tags }}</small>
+          </section>
+          <p class="narrative-source">{{ narrative.profile_source }}<span v-if="narrative.profile_updated"> · {{ narrative.profile_updated }}</span>。同步日期不等于财报发布日期。</p>
+        </template>
+        <p v-else-if="narrative && !narrative.available" class="narrative-empty">该股票暂无本地公司档案；不会按同名公司拼接资料。</p>
+      </div>
+    </el-drawer>
   </div>
 </template>
 
@@ -673,4 +768,16 @@ onMounted(fetchTrend)
   display: flex;
   justify-content: flex-end;
 }
+.profile-link { color: #155eef; font-size: 12px; white-space: nowrap; }
+.profile-link:hover { text-decoration: underline; }
+.narrative-panel { min-height: 120px; padding: 0 4px 20px; }
+.narrative-note, .narrative-source { color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
+.narrative-error { color: #b42318; }
+.narrative-empty { color: var(--text-secondary); line-height: 1.7; }
+.narrative-meta { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 18px 0; color: var(--text-secondary); font-size: 12px; }
+.narrative-stale { color: #b54708; }
+.narrative-section { padding: 15px 0; border-top: 1px solid rgba(15, 23, 42, 0.08); }
+.narrative-section h3 { margin: 0 0 8px; font-size: 14px; }
+.narrative-section p { margin: 0; line-height: 1.75; font-size: 13px; white-space: pre-wrap; }
+.narrative-section small { display: block; margin-top: 7px; line-height: 1.6; color: var(--text-secondary); }
 </style>

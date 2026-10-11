@@ -1047,6 +1047,21 @@ def _refresh_trend_display_prices(
     return updated
 
 
+@app.get("/api/trend/narrative")
+def get_trend_narrative(
+    market: str = Query(...),
+    symbol: str = Query(...),
+    user: UserContext = Depends(get_current_user),
+):
+    """On-demand company context; it is intentionally absent from list loading."""
+    from modules.monitor.stock_narrative import get_stock_narrative
+
+    try:
+        return get_stock_narrative(market, symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/trend")
 def get_trend(
     days: int = Query(default=7, ge=3, le=180),
