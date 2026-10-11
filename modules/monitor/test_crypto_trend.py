@@ -41,6 +41,7 @@ class TrendTest(unittest.TestCase):
 
     def test_english_description_is_not_shown_as_chinese_narrative(self):
         self.assertTrue(english_dominant('This is an English description of a decentralized lending protocol.'))
+        self.assertTrue(english_dominant('Fighting for gamers'))
         self.assertFalse(english_dominant('该项目提供去中心化借贷服务，ABC代币可用于社区治理。'))
         self.assertFalse(english_dominant('GOLDEN是Robinhood链上的社区迷因代币，致敬Robinhood获Product Hunt金猫奖。'))
 

@@ -58,7 +58,7 @@ def english_dominant(text):
     raw = str(text or '')
     latin = len(re.findall(r'[A-Za-z]', raw))
     han = len(re.findall(r'[\u4e00-\u9fff]', raw))
-    return latin >= 25 and latin > han * 4
+    return (latin >= 12 and han == 0) or (latin >= 25 and latin > han * 4)
 
 
 def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_only=False,
