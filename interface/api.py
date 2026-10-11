@@ -1062,6 +1062,21 @@ def get_trend_narrative(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/api/trend/narrative/evidence")
+def get_trend_narrative_evidence(
+    market: str = Query(...),
+    symbol: str = Query(...),
+    user: UserContext = Depends(get_current_user),
+):
+    """Fetch cached, linkable events only when a company card is opened."""
+    from modules.monitor.stock_evidence import get_stock_evidence
+
+    try:
+        return get_stock_evidence(market, symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/trend")
 def get_trend(
     days: int = Query(default=7, ge=3, le=180),

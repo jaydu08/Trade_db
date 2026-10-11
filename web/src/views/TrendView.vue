@@ -37,6 +37,23 @@ interface StockNarrative {
   market_focus?: string
 }
 
+interface StockEvidenceEvent {
+  title: string
+  date: string
+  source: string
+  url: string
+  kind: string
+  priority: number
+}
+
+interface StockEvidence {
+  market: string
+  symbol: string
+  events: StockEvidenceEvent[]
+  status: string
+  note?: string
+}
+
 interface TrendItem {
   rank: number
   symbol: string
@@ -95,7 +112,31 @@ const narrativeError = ref('')
 const narrativeRow = ref<TrendItem | null>(null)
 const narrative = ref<StockNarrative | null>(null)
 const narrativeCache = new Map<string, StockNarrative>()
+const evidenceCache = new Map<string, StockEvidence>()
+const evidence = ref<StockEvidence | null>(null)
+const evidenceLoading = ref(false)
 let narrativeRequestId = 0
+
+async function loadEvidence(row: TrendItem, key: string, requestId: number) {
+  const cached = evidenceCache.get(key)
+  evidence.value = cached || null
+  evidenceLoading.value = !cached
+  if (cached) return
+  try {
+    const res = await api.get('/trend/narrative/evidence', {
+      params: { market: row.market, symbol: row.symbol }, timeout: 25000,
+    })
+    const result = res.data as StockEvidence
+    evidenceCache.set(key, result)
+    if (requestId === narrativeRequestId) evidence.value = result
+  } catch {
+    if (requestId === narrativeRequestId) evidence.value = {
+      market: row.market, symbol: row.symbol, events: [], status: 'unavailable',
+    }
+  } finally {
+    if (requestId === narrativeRequestId) evidenceLoading.value = false
+  }
+}
 
 async function openNarrative(row: TrendItem) {
   narrativeRow.value = row
@@ -103,6 +144,7 @@ async function openNarrative(row: TrendItem) {
   narrativeError.value = ''
   const key = `${row.market}:${row.symbol}`
   const requestId = ++narrativeRequestId
+  void loadEvidence(row, key, requestId)
   const cached = narrativeCache.get(key)
   narrative.value = cached || null
   if (cached) {
@@ -590,7 +632,20 @@ onMounted(fetchTrend)
           </section>
           <section class="narrative-section">
             <h3>市场在交易什么？</h3>
-            <p>{{ narrative.market_focus }}</p>
+            <p>{{ evidence?.events?.length ? '以下是近期公司相关公告/新闻线索，尚不能据此确认价格变动原因。' : narrative.market_focus }}</p>
+            <p v-if="evidenceLoading" class="evidence-state">近期公告与新闻检索中…</p>
+            <template v-else-if="evidence?.events?.length">
+              <div class="evidence-list">
+                <a v-for="event in evidence.events" :key="event.url" class="evidence-item"
+                   :href="event.url" target="_blank" rel="noopener noreferrer">
+                  <span class="evidence-date">{{ event.date }} · {{ event.source }} · {{ event.kind }}</span>
+                  <span class="evidence-title">{{ event.title }} ↗</span>
+                </a>
+              </div>
+              <small>{{ evidence.note || '仅为近期公司相关线索，不代表价格变动原因。' }}</small>
+              <small v-if="narrative.market === 'US'">美股标题保留来源原文；请点击原文核实具体内容。</small>
+            </template>
+            <p v-else-if="evidence" class="evidence-state">{{ evidence.status === 'unavailable' ? '来源暂时不可用，稍后再试。' : evidence.status === 'routine_only' ? '近期仅检索到例行披露，未见值得单列的事项标题。' : '本次未取得可核实的近期公告或新闻。' }}</p>
             <small v-if="narrativeRow?.catalyst_tags">榜单规则线索（未经新闻核实）：{{ narrativeRow.catalyst_tags }}</small>
           </section>
           <p class="narrative-source">{{ narrative.profile_source }}<span v-if="narrative.profile_updated"> · {{ narrative.profile_updated }}</span>。同步日期不等于财报发布日期。</p>
@@ -783,4 +838,10 @@ onMounted(fetchTrend)
 .narrative-section h3 { margin: 0 0 8px; font-size: 14px; }
 .narrative-section p { margin: 0; line-height: 1.75; font-size: 13px; white-space: pre-wrap; }
 .narrative-section small { display: block; margin-top: 7px; line-height: 1.6; color: var(--text-secondary); }
+.evidence-state { margin-top: 10px !important; color: var(--text-secondary); font-size: 12px !important; }
+.evidence-list { display: grid; gap: 7px; margin-top: 12px; }
+.evidence-item { display: grid; gap: 3px; padding: 9px 10px; border-radius: 7px; background: var(--bg-hover); text-decoration: none; }
+.evidence-item:hover .evidence-title { text-decoration: underline; }
+.evidence-date { color: var(--text-secondary); font-size: 11px; }
+.evidence-title { color: #155eef; font-size: 12px; line-height: 1.5; }
 </style>
