@@ -33,6 +33,7 @@ const trendLoading = ref(false)
 const showComparison = ref(false)
 const emit = defineEmits<{ (e: 'select-stock', row: { symbol: string; name: string; market: string; catalyst_tags: string }): void }>()
 let calendarRequestId = 0
+let boardRequestId = 0
 
 const trendQuota = computed(() => activeMarket.value === "HK" ? 7 : 10)
 const quotaText = computed(() => activeMarket.value === "HK" ? "Top7" : "Top10")
@@ -57,16 +58,17 @@ async function fetchTradingDays(month?: string) {
 
 async function fetchHeatmap() {
   if (!selectedDate.value) return
+  const requestId = ++boardRequestId
   loading.value = true
   try {
     const res = await api.get("/heatmap", {
       params: { date: selectedDate.value, market: activeMarket.value }
     })
-    items.value = res.data.items || []
+    if (requestId === boardRequestId) items.value = res.data.items || []
   } catch {
-    ElMessage.error("加载Heatmap日榜失败")
+    if (requestId === boardRequestId) ElMessage.error("加载TG日榜失败")
   } finally {
-    loading.value = false
+    if (requestId === boardRequestId) loading.value = false
   }
 }
 
@@ -139,7 +141,12 @@ function handleDateChange(val: string) {
 
 onMounted(() => fetchTradingDays())
 
-watch(activeMarket, () => fetchTradingDays())
+watch(activeMarket, () => {
+  ++boardRequestId
+  items.value = []
+  selectedDate.value = ''
+  fetchTradingDays()
+})
 watch(trendDays, () => { if (showComparison.value) fetchTrendPush() })
 watch(showComparison, (visible) => { if (visible) fetchTrendPush() })
 </script>
@@ -165,7 +172,7 @@ watch(showComparison, (visible) => { if (visible) fetchTrendPush() })
         @update:model-value="handleDateChange"
         style="width: 150px"
       />
-      <span class="board-hint">与股票 TG 实际推送同步 · 默认各市场最近交易日</span>
+      <span class="board-hint">与股票 TG 推送使用同一份榜单 · 默认各市场最近交易日</span>
       <button class="compare-toggle" @click="showComparison = !showComparison">{{ showComparison ? '收起算法对照' : '查看旧算法对照' }}</button>
       <div v-if="showComparison" class="days-group">
         <span class="days-label">Trend窗口</span>
@@ -184,7 +191,7 @@ watch(showComparison, (visible) => { if (visible) fetchTrendPush() })
         <div class="panel-head">
           <div>
             <h2>TG 当日强势榜</h2>
-            <p>{{ selectedDate || "-" }} · 已推送标的，可切换交易日回看</p>
+            <p>{{ selectedDate || "-" }} · TG 同口径榜单，可切换交易日回看</p>
           </div>
           <span class="count-pill">{{ items.length }}只</span>
         </div>
