@@ -125,12 +125,46 @@ def extract_sec_item1(html):
     return ''
 
 
+def extract_sec_item4_20f(html):
+    """Extract the Business Overview subsection of a foreign issuer's 20-F."""
+    import warnings
+    from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', XMLParsedAsHTMLWarning)
+        soup = BeautifulSoup(html, 'lxml')
+    for tag in soup.find_all(['script', 'style', 'ix:header']):
+        tag.decompose()
+    body = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+    heading = re.compile(r'\bitem\s*4\s*[.\-\s]*\s*inform\s*ation\s+on\s+the\s+company\b', re.I)
+    overview = re.compile(r'\bB\.\s*Business\s+Overview\b', re.I)
+    for match in heading.finditer(body):
+        # Real Item 4 begins with subsection A; references elsewhere do not.
+        prefix = body[match.end():match.end() + 500]
+        if not re.search(r'\bA\.\s*History\s+and\s+Development\b', prefix, re.I):
+            continue
+        for section in overview.finditer(body, match.end(), min(match.end() + 50000, len(body))):
+            tail = body[section.end():section.end() + 1200].strip()
+            # Cross-references read "B. Business Overview—Regulations...";
+            # the section heading itself starts directly with narrative prose.
+            if not tail or tail[0] in '—–“”"' or tail.lower().startswith('regulations'):
+                continue
+            excerpt = tail[:1100]
+            if len(excerpt) < 500:
+                continue
+            last_sentence = max(excerpt.rfind('. '), excerpt.rfind('。'))
+            if last_sentence >= 400:
+                excerpt = excerpt[:last_sentence + 1]
+            return excerpt
+    return ''
+
+
 def sec_business_info(ticker):
     """Official 10-K business excerpt; exact ticker/CIK match and disk cache."""
     ticker = str(ticker or '').upper().strip()
     if not re.fullmatch(r'[A-Z][A-Z0-9.\-]{0,12}', ticker):
         return {}
-    key = 'stock_sec_item1_v2:' + ticker
+    key = 'stock_sec_business_v4:' + ticker
     cached = get_cache(key)
     if isinstance(cached, dict):
         return cached
@@ -165,7 +199,7 @@ def sec_business_info(ticker):
         if ticker not in [str(x).upper() for x in submission.get('tickers', [])]:
             return {}
         recent = submission['filings']['recent']
-        index = next((i for i, form in enumerate(recent['form']) if form == '10-K'), None)
+        index = next((i for i, form in enumerate(recent['form']) if form in {'10-K', '20-F'}), None)
         if index is None:
             set_cache(key, {}, ttl=86400)
             return {}
@@ -178,12 +212,13 @@ def sec_business_info(ticker):
         response.raise_for_status()
         if len(response.content) > 12_000_000:
             return {}
-        excerpt = extract_sec_item1(response.content)
+        form = recent['form'][index]
+        excerpt = extract_sec_item1(response.content) if form == '10-K' else extract_sec_item4_20f(response.content)
         if not excerpt:
             set_cache(key, {}, ttl=86400)
             return {}
         result = {'business': excerpt, 'filing_date': recent['filingDate'][index],
-                  'filing_url': url, 'form': '10-K',
+                  'filing_url': url, 'form': form,
                   'industry': _clean(submission.get('sicDescription'), 100)}
         set_cache(key, result, ttl=30 * 86400)
         return result
@@ -271,13 +306,14 @@ def get_stock_narrative(market, symbol):
         "market": market, "symbol": symbol, "name": asset.name, "available": bool(profile or external_identity or sec_info),
         "industry": industry, "industry_source": industry_source,
         "main_business": business, "company_profile": intro, "products": products,
-        "business_source": "本地中文公司资料" if local_business else "SEC 10-K 英文原文" if sec_info else "",
+        "business_source": "本地中文公司资料" if local_business else f"SEC {sec_info['form']} 英文原文" if sec_info else "",
         "website": external_identity.get('website', ''),
         "profile_quality": 'complete' if business and intro else 'partial' if business or intro or industry else 'missing',
         "growth_clue": growth, "profile_updated": updated, "profile_stale": stale,
-        "profile_source": "本地公司资料库（原始采集：AkShare）" if profile else "SEC 10-K Item 1（英文原文）" if sec_info else "",
+        "profile_source": "本地公司资料库（原始采集：AkShare）" if profile else f"SEC {sec_info['form']}（英文原文）" if sec_info else "",
         "sec_business": sec_info.get('business', ''),
         "sec_filing_date": sec_info.get('filing_date', ''),
         "sec_filing_url": sec_info.get('filing_url', ''),
+        "sec_form": sec_info.get('form', ''),
         "market_focus": "暂无带来源和时间的近期公告/新闻证据；榜单涨幅或规则标签不能证明上涨原因。",
     }

@@ -1,10 +1,21 @@
 import unittest
 from unittest.mock import patch, Mock
 
-from modules.monitor.stock_narrative import growth_clue, profile_highlight, business_detail, _clean, _profile_symbol, extract_sec_item1, sec_business_info
+from modules.monitor.stock_narrative import growth_clue, profile_highlight, business_detail, _clean, _profile_symbol, extract_sec_item1, extract_sec_item4_20f, sec_business_info
 
 
 class StockNarrativeTest(unittest.TestCase):
+    def test_sec_20f_uses_business_overview_after_real_item4(self):
+        html = ('<html><body>Item 4. Information on the Company 42 Item 4A. Staff Comments '
+                'Item 4. INFORM ATION ON THE COMPANY A. History and Development of the Company. '
+                'The company was founded in 2012. B. Business Overview—Regulations” cross reference. '
+                'B. Business Overview We build electric vehicles. '
+                + 'We sell cars and provide battery services worldwide. ' * 25
+                + 'C. Organizational Structure</body></html>')
+        excerpt = extract_sec_item4_20f(html)
+        self.assertIn('electric vehicles', excerpt)
+        self.assertNotIn('Organizational Structure', excerpt)
+
     def test_sec_fallback_rejects_ticker_cik_mismatch(self):
         ticker_response = Mock()
         ticker_response.json.return_value = {

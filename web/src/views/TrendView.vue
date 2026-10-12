@@ -40,6 +40,7 @@ interface StockNarrative {
   sec_business?: string
   sec_filing_date?: string
   sec_filing_url?: string
+  sec_form?: string
   market_focus?: string
   website?: string
   profile_quality?: string
@@ -640,11 +641,11 @@ watch(historyMode, (isDailyBoard) => { if (!isDailyBoard) fetchTrend() })
             <small v-if="narrative.products">产品线：{{ narrative.products }}</small>
           </section>
           <section v-if="narrative.sec_business && narrative.sec_business !== narrative.main_business" class="narrative-section">
-            <h3>SEC 年报业务说明 · 英文原文</h3>
+            <h3>SEC {{ narrative.sec_form || '年报' }} 业务说明 · 英文原文</h3>
             <p>{{ narrative.sec_business }}</p>
-            <small>摘自 10-K Item 1；原文不是自动翻译，也不代表最新经营变化。</small>
+            <small>摘自 {{ narrative.sec_form === '20-F' ? '20-F Item 4.B' : '10-K Item 1' }}；原文不是自动翻译，也不代表最新经营变化。</small>
           </section>
-          <p v-if="narrative.sec_filing_url" class="narrative-source">SEC 10-K 申报于 {{ narrative.sec_filing_date || '日期待核' }} · <a :href="narrative.sec_filing_url" target="_blank" rel="noopener noreferrer">核对原始申报 ↗</a></p>
+          <p v-if="narrative.sec_filing_url" class="narrative-source">SEC {{ narrative.sec_form }} 申报于 {{ narrative.sec_filing_date || '日期待核' }} · <a :href="narrative.sec_filing_url" target="_blank" rel="noopener noreferrer">核对原始申报 ↗</a></p>
           <section v-if="narrative.main_business && narrative.company_profile" class="narrative-section">
             <h3>公司简介补充</h3>
             <p>{{ narrative.company_profile }}</p>
