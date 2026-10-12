@@ -5,6 +5,7 @@ Profiles are historical reference material, not current filings or investment ad
 """
 import re
 import os
+from pathlib import Path
 from datetime import date
 
 import requests
@@ -93,6 +94,104 @@ def finnhub_company_identity(symbol):
         return {}
 
 
+def extract_sec_item1(html):
+    """Extract a bounded Item 1 excerpt, skipping the 10-K table of contents."""
+    import warnings
+    from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', XMLParsedAsHTMLWarning)
+        soup = BeautifulSoup(html, 'lxml')
+    for tag in soup.find_all(['script', 'style', 'ix:header']):
+        tag.decompose()
+    body = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))
+    heading = re.compile(r'\bitem\s*1\s*[.\-\s]*\s*business\b', re.I)
+    next_heading = re.compile(r'\bitem\s*1a\s*[.\-\s]*\s*risk\s+factors\b', re.I)
+    for match in heading.finditer(body):
+        tail = body[match.end():]
+        end = next_heading.search(tail)
+        # A contents entry leads almost immediately to Item 1A; real Item 1
+        # has a substantive section before the risk factors heading.
+        if end and end.start() < 800:
+            continue
+        section = tail[:min(end.start() if end else 12000, 12000)].strip(' .:-')
+        if len(section) < 500:
+            continue
+        excerpt = section[:1100].strip()
+        last_sentence = max(excerpt.rfind('. '), excerpt.rfind('。'))
+        if last_sentence >= 400:
+            excerpt = excerpt[:last_sentence + 1]
+        return excerpt
+    return ''
+
+
+def sec_business_info(ticker):
+    """Official 10-K business excerpt; exact ticker/CIK match and disk cache."""
+    ticker = str(ticker or '').upper().strip()
+    if not re.fullmatch(r'[A-Z][A-Z0-9.\-]{0,12}', ticker):
+        return {}
+    key = 'stock_sec_item1_v2:' + ticker
+    cached = get_cache(key)
+    if isinstance(cached, dict):
+        return cached
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parents[2] / '.env.sec', override=False)
+    user_agent = os.getenv('SEC_USER_AGENT', '').strip()
+    if not user_agent or '@' not in user_agent:
+        return {}
+    headers = {'User-Agent': user_agent, 'Accept-Encoding': 'gzip, deflate'}
+    try:
+        ticker_map = get_cache('sec_ticker_exchange_v1')
+        if not isinstance(ticker_map, dict):
+            response = requests.get('https://www.sec.gov/files/company_tickers_exchange.json',
+                                    headers=headers, timeout=8)
+            response.raise_for_status()
+            payload = response.json()
+            fields = payload['fields']
+            ticker_map = {}
+            for row in payload['data']:
+                item = dict(zip(fields, row))
+                ticker_map.setdefault(str(item['ticker']).upper(), set()).add(int(item['cik']))
+            set_cache('sec_ticker_exchange_v1', ticker_map, ttl=7 * 86400)
+        ciks = ticker_map.get(ticker, set())
+        if len(ciks) != 1:
+            set_cache(key, {}, ttl=86400)
+            return {}
+        cik = next(iter(ciks))
+        response = requests.get(f'https://data.sec.gov/submissions/CIK{cik:010d}.json',
+                                headers=headers, timeout=8)
+        response.raise_for_status()
+        submission = response.json()
+        if ticker not in [str(x).upper() for x in submission.get('tickers', [])]:
+            return {}
+        recent = submission['filings']['recent']
+        index = next((i for i, form in enumerate(recent['form']) if form == '10-K'), None)
+        if index is None:
+            set_cache(key, {}, ttl=86400)
+            return {}
+        accession = str(recent['accessionNumber'][index]).replace('-', '')
+        document = str(recent['primaryDocument'][index])
+        if not re.fullmatch(r'[A-Za-z0-9_.\-]+', document):
+            return {}
+        url = f'https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{document}'
+        response = requests.get(url, headers=headers, timeout=12)
+        response.raise_for_status()
+        if len(response.content) > 12_000_000:
+            return {}
+        excerpt = extract_sec_item1(response.content)
+        if not excerpt:
+            set_cache(key, {}, ttl=86400)
+            return {}
+        result = {'business': excerpt, 'filing_date': recent['filingDate'][index],
+                  'filing_url': url, 'form': '10-K',
+                  'industry': _clean(submission.get('sicDescription'), 100)}
+        set_cache(key, result, ttl=30 * 86400)
+        return result
+    except (requests.RequestException, ValueError, KeyError, TypeError, IndexError):
+        set_cache(key, {}, ttl=600)
+        return {}
+
+
 def _profile_symbol(session, market, symbol):
     candidates = [symbol]
     if market == "US" and "." not in symbol:
@@ -133,10 +232,25 @@ def get_stock_narrative(market, symbol):
                              profile.company_profile if profile else "")
         updated = profile.updated_at.date().isoformat() if profile and profile.updated_at else ""
 
-    external_identity = finnhub_company_identity(asset.symbol.split('.', 1)[-1]) if market == 'US' else {}
+    stale = False
+    if updated:
+        try:
+            stale = (date.today() - date.fromisoformat(updated)).days > 180
+        except ValueError:
+            stale = True
+
+    us_ticker = asset.symbol.split('.', 1)[-1] if market == 'US' else ''
+    external_identity = finnhub_company_identity(us_ticker) if market == 'US' else {}
+    sec_info = sec_business_info(us_ticker) if market == 'US' and (not business or len(business) < 180 or stale) else {}
+    local_business = bool(business)
+    if not business and sec_info.get('business'):
+        business = sec_info['business']
     # Resolve only on detail click, never on the Trend list request. The existing
     # resolver uses cached profile classifications and may consult external APIs.
     industry_source = "本地行业映射" if industry else ""
+    if not industry and sec_info.get('industry'):
+        industry = sec_info['industry']
+        industry_source = 'SEC SIC 行业分类'
     if not industry:
         try:
             from modules.monitor.industry_intel import resolve_industry_label
@@ -153,19 +267,17 @@ def get_stock_narrative(market, symbol):
         industry = external_identity['industry']
         industry_source = 'Finnhub 公司资料'
 
-    stale = False
-    if updated:
-        try:
-            stale = (date.today() - date.fromisoformat(updated)).days > 180
-        except ValueError:
-            stale = True
     return {
-        "market": market, "symbol": symbol, "name": asset.name, "available": bool(profile or external_identity),
+        "market": market, "symbol": symbol, "name": asset.name, "available": bool(profile or external_identity or sec_info),
         "industry": industry, "industry_source": industry_source,
         "main_business": business, "company_profile": intro, "products": products,
+        "business_source": "本地中文公司资料" if local_business else "SEC 10-K 英文原文" if sec_info else "",
         "website": external_identity.get('website', ''),
         "profile_quality": 'complete' if business and intro else 'partial' if business or intro or industry else 'missing',
         "growth_clue": growth, "profile_updated": updated, "profile_stale": stale,
-        "profile_source": "本地公司资料库（原始采集：AkShare）" if profile else "",
+        "profile_source": "本地公司资料库（原始采集：AkShare）" if profile else "SEC 10-K Item 1（英文原文）" if sec_info else "",
+        "sec_business": sec_info.get('business', ''),
+        "sec_filing_date": sec_info.get('filing_date', ''),
+        "sec_filing_url": sec_info.get('filing_url', ''),
         "market_focus": "暂无带来源和时间的近期公告/新闻证据；榜单涨幅或规则标签不能证明上涨原因。",
     }

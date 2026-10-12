@@ -36,6 +36,10 @@ interface StockNarrative {
   profile_updated?: string
   profile_stale?: boolean
   profile_source?: string
+  business_source?: string
+  sec_business?: string
+  sec_filing_date?: string
+  sec_filing_url?: string
   market_focus?: string
   website?: string
   profile_quality?: string
@@ -161,7 +165,7 @@ async function openNarrative(row: NarrativeTarget) {
   narrativeLoading.value = true
   try {
     const res = await api.get('/trend/narrative', {
-      params: { market: row.market, symbol: row.symbol }, timeout: 20000,
+      params: { market: row.market, symbol: row.symbol }, timeout: 45000,
     })
     const detail = res.data as StockNarrative
     narrativeCache.set(key, detail)
@@ -631,10 +635,16 @@ watch(historyMode, (isDailyBoard) => { if (!isDailyBoard) fetchTrend() })
             <small v-if="narrative.website"><a :href="narrative.website" target="_blank" rel="noopener noreferrer">公司网站 ↗</a>（Finnhub 收录，链接需自行核对）</small>
           </section>
           <section class="narrative-section">
-            <h3>主营业务</h3>
+            <h3>主营业务<span v-if="narrative.business_source"> · {{ narrative.business_source }}</span></h3>
             <p>{{ narrative.main_business || narrative.company_profile || '暂无可靠的主营业务描述，不能仅凭行业分类推断。' }}</p>
             <small v-if="narrative.products">产品线：{{ narrative.products }}</small>
           </section>
+          <section v-if="narrative.sec_business && narrative.sec_business !== narrative.main_business" class="narrative-section">
+            <h3>SEC 年报业务说明 · 英文原文</h3>
+            <p>{{ narrative.sec_business }}</p>
+            <small>摘自 10-K Item 1；原文不是自动翻译，也不代表最新经营变化。</small>
+          </section>
+          <p v-if="narrative.sec_filing_url" class="narrative-source">SEC 10-K 申报于 {{ narrative.sec_filing_date || '日期待核' }} · <a :href="narrative.sec_filing_url" target="_blank" rel="noopener noreferrer">核对原始申报 ↗</a></p>
           <section v-if="narrative.main_business && narrative.company_profile" class="narrative-section">
             <h3>公司简介补充</h3>
             <p>{{ narrative.company_profile }}</p>

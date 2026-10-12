@@ -1,9 +1,34 @@
 import unittest
+from unittest.mock import patch, Mock
 
-from modules.monitor.stock_narrative import growth_clue, profile_highlight, business_detail, _clean, _profile_symbol
+from modules.monitor.stock_narrative import growth_clue, profile_highlight, business_detail, _clean, _profile_symbol, extract_sec_item1, sec_business_info
 
 
 class StockNarrativeTest(unittest.TestCase):
+    def test_sec_fallback_rejects_ticker_cik_mismatch(self):
+        ticker_response = Mock()
+        ticker_response.json.return_value = {
+            'fields': ['cik', 'name', 'ticker', 'exchange'],
+            'data': [[123, 'Example', 'TEST', 'Nasdaq']],
+        }
+        submission_response = Mock()
+        submission_response.json.return_value = {'tickers': ['OTHER']}
+        with patch('modules.monitor.stock_narrative.get_cache', return_value=None), \
+             patch('modules.monitor.stock_narrative.set_cache'), \
+             patch('modules.monitor.stock_narrative.os.getenv', return_value='TradeDB contact@example.com'), \
+             patch('modules.monitor.stock_narrative.requests.get', side_effect=[ticker_response, submission_response]) as get:
+            self.assertEqual(sec_business_info('TEST'), {})
+            self.assertEqual(get.call_count, 2)
+
+    def test_sec_item1_skips_contents_and_stops_before_risk_factors(self):
+        html = ('<html><body>Item 1. Business 7 Item 1A. Risk Factors 20 '
+                'Item 1. Business Overview We operate communications towers. '
+                + 'We lease infrastructure to wireless carriers. ' * 25
+                + 'Item 1A. Risk Factors Losses may occur.</body></html>')
+        excerpt = extract_sec_item1(html)
+        self.assertIn('communications towers', excerpt)
+        self.assertNotIn('Risk Factors', excerpt)
+
     def test_us_bare_ticker_finds_nyse_profile(self):
         class AssetStub:
             market = 'US'
