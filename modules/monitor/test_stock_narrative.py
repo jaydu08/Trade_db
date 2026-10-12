@@ -1,6 +1,6 @@
 import unittest
 
-from modules.monitor.stock_narrative import growth_clue, profile_highlight, _clean
+from modules.monitor.stock_narrative import growth_clue, profile_highlight, business_detail, _clean
 
 
 class StockNarrativeTest(unittest.TestCase):
@@ -17,6 +17,12 @@ class StockNarrativeTest(unittest.TestCase):
         self.assertEqual(profile_highlight(text), '公司主要为企业客户提供网络安全产品与服务。')
         text = '公司是世界领先的科技公司。公司提供社交服务与电子游戏产品。还提供云计算业务和企业软件服务。'
         self.assertEqual(profile_highlight(text), '公司提供社交服务与电子游戏产品。还提供云计算业务和企业软件服务。')
+
+    def test_short_us_business_uses_existing_profile_detail_only(self):
+        intro = '公司成立于1975年。公司提供企业软件、云平台和网络安全服务。'
+        self.assertEqual(business_detail('US', '软件服务', intro),
+                         '软件服务；公司提供企业软件、云平台和网络安全服务。')
+        self.assertEqual(business_detail('CN', '软件服务', intro), '软件服务')
 
 
 if __name__ == '__main__':

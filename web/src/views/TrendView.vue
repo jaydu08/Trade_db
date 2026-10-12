@@ -2,6 +2,8 @@
 import { ref, onMounted, watch, computed } from 'vue'
 import { ElMessage } from 'element-plus'
 import api from '../api'
+import { useRoute } from 'vue-router'
+import HeatmapView from './HeatmapView.vue'
 
 interface CapitalSignalItem {
   label: string
@@ -35,6 +37,8 @@ interface StockNarrative {
   profile_stale?: boolean
   profile_source?: string
   market_focus?: string
+  website?: string
+  profile_quality?: string
 }
 
 interface StockEvidenceEvent {
@@ -99,6 +103,8 @@ interface TrendCacheEntry {
 const markets = ['CN', 'HK', 'US']
 const daysOptions = [3, 7, 14, 30, 60, 90, 180]
 const activeMode = ref<TrendMode>('hot')
+const route = useRoute()
+const historyMode = ref(route.query.view === 'history')
 const activeMarket = ref('CN')
 const activeDays = ref(7)
 const loading = ref(false)
@@ -487,6 +493,9 @@ onMounted(fetchTrend)
 
 <template>
   <div class="trend-view">
+    <div class="market-subnav"><button :class="{ active: !historyMode }" @click="historyMode = false">当前市场趋势</button><button :class="{ active: historyMode }" @click="historyMode = true">历史回看 · TG 日榜</button></div>
+    <HeatmapView v-if="historyMode" />
+    <template v-else>
     <div style="margin-bottom: 16px"><router-link to="/trend/crypto">◈ 加密 Trend · 现货 / 合约 / 链上 →</router-link></div>
     <div class="toolbar">
       <div class="mode-group">
@@ -610,15 +619,17 @@ onMounted(fetchTrend)
             <span>{{ narrative.market }} · {{ narrative.symbol }}</span>
             <span v-if="narrative.profile_updated">资料同步 {{ narrative.profile_updated }}</span>
             <span v-if="narrative.profile_stale" class="narrative-stale">资料超过 180 天</span>
+            <span v-if="narrative.profile_quality === 'partial'" class="narrative-stale">资料待补齐</span>
           </div>
           <section class="narrative-section">
             <h3>所属行业</h3>
             <p>{{ narrative.industry || '暂无可核实分类' }}</p>
             <small v-if="narrative.industry_source">{{ narrative.industry_source }}</small>
+            <small v-if="narrative.website"><a :href="narrative.website" target="_blank" rel="noopener noreferrer">公司网站 ↗</a>（Finnhub 收录，链接需自行核对）</small>
           </section>
           <section class="narrative-section">
             <h3>主营业务</h3>
-            <p>{{ narrative.main_business || narrative.company_profile || '暂无公司业务资料' }}</p>
+            <p>{{ narrative.main_business || narrative.company_profile || '暂无可靠的主营业务描述，不能仅凭行业分类推断。' }}</p>
             <small v-if="narrative.products">产品线：{{ narrative.products }}</small>
           </section>
           <section v-if="narrative.main_business && narrative.company_profile" class="narrative-section">
@@ -648,16 +659,20 @@ onMounted(fetchTrend)
             <p v-else-if="evidence" class="evidence-state">{{ evidence.status === 'unavailable' ? '来源暂时不可用，稍后再试。' : evidence.status === 'routine_only' ? '近期仅检索到例行披露，未见值得单列的事项标题。' : '本次未取得可核实的近期公告或新闻。' }}</p>
             <small v-if="narrativeRow?.catalyst_tags">榜单规则线索（未经新闻核实）：{{ narrativeRow.catalyst_tags }}</small>
           </section>
-          <p class="narrative-source">{{ narrative.profile_source }}<span v-if="narrative.profile_updated"> · {{ narrative.profile_updated }}</span>。同步日期不等于财报发布日期。</p>
+          <p class="narrative-source">{{ narrative.profile_source || 'Finnhub 公司身份资料' }}<span v-if="narrative.profile_updated"> · {{ narrative.profile_updated }}</span>。同步日期不等于财报发布日期；主营描述仅使用已有公司资料原文。</p>
         </template>
         <p v-else-if="narrative && !narrative.available" class="narrative-empty">该股票暂无本地公司档案；不会按同名公司拼接资料。</p>
       </div>
     </el-drawer>
+    </template>
   </div>
 </template>
 
 <style scoped>
 .trend-view { max-width: 1440px; }
+.market-subnav { display: flex; gap: 8px; margin-bottom: 16px; }
+.market-subnav button { border: 1px solid var(--border); background: white; border-radius: 6px; padding: 7px 12px; cursor: pointer; }
+.market-subnav button.active { color: white; background: #222b25; }
 .toolbar {
   display: flex;
   align-items: center;

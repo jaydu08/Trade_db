@@ -10,10 +10,9 @@ const auth = useAuthStore()
 const navItems = [
   { path: '/list', label: 'List', icon: '📋' },
   { path: '/holds', label: 'Holds', icon: '💼' },
-  { path: '/trend', label: 'Trend', icon: '📈' },
+  { path: '/trend', label: 'Market Trend', icon: '📈' },
   { path: '/trend/crypto', label: 'Crypto Trend', icon: '◈' },
-  { path: '/macro', label: 'Macro & Commodities', icon: '◉' },
-  { path: '/heatmap', label: 'Heatmap', icon: '🔥' },
+  { path: '/macro', label: '宏观商品', icon: '◉' },
 ]
 
 const pageTitle = computed(() => {

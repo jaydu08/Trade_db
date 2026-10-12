@@ -32,7 +32,7 @@ const routes = [
   {
     path: '/heatmap',
     name: 'Heatmap',
-    component: () => import('../views/HeatmapView.vue'),
+    redirect: '/trend?view=history',
     meta: { requiresAuth: true },
   },
   {

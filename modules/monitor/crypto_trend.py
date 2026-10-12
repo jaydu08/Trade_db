@@ -4,14 +4,50 @@ import os
 import re
 import sqlite3
 import time
+import threading
 from collections import Counter
 from datetime import datetime
+
+import requests
 
 DB_PATH = os.getenv('CRYPTO_TREND_DB', '/root/alpha_news/data/crypto_trend.sqlite')
 ALPHA_ROOT = os.getenv('ALPHA_NEWS_ROOT', '/root/alpha_news')
 PERIODS = {'12h': 12 * 3600, '24h': 86400, '3d': 3 * 86400, '7d': 7 * 86400, '30d': 30 * 86400}
 ONCHAIN_SORTS = {'period_change', 'price', 'volume_24h', 'liquidity', 'market_cap', 'fdv', 'age_hours', 'updated'}
 ONCHAIN_DISPLAY_LIMIT = 10
+ONCHAIN_MIN_LIQUIDITY = float(os.getenv('ONCHAIN_TREND_MIN_LIQUIDITY_USD', '50000'))
+ONCHAIN_MIN_VOLUME_24H = float(os.getenv('ONCHAIN_TREND_MIN_VOLUME_24H_USD', '50000'))
+_identity_lock = threading.Lock()
+_identity_cache = {'until': 0, 'addresses': {}}
+_PLATFORMS = {'ethereum': 'ethereum', 'bsc': 'binance-smart-chain',
+              'base': 'base', 'solana': 'solana'}
+
+
+def project_identities(now=None):
+    """CoinGecko's exact platform/address mapping; never infer identity from ticker."""
+    now = now or time.time()
+    if _identity_cache['until'] > now:
+        return _identity_cache['addresses']
+    with _identity_lock:
+        if _identity_cache['until'] > now:
+            return _identity_cache['addresses']
+        try:
+            response = requests.get('https://api.coingecko.com/api/v3/coins/list',
+                                    params={'include_platform': 'true'}, timeout=10)
+            response.raise_for_status()
+            mapping = {}
+            for coin in response.json():
+                coin_id = coin.get('id')
+                for chain, platform in _PLATFORMS.items():
+                    address = (coin.get('platforms') or {}).get(platform)
+                    if coin_id and address:
+                        key = chain + ':' + (address.lower() if address.startswith('0x') else address)
+                        mapping[key] = coin_id
+            _identity_cache.update(until=now + 12 * 3600, addresses=mapping)
+        except (requests.RequestException, ValueError, TypeError):
+            # Keep a prior verified map; failed refresh must not create ticker-based merges.
+            _identity_cache['until'] = now + 900
+        return _identity_cache['addresses']
 
 
 def read_json(path):
@@ -32,6 +68,20 @@ def period_return(db, item, seconds):
     if item['market'] == 'onchain' and seconds == 86400 and item.get('provider_change_24h') is not None:
         return item['provider_change_24h'], None, 'DexScreener 24h'
     return None, None, 'insufficient_history'
+
+
+def onchain_hourly_return(db, item, seconds, now):
+    """Stable previous-complete-hour comparison on the same pricing pool."""
+    asof = int(now // 3600) * 3600 - 3600
+    source = 'dex:' + item.get('pair', '')
+    def bar_at(target):
+        row = db.execute('SELECT ts,price FROM bars WHERE id=? AND source=? AND ts<=? '
+                         'ORDER BY ts DESC LIMIT 1', (item['id'], source, target)).fetchone()
+        return row if row and 0 <= target - row['ts'] <= 3600 and row['price'] > 0 else None
+    current, baseline = bar_at(asof), bar_at(asof - seconds)
+    if current and baseline:
+        return (current['price'] / baseline['price'] - 1) * 100, baseline['ts'], 'fixed_hour_history', asof
+    return None, None, 'insufficient_fixed_hour_history', asof
 
 
 def effective_security(payload, pair, now):
@@ -66,7 +116,7 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
     if market not in ('spot', 'futures', 'onchain'):
         raise ValueError('invalid market')
     allowed = ('24h', '3d', '7d', '30d') if market == 'onchain' else ('12h', '3d', '7d', '30d')
-    if (period not in allowed or risk not in ('pass', 'review', 'unknown', 'blocked', 'all')
+    if (period not in allowed or risk not in ('pass', 'needs_review', 'review', 'unknown', 'blocked', 'all')
             or sort_by not in ONCHAIN_SORTS or sort_dir not in ('asc', 'desc')):
         raise ValueError('invalid period or risk')
     now = time.time()
@@ -104,6 +154,10 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
             selected = set(selected)
             rows = [row for row in rows if json.loads(row['payload']).get('symbol') in selected]
         all_items = [json.loads(row['payload']) for row in rows]
+        identities = project_identities(now) if market == 'onchain' else {}
+        if market == 'onchain':
+            for item in all_items:
+                item['project_id'] = identities.get(item['id'], '')
         available_chains = sorted({item.get('chain') for item in all_items if item.get('chain')}) if market == 'onchain' else []
         benchmark = None
         if market != 'onchain':
@@ -121,6 +175,7 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
         inventory_counts = Counter()
         history_counts = Counter()
         counts = Counter()
+        quality_counts = Counter()
         items = []
         for row, item in zip(rows, all_items):
             security = effective_security(json.loads(row['security']) if row['security'] else None,
@@ -143,7 +198,11 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
             item['alert_note'] = '现货/合约共振告警' if market != 'onchain' and item['has_alert'] else ''
             if pushed_only and not item['has_alert']:
                 continue
-            value, baseline, source = period_return(db, item, PERIODS[period])
+            if market == 'onchain' and period == '24h':
+                value, baseline, source, snapshot_at = onchain_hourly_return(db, item, PERIODS[period], now)
+                item['snapshot_at'] = snapshot_at
+            else:
+                value, baseline, source = period_return(db, item, PERIODS[period])
             item.update(period_change=value, baseline_at=baseline, return_source=source,
                         stale=now - item['updated'] > 900, oi_change_percent=None,
                         relative_change_percent=(value - benchmark if value is not None and benchmark is not None else None))
@@ -167,17 +226,42 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
                 history_counts[security['status']] += 1
             if market == 'onchain' and not item['stale'] and value is not None and value > 0:
                 counts[security['status']] += 1
-            if market == 'onchain' and risk != 'all' and security['status'] != risk:
+                if (item.get('liquidity') or 0) >= ONCHAIN_MIN_LIQUIDITY and (item.get('volume_24h') or 0) >= ONCHAIN_MIN_VOLUME_24H:
+                    quality_counts[security['status']] += 1
+            if market == 'onchain' and risk not in ('all', 'needs_review') and security['status'] != risk:
+                continue
+            if market == 'onchain' and risk == 'needs_review' and security['status'] not in ('review', 'unknown'):
+                continue
+            if market == 'onchain' and risk == 'pass' and (
+                (item.get('liquidity') or 0) < ONCHAIN_MIN_LIQUIDITY or
+                (item.get('volume_24h') or 0) < ONCHAIN_MIN_VOLUME_24H
+            ):
                 continue
             if market == 'onchain':
                 if item['stale'] or value is None or value <= 0:
                     continue
             items.append(item)
         if market == 'onchain':
+            # Collapse only exact addresses mapped to one provider project ID.
+            # No symbol/name/website heuristic can establish cross-chain identity.
+            grouped = {}
+            for item in items:
+                group_key = 'project:' + item['project_id'] if item.get('project_id') else 'contract:' + item['id']
+                grouped.setdefault(group_key, []).append(item)
+            merged = []
+            for members in grouped.values():
+                primary = max(members, key=lambda x: (x.get('liquidity') or 0, x.get('volume_24h') or 0))
+                primary['linked_contracts'] = [
+                    {'chain': m['chain'], 'address': m['address'], 'status': m['security']['status'],
+                     'period_change': m['period_change'], 'liquidity': m.get('liquidity'),
+                     'pair': m.get('pair')} for m in members
+                ] if len(members) > 1 else []
+                merged.append(primary)
+            items = merged
             # Counts must represent the current period's eligible rising assets, not the
             # historical security inventory. Calculate all statuses even under a risk tab.
             status_order = {'pass': 0, 'review': 1, 'unknown': 2, 'blocked': 3}
-            items.sort(key=lambda x: (status_order[x['security']['status']] if risk == 'all' else 0,
+            items.sort(key=lambda x: (status_order[x['security']['status']] if risk in ('all', 'needs_review') else 0,
                                       x.get(sort_by) is None,
                                       -(x.get(sort_by) or 0) if sort_dir == 'desc' else x.get(sort_by) or 0,
                                       -x['period_change']))
@@ -198,6 +282,8 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
         return {'market': market, 'period': period, 'items': items, 'health': health,
                 'available_chains': available_chains,
                 'asof': now, 'counts': dict(counts), 'history_counts': dict(history_counts),
+                'quality_counts': dict(quality_counts),
+                'quality_thresholds': {'liquidity': ONCHAIN_MIN_LIQUIDITY, 'volume_24h': ONCHAIN_MIN_VOLUME_24H},
                 'inventory_counts': dict(inventory_counts), 'global_inventory_counts': dict(global_inventory_counts),
                 'matching_count': matching_count, 'display_limit': ONCHAIN_DISPLAY_LIMIT if market == 'onchain' and risk != 'pass' else None,
                 'risk': risk, 'chain': chain,

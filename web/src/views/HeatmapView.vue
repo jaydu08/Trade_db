@@ -176,8 +176,8 @@ watch(trendDays, fetchTrendPush)
       <section class="panel-card heatmap-panel">
         <div class="panel-head">
           <div>
-            <h2>Heatmap日榜</h2>
-            <p>{{ selectedDate || "-" }} · 实际TG日榜落库</p>
+            <h2>TG 已推送</h2>
+            <p>{{ selectedDate || "-" }} · 历史推送记录</p>
           </div>
           <span class="count-pill">{{ items.length }}只</span>
         </div>
@@ -216,8 +216,8 @@ watch(trendDays, fetchTrendPush)
       <section class="panel-card trend-panel">
         <div class="panel-head">
           <div>
-            <h2>Trend算法榜</h2>
-            <p>{{ selectedDate || "-" }} · {{ trendDays }}天窗口 · {{ quotaText }} · {{ trendQuotaRule }}</p>
+            <h2>历史算法对照</h2>
+            <p>{{ selectedDate || "-" }} · {{ trendDays }}天窗口 · {{ quotaText }} · {{ trendQuotaRule }} · 非当前主榜</p>
           </div>
           <span class="count-pill accent">{{ trendItems.length }}/{{ trendQuota }}</span>
         </div>

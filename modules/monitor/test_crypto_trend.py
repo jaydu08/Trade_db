@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 from modules.monitor import crypto_trend
-from modules.monitor.crypto_trend import period_return, effective_security, trading_pool_age_hours, english_dominant
+from modules.monitor.crypto_trend import period_return, onchain_hourly_return, effective_security, trading_pool_age_hours, english_dominant
 
 
 class TrendTest(unittest.TestCase):
@@ -28,6 +28,16 @@ class TrendTest(unittest.TestCase):
         item = {'id': 'bsc:X', 'market': 'onchain', 'pair': 'new', 'updated': 200000, 'price': 12}
         self.db.execute('INSERT INTO bars VALUES(?,?,?,?)', ('bsc:X', 200000-86400, 10, 'dex:old'))
         self.assertIsNone(period_return(self.db, item, 86400)[0])
+
+    def test_completed_hour_return_is_stable_and_uses_one_pool(self):
+        asof = 180000 // 3600 * 3600 - 3600
+        item = {'id': 'bsc:X', 'market': 'onchain', 'pair': 'a'}
+        self.db.executemany('INSERT INTO bars VALUES(?,?,?,?)', [
+            ('bsc:X', asof - 86400, 10, 'dex:a'), ('bsc:X', asof, 12, 'dex:a'),
+            ('bsc:X', asof + 10, 100, 'dex:a')])
+        self.assertAlmostEqual(onchain_hourly_return(self.db, item, 86400, asof + 3600)[0], 20)
+        item['pair'] = 'b'
+        self.assertIsNone(onchain_hourly_return(self.db, item, 86400, asof + 3600)[0])
 
     def test_stale_pass_or_changed_pool_becomes_unknown(self):
         payload = {'status': 'pass', 'expires_at': 100, 'pair': 'a'}
@@ -58,13 +68,16 @@ class TrendTest(unittest.TestCase):
                 asset_id = chain + ':token'
                 payload = {'id': asset_id, 'chain': chain, 'market': 'onchain', 'pair': 'pool',
                            'symbol': chain, 'name': chain, 'updated': now, 'price': 2,
-                           'provider_change_24h': 5}
+                           'provider_change_24h': 5, 'liquidity': 100000, 'volume_24h': 100000}
                 db.execute('INSERT INTO assets VALUES(?,?,?)', (asset_id, 'onchain', json.dumps(payload)))
                 security = {'status': status, 'pair': 'pool', 'expires_at': now + 3600}
                 db.execute('INSERT INTO security VALUES(?,?)', (asset_id, json.dumps(security)))
+                asof = int(now // 3600) * 3600 - 3600
+                db.execute('INSERT INTO bars VALUES(?,?,?,?)', (asset_id, asof - 86400, 1, 'dex:pool'))
+                db.execute('INSERT INTO bars VALUES(?,?,?,?)', (asset_id, asof, 2, 'dex:pool'))
             db.commit()
             db.close()
-            with patch.object(crypto_trend, 'DB_PATH', path), patch.object(crypto_trend, 'ALPHA_ROOT', folder):
+            with patch.object(crypto_trend, 'DB_PATH', path), patch.object(crypto_trend, 'ALPHA_ROOT', folder), patch.object(crypto_trend, 'project_identities', return_value={}):
                 result = crypto_trend.get_crypto_trend(market='onchain', period='24h', risk='pass')
             self.assertEqual(result['available_chains'], ['ethereum', 'robinhood', 'solana'])
             self.assertEqual([item['chain'] for item in result['items']], ['ethereum'])
@@ -83,14 +96,19 @@ class TrendTest(unittest.TestCase):
                 asset_id = chain + ':' + str(n)
                 payload = {'id': asset_id, 'chain': chain, 'market': 'onchain', 'pair': 'pool',
                            'symbol': str(n), 'name': str(n), 'updated': now, 'price': 2,
-                           'volume_24h': n * 100, 'provider_change_24h': n + 1}
+                           'volume_24h': n * 100 if n else 100000,
+                           'liquidity': 100000 if n == 0 else 0,
+                           'provider_change_24h': n + 1}
                 db.execute('INSERT INTO assets VALUES(?,?,?)', (asset_id, 'onchain', json.dumps(payload)))
                 if n == 0:
                     db.execute('INSERT INTO security VALUES(?,?)',
                                (asset_id, json.dumps({'status': 'pass', 'pair': 'pool', 'expires_at': now + 3600})))
+                asof = int(now // 3600) * 3600 - 3600
+                db.execute('INSERT INTO bars VALUES(?,?,?,?)', (asset_id, asof - 86400, 1, 'dex:pool'))
+                db.execute('INSERT INTO bars VALUES(?,?,?,?)', (asset_id, asof, 2, 'dex:pool'))
             db.commit()
             db.close()
-            with patch.object(crypto_trend, 'DB_PATH', path), patch.object(crypto_trend, 'ALPHA_ROOT', folder):
+            with patch.object(crypto_trend, 'DB_PATH', path), patch.object(crypto_trend, 'ALPHA_ROOT', folder), patch.object(crypto_trend, 'project_identities', return_value={}):
                 result = crypto_trend.get_crypto_trend(market='onchain', period='24h', risk='all')
                 solana = crypto_trend.get_crypto_trend(market='onchain', period='24h', risk='unknown',
                                                        chain='solana', sort_by='volume_24h', sort_dir='asc')
@@ -104,3 +122,31 @@ class TrendTest(unittest.TestCase):
             self.assertTrue(all(item['chain'] == 'solana' for item in solana['items']))
             self.assertEqual(solana['inventory_counts'].get('pass', 0), 0)
             self.assertEqual(solana['global_inventory_counts']['pass'], 1)
+
+    def test_only_exact_project_mapping_merges_cross_chain_contracts(self):
+        now = time.time()
+        asof = int(now // 3600) * 3600 - 3600
+        with tempfile.TemporaryDirectory() as folder:
+            path = folder + '/trend.sqlite'
+            db = sqlite3.connect(path)
+            db.execute('CREATE TABLE assets(id TEXT,market TEXT,payload TEXT)')
+            db.execute('CREATE TABLE security(id TEXT,payload TEXT)')
+            db.execute('CREATE TABLE health(component TEXT,payload TEXT,updated REAL)')
+            db.execute('CREATE TABLE bars(id TEXT,ts INTEGER,price REAL,source TEXT)')
+            for chain in ('ethereum', 'base', 'bsc'):
+                asset_id = chain + ':0xabc'
+                payload = {'id': asset_id, 'chain': chain, 'address': '0xabc', 'market': 'onchain',
+                           'pair': 'pool', 'symbol': 'SAME', 'name': 'Same', 'updated': now,
+                           'price': 2, 'liquidity': 100000, 'volume_24h': 100000}
+                db.execute('INSERT INTO assets VALUES(?,?,?)', (asset_id, 'onchain', json.dumps(payload)))
+                db.execute('INSERT INTO security VALUES(?,?)',
+                           (asset_id, json.dumps({'status': 'pass', 'pair': 'pool', 'expires_at': now + 3600})))
+                db.execute('INSERT INTO bars VALUES(?,?,?,?)', (asset_id, asof - 86400, 1, 'dex:pool'))
+                db.execute('INSERT INTO bars VALUES(?,?,?,?)', (asset_id, asof, 2, 'dex:pool'))
+            db.commit()
+            db.close()
+            mapping = {'ethereum:0xabc': 'real-project', 'base:0xabc': 'real-project'}
+            with patch.object(crypto_trend, 'DB_PATH', path), patch.object(crypto_trend, 'ALPHA_ROOT', folder), patch.object(crypto_trend, 'project_identities', return_value=mapping):
+                result = crypto_trend.get_crypto_trend(market='onchain', period='24h', risk='pass')
+            self.assertEqual(result['matching_count'], 2)
+            self.assertEqual(sorted(len(x['linked_contracts']) for x in result['items']), [0, 2])

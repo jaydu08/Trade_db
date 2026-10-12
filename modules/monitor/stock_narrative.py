@@ -4,11 +4,15 @@ This first version deliberately does not infer news catalysts from price action.
 Profiles are historical reference material, not current filings or investment advice.
 """
 import re
+import os
 from datetime import date
+
+import requests
 
 from sqlmodel import select
 
 from core.db import get_meta_session
+from core.cache import get_cache, set_cache
 from domain.meta import Asset, AssetProfile, AssetIndustryLink, Industry
 
 
@@ -46,6 +50,47 @@ def profile_highlight(text, main_business=""):
     return _clean(candidates[0], 260) if candidates else ""
 
 
+def business_detail(market, main_business, intro):
+    """Enrich terse US business labels with source text, without inventing products."""
+    business = _clean(main_business, 420)
+    if market != 'US':
+        return business
+    detail = profile_highlight(intro, business)
+    if not business:
+        return detail
+    if len(business) < 45 and detail and detail not in business and business not in detail:
+        return _clean(business.rstrip('。；;') + '；' + detail, 420)
+    return business
+
+
+def finnhub_company_identity(symbol):
+    """Supplement industry/site only; Finnhub profile2 has no business description."""
+    key = 'stock_identity_finnhub_v1:' + symbol
+    cached = get_cache(key)
+    if isinstance(cached, dict):
+        return cached
+    from dotenv import load_dotenv
+    load_dotenv()
+    token = os.getenv('FINNHUB_API_KEY', '').strip()
+    if not token:
+        return {}
+    try:
+        response = requests.get('https://finnhub.io/api/v1/stock/profile2',
+                                params={'symbol': symbol, 'token': token}, timeout=8)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or payload.get('ticker', '').upper() != symbol:
+            return {}
+        site = str(payload.get('weburl') or '').strip()
+        result = {'industry': _clean(payload.get('finnhubIndustry'), 100),
+                  'website': site[:300] if site.startswith('https://') else '',
+                  'company_name': _clean(payload.get('name'), 120)}
+        set_cache(key, result, ttl=86400)
+        return result
+    except (requests.RequestException, ValueError):
+        return {}
+
+
 def _profile_symbol(session, market, symbol):
     candidates = [symbol]
     if market == "US" and not symbol.startswith("105."):
@@ -76,13 +121,15 @@ def get_stock_narrative(market, symbol):
         industry_rows = sorted(industry_rows, key=lambda row: (bool(row[1]), int(row[2] or 0)), reverse=True)
         industry = str(industry_rows[0][0]) if industry_rows else ""
 
-        business = _clean(profile.main_business if profile else "", 420)
+        raw_business = _clean(profile.main_business if profile else "", 420)
+        business = business_detail(market, raw_business, profile.company_profile if profile else "")
         intro = profile_highlight(profile.company_profile if profile else "", business)
         products = _clean(profile.products if profile else "", 280)
         growth = growth_clue(profile.main_business if profile else "",
                              profile.company_profile if profile else "")
         updated = profile.updated_at.date().isoformat() if profile and profile.updated_at else ""
 
+    external_identity = finnhub_company_identity(symbol) if market == 'US' else {}
     # Resolve only on detail click, never on the Trend list request. The existing
     # resolver uses cached profile classifications and may consult external APIs.
     industry_source = "本地行业映射" if industry else ""
@@ -98,6 +145,9 @@ def get_stock_narrative(market, symbol):
                                        resolved.get("source"), "辅助分类")
         except Exception:
             pass
+    if not industry and external_identity.get('industry'):
+        industry = external_identity['industry']
+        industry_source = 'Finnhub 公司资料'
 
     stale = False
     if updated:
@@ -106,9 +156,11 @@ def get_stock_narrative(market, symbol):
         except ValueError:
             stale = True
     return {
-        "market": market, "symbol": symbol, "name": asset.name, "available": bool(profile),
+        "market": market, "symbol": symbol, "name": asset.name, "available": bool(profile or external_identity),
         "industry": industry, "industry_source": industry_source,
         "main_business": business, "company_profile": intro, "products": products,
+        "website": external_identity.get('website', ''),
+        "profile_quality": 'complete' if business and intro else 'partial' if business or intro or industry else 'missing',
         "growth_clue": growth, "profile_updated": updated, "profile_stale": stale,
         "profile_source": "本地公司资料库（原始采集：AkShare）" if profile else "",
         "market_focus": "暂无带来源和时间的近期公告/新闻证据；榜单涨幅或规则标签不能证明上涨原因。",
