@@ -50,7 +50,10 @@ class MacroDashboardTest(unittest.TestCase):
         old.return_value = {'macro': [{'id': 'DGS10'}], 'macro_checked_at': 10}
         fred.side_effect = RuntimeError('upstream unavailable')
         futures.return_value = [{'id': 'CL'}]
-        with tempfile.TemporaryDirectory() as folder, patch.object(module, 'SNAPSHOT_PATH', folder + '/snapshot.json'):
+        with tempfile.TemporaryDirectory() as folder, patch.object(module, 'SNAPSHOT_PATH', folder + '/snapshot.json'), \
+                patch('modules.monitor.market_activity.fetch_binance', return_value={'value': 1, 'pairs': 1}), \
+                patch('modules.monitor.market_activity.fetch_dex', return_value={'value': 1}), \
+                patch('modules.monitor.market_activity.fetch_sentiment', return_value={'value': 50}):
             result = refresh_snapshot(force=True, now=20)
         self.assertEqual(result['macro'], [{'id': 'DGS10'}])
         self.assertEqual(result['futures'], [{'id': 'CL'}])

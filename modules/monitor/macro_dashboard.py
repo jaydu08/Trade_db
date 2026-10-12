@@ -144,6 +144,22 @@ def refresh_snapshot(force=False, now=None):
         except Exception as exc:
             errors[key] = str(exc)[:180]
             LOG.warning('Macro dashboard %s refresh failed: %s', key, exc)
+    from modules.monitor.market_activity import (fetch_binance, fetch_dex,
+                                                  fetch_sentiment, update_crypto_history)
+    activity = snapshot.setdefault('crypto_activity', {})
+    for key, ttl, fetcher in [('spot', 3600, lambda: fetch_binance(False)),
+                              ('perp', 3600, lambda: fetch_binance(True)),
+                              ('dex', 1800, fetch_dex),
+                              ('sentiment', 6 * 3600, fetch_sentiment)]:
+        old = activity.get(key, {})
+        if not force and old and now - old.get('checked_at', 0) < ttl:
+            continue
+        try:
+            activity[key] = {**fetcher(), 'checked_at': now}
+        except Exception as exc:
+            errors['crypto_' + key] = str(exc)[:180]
+            LOG.warning('Crypto activity %s refresh failed: %s', key, exc)
+    update_crypto_history(snapshot, now)
     snapshot['errors'] = errors
     snapshot['refreshed_at'] = now
     os.makedirs(os.path.dirname(SNAPSHOT_PATH), exist_ok=True)
@@ -190,12 +206,14 @@ def commodity_movers():
 
 def get_dashboard():
     snapshot = read_snapshot()
+    from modules.monitor.market_activity import stock_dashboard, crypto_dashboard
     try:
         movers, mover_date = commodity_movers()
     except Exception:
         LOG.exception('Commodity movers unavailable')
         movers, mover_date = [], None
     return {'macro': snapshot.get('macro', []), 'futures': snapshot.get('futures', []),
+            'stock_activity': stock_dashboard(), 'crypto_activity': crypto_dashboard(snapshot),
             'macro_checked_at': snapshot.get('macro_checked_at'),
             'futures_checked_at': snapshot.get('futures_checked_at'),
             'errors': snapshot.get('errors', {}), 'movers': movers,

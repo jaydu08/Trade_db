@@ -1405,6 +1405,13 @@ class MarketHeatMap:
         elif market == 'HK':
             push_n = _push_limit(7)
 
+        if market in {'CN', 'HK'}:
+            try:
+                from modules.monitor.market_activity import record_stock_turnover
+                record_stock_turnover(market, df)
+            except Exception as exc:
+                logger.warning('Market activity turnover recording failed for %s: %s', market, exc)
+
         persist_stocks = self._generate_heatmap(df, market, top_n=persist_n, min_amount=min_amt)
         if market == "US":
             top_stocks = self._cap_us_leveraged_ranked(persist_stocks, push_n)
