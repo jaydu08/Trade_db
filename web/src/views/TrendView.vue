@@ -104,7 +104,7 @@ const markets = ['CN', 'HK', 'US']
 const daysOptions = [3, 7, 14, 30, 60, 90, 180]
 const activeMode = ref<TrendMode>('hot')
 const route = useRoute()
-const historyMode = ref(route.query.view === 'history')
+const historyMode = ref(route.query.view !== 'trend')
 const activeMarket = ref('CN')
 const activeDays = ref(7)
 const loading = ref(false)
@@ -115,7 +115,8 @@ const CACHE_TTL_MS = 5 * 60 * 1000
 const narrativeVisible = ref(false)
 const narrativeLoading = ref(false)
 const narrativeError = ref('')
-const narrativeRow = ref<TrendItem | null>(null)
+type NarrativeTarget = Pick<TrendItem, 'symbol' | 'name' | 'market' | 'catalyst_tags'>
+const narrativeRow = ref<NarrativeTarget | null>(null)
 const narrative = ref<StockNarrative | null>(null)
 const narrativeCache = new Map<string, StockNarrative>()
 const evidenceCache = new Map<string, StockEvidence>()
@@ -123,7 +124,7 @@ const evidence = ref<StockEvidence | null>(null)
 const evidenceLoading = ref(false)
 let narrativeRequestId = 0
 
-async function loadEvidence(row: TrendItem, key: string, requestId: number) {
+async function loadEvidence(row: NarrativeTarget, key: string, requestId: number) {
   const cached = evidenceCache.get(key)
   evidence.value = cached || null
   evidenceLoading.value = !cached
@@ -144,7 +145,7 @@ async function loadEvidence(row: TrendItem, key: string, requestId: number) {
   }
 }
 
-async function openNarrative(row: TrendItem) {
+async function openNarrative(row: NarrativeTarget) {
   narrativeRow.value = row
   narrativeVisible.value = true
   narrativeError.value = ''
@@ -488,13 +489,14 @@ function handleSortChange(payload: any) {
   currentPage.value = 1
 }
 
-onMounted(fetchTrend)
+onMounted(() => { if (!historyMode.value) fetchTrend() })
+watch(historyMode, (isDailyBoard) => { if (!isDailyBoard) fetchTrend() })
 </script>
 
 <template>
   <div class="trend-view">
-    <div class="market-subnav"><button :class="{ active: !historyMode }" @click="historyMode = false">当前市场趋势</button><button :class="{ active: historyMode }" @click="historyMode = true">历史回看 · TG 日榜</button></div>
-    <HeatmapView v-if="historyMode" />
+    <div class="market-subnav"><button :class="{ active: historyMode }" @click="historyMode = true">TG 当日强势榜</button><button :class="{ active: !historyMode }" @click="historyMode = false">多周期市场趋势</button></div>
+    <HeatmapView v-if="historyMode" @select-stock="openNarrative" />
     <template v-else>
     <div style="margin-bottom: 16px"><router-link to="/trend/crypto">◈ 加密 Trend · 现货 / 合约 / 链上 →</router-link></div>
     <div class="toolbar">
@@ -610,6 +612,7 @@ onMounted(fetchTrend)
       />
     </div>
 
+    </template>
     <el-drawer v-model="narrativeVisible" :title="`${narrativeRow?.name || narrativeRow?.symbol || '公司'} · 公司脉络`" size="min(520px, 100vw)">
       <div v-loading="narrativeLoading" class="narrative-panel">
         <p class="narrative-note">公司资料与行情榜分开更新；行业可能为规则推断。以下不是投资建议，也不把涨幅当作新闻催化。</p>
@@ -664,7 +667,6 @@ onMounted(fetchTrend)
         <p v-else-if="narrative && !narrative.available" class="narrative-empty">该股票暂无本地公司档案；不会按同名公司拼接资料。</p>
       </div>
     </el-drawer>
-    </template>
   </div>
 </template>
 

@@ -30,6 +30,9 @@ const trendItems = ref<HeatmapItem[]>([])
 const trendDays = ref(1)
 const loading = ref(false)
 const trendLoading = ref(false)
+const showComparison = ref(false)
+const emit = defineEmits<{ (e: 'select-stock', row: { symbol: string; name: string; market: string; catalyst_tags: string }): void }>()
+let calendarRequestId = 0
 
 const trendQuota = computed(() => activeMarket.value === "HK" ? 7 : 10)
 const quotaText = computed(() => activeMarket.value === "HK" ? "Top7" : "Top10")
@@ -41,12 +44,14 @@ const trendQuotaRule = computed(() => {
 
 async function fetchTradingDays(month?: string) {
   const m = month || new Date().toISOString().slice(0, 7)
+  const requestId = ++calendarRequestId
   try {
-    const res = await api.get("/trading-days", { params: { month: m } })
+    const res = await api.get("/trading-days", { params: { month: m, market: activeMarket.value } })
+    if (requestId !== calendarRequestId) return
     tradingDays.value = res.data.days || []
-    if (!selectedDate.value && tradingDays.value.length) {
-      selectedDate.value = tradingDays.value[tradingDays.value.length - 1]
-    }
+    selectedDate.value = tradingDays.value[tradingDays.value.length - 1] || ''
+    items.value = []
+    await fetchHeatmap()
   } catch {}
 }
 
@@ -84,7 +89,7 @@ async function fetchTrendPush() {
 
 function fetchBoth() {
   fetchHeatmap()
-  fetchTrendPush()
+  if (showComparison.value) fetchTrendPush()
 }
 
 function isDisabledDate(date: Date) {
@@ -122,7 +127,9 @@ function formatDate(v?: string) {
 }
 
 function rowTags(row: HeatmapItem) {
-  return row.catalyst_tags || row.industry_label || "-"
+  const tag = (row.catalyst_tags || '').trim()
+  if (tag && !['LLM不可用', '搜索无结果'].includes(tag)) return tag
+  return row.industry_label || '暂无已核实催化'
 }
 
 function handleDateChange(val: string) {
@@ -130,13 +137,11 @@ function handleDateChange(val: string) {
   fetchBoth()
 }
 
-onMounted(async () => {
-  await fetchTradingDays()
-  fetchBoth()
-})
+onMounted(() => fetchTradingDays())
 
-watch(activeMarket, fetchBoth)
-watch(trendDays, fetchTrendPush)
+watch(activeMarket, () => fetchTradingDays())
+watch(trendDays, () => { if (showComparison.value) fetchTrendPush() })
+watch(showComparison, (visible) => { if (visible) fetchTrendPush() })
 </script>
 
 <template>
@@ -160,7 +165,9 @@ watch(trendDays, fetchTrendPush)
         @update:model-value="handleDateChange"
         style="width: 150px"
       />
-      <div class="days-group">
+      <span class="board-hint">与股票 TG 实际推送同步 · 默认各市场最近交易日</span>
+      <button class="compare-toggle" @click="showComparison = !showComparison">{{ showComparison ? '收起算法对照' : '查看旧算法对照' }}</button>
+      <div v-if="showComparison" class="days-group">
         <span class="days-label">Trend窗口</span>
         <button
           v-for="d in trendWindows"
@@ -172,12 +179,12 @@ watch(trendDays, fetchTrendPush)
       </div>
     </div>
 
-    <div class="compare-grid">
+    <div class="compare-grid" :class="{ 'single-board': !showComparison }">
       <section class="panel-card heatmap-panel">
         <div class="panel-head">
           <div>
-            <h2>TG 已推送</h2>
-            <p>{{ selectedDate || "-" }} · 历史推送记录</p>
+            <h2>TG 当日强势榜</h2>
+            <p>{{ selectedDate || "-" }} · 已推送标的，可切换交易日回看</p>
           </div>
           <span class="count-pill">{{ items.length }}只</span>
         </div>
@@ -191,6 +198,14 @@ watch(trendDays, fetchTrendPush)
                 <span class="name">{{ row.name }}</span>
               </div>
             </template>
+          </el-table-column>
+          <el-table-column label="公司" width="76">
+            <template #default="{ row }">
+              <button class="profile-link" @click="emit('select-stock', { symbol: row.raw_symbol || row.symbol, name: row.name, market: activeMarket, catalyst_tags: rowTags(row) === '暂无已核实催化' ? '' : rowTags(row) })">了解 ↗</button>
+            </template>
+          </el-table-column>
+          <el-table-column label="现价" width="88" align="right">
+            <template #default="{ row }">{{ row.close ? Number(row.close).toFixed(2) : '-' }}</template>
           </el-table-column>
           <el-table-column label="涨幅" width="78" align="right">
             <template #default="{ row }">
@@ -213,7 +228,7 @@ watch(trendDays, fetchTrendPush)
         </el-table>
       </section>
 
-      <section class="panel-card trend-panel">
+      <section v-if="showComparison" class="panel-card trend-panel">
         <div class="panel-head">
           <div>
             <h2>历史算法对照</h2>
@@ -301,6 +316,9 @@ watch(trendDays, fetchTrendPush)
   gap: 16px;
   align-items: start;
 }
+.compare-grid.single-board { grid-template-columns: minmax(0, 1fr); }
+.board-hint { color: var(--text-secondary); font-size: 12px; }
+.compare-toggle, .profile-link { color: var(--el-color-primary); cursor: pointer; font-size: 12px; }
 .panel-card {
   min-width: 0;
   padding: 14px;

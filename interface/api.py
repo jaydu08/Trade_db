@@ -2792,7 +2792,7 @@ def _enrich_heatmap_market_cap(items: list, market: str):
 
 # --------------- Routes: Trading Days ---------------
 @app.get("/api/trading-days")
-def get_trading_days(month: str = Query(default=""), user: UserContext = Depends(get_current_user)):
+def get_trading_days(month: str = Query(default=""), market: str = Query(default=""), user: UserContext = Depends(get_current_user)):
     """Return list of dates that have heatmap data for the given month."""
     from core.db import db_manager
     from domain.ledger.analytics import TrendDailyBar
@@ -2809,6 +2809,10 @@ def get_trading_days(month: str = Query(default=""), user: UserContext = Depends
     else:
         end = dt.date(year, mon + 1, 1)
 
+    market = market.upper().strip()
+    if market and market not in {"CN", "HK", "US"}:
+        raise HTTPException(status_code=400, detail="Invalid market")
+
     with Session(db_manager.ledger_engine) as session:
         stmt = (
             select(TrendDailyBar.date)
@@ -2817,9 +2821,11 @@ def get_trading_days(month: str = Query(default=""), user: UserContext = Depends
             .where(TrendDailyBar.source == "heatmap")
             .distinct()
         )
+        if market:
+            stmt = stmt.where(TrendDailyBar.market == market)
         dates = session.exec(stmt).all()
 
-    return {"month": month, "days": sorted(set(str(d) for d in dates))}
+    return {"month": month, "market": market, "days": sorted(set(str(d) for d in dates))}
 
 # --------------- Crypto Trend (shared alpha_news evidence) ---------------
 @app.get('/api/crypto/trend')

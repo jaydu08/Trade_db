@@ -23,6 +23,8 @@ BOILERPLATE_WORDS = re.compile(r"成立于|注册资本|营业执照|工商行�
 
 def _clean(value, limit=360):
     text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if text.lower() in {"nan", "none", "null"}:
+        return ""
     return text[:limit].rstrip("，、；; ")
 
 
@@ -55,7 +57,7 @@ def business_detail(market, main_business, intro):
     business = _clean(main_business, 420)
     if market != 'US':
         return business
-    detail = profile_highlight(intro, business)
+    detail = profile_highlight(intro, "")
     if not business:
         return detail
     if len(business) < 45 and detail and detail not in business and business not in detail:
@@ -93,8 +95,10 @@ def finnhub_company_identity(symbol):
 
 def _profile_symbol(session, market, symbol):
     candidates = [symbol]
-    if market == "US" and not symbol.startswith("105."):
-        candidates.append("105." + symbol)
+    if market == "US" and "." not in symbol:
+        # Eastmoney uses 105 (Nasdaq), 106 (NYSE) and 107 (other US listings).
+        # Trend and TG bars can carry either the full code or the bare ticker.
+        candidates.extend(f"{prefix}.{symbol}" for prefix in ("105", "106", "107"))
     for candidate in candidates:
         asset = session.get(Asset, candidate)
         if asset and asset.market == market and asset.asset_type == "STOCK":
@@ -123,13 +127,13 @@ def get_stock_narrative(market, symbol):
 
         raw_business = _clean(profile.main_business if profile else "", 420)
         business = business_detail(market, raw_business, profile.company_profile if profile else "")
-        intro = profile_highlight(profile.company_profile if profile else "", business)
+        intro = profile_highlight(profile.company_profile if profile else "", "" if market == "US" else business)
         products = _clean(profile.products if profile else "", 280)
         growth = growth_clue(profile.main_business if profile else "",
                              profile.company_profile if profile else "")
         updated = profile.updated_at.date().isoformat() if profile and profile.updated_at else ""
 
-    external_identity = finnhub_company_identity(symbol) if market == 'US' else {}
+    external_identity = finnhub_company_identity(asset.symbol.split('.', 1)[-1]) if market == 'US' else {}
     # Resolve only on detail click, never on the Trend list request. The existing
     # resolver uses cached profile classifications and may consult external APIs.
     industry_source = "本地行业映射" if industry else ""

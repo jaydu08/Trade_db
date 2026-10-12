@@ -1,15 +1,27 @@
 import unittest
 
-from modules.monitor.stock_narrative import growth_clue, profile_highlight, business_detail, _clean
+from modules.monitor.stock_narrative import growth_clue, profile_highlight, business_detail, _clean, _profile_symbol
 
 
 class StockNarrativeTest(unittest.TestCase):
+    def test_us_bare_ticker_finds_nyse_profile(self):
+        class AssetStub:
+            market = 'US'
+            asset_type = 'STOCK'
+
+        class SessionStub:
+            def get(self, _, symbol):
+                return AssetStub() if symbol == '106.CCI' else None
+
+        self.assertIsNotNone(_profile_symbol(SessionStub(), 'US', 'CCI'))
+
     def test_growth_only_quotes_explicit_direction(self):
         self.assertEqual(growth_clue('公司销售手机和电脑。'), '')
         self.assertEqual(growth_clue('公司销售手机和电脑。未来将拓展海外市场。'), '未来将拓展海外市场。')
 
     def test_profile_text_is_bounded_and_whitespace_normalized(self):
         self.assertEqual(_clean('  手机\n 电脑  ', 20), '手机 电脑')
+        self.assertEqual(_clean('nan'), '')
         self.assertEqual(len(_clean('a' * 500, 120)), 120)
 
     def test_profile_highlight_skips_founding_boilerplate(self):
