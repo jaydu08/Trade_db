@@ -111,7 +111,7 @@ def build_commodity_trends(bars, latest, windows=(3, 7, 30)):
         changes = calendar_changes(points, windows)
         for days in windows:
             change = changes.get(str(days) + 'd')
-            if change is None:
+            if change is None or change <= 0:
                 continue
             result[str(days) + 'd'].append({'symbol': symbol, 'name': current.name,
                 'category': CommodityScanner._determine_category(current.name),

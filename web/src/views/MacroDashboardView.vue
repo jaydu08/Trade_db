@@ -144,7 +144,7 @@ function sentimentName(value: number): string {
       <tr v-for="r in commodityTrendRows" :key="r.symbol"><td><strong>{{ r.name }}</strong></td><td>{{ r.category }}</td><td>{{ r.symbol }}</td><td>{{ number(r.price, 3) }}</td><td :class="Number(r.change_pct) >= 0 ? 'up' : 'down'">{{ signed(r.change_pct) }}%</td><td>{{ r.date }}</td></tr>
       <tr v-if="!commodityTrendRows.length"><td colspan="6" class="empty-row">本周期历史不足或日线尚未更新。</td></tr>
     </tbody></table></div>
-    <p class="source-note">最多展示涨幅前 20 个主力合约，包含跌幅时如实显示；按日历天比较已存日线收盘，换月可能导致不连续，不能当作可直接交易的连续合约收益。</p>
+    <p class="source-note">只展示上涨的主力合约，最多显示前 20 个；按日历天比较已存日线收盘，换月可能导致不连续，不能当作可直接交易的连续合约收益。</p>
     <p v-if="Object.keys(payload.errors || {}).length" class="error">上游本轮更新失败：{{ Object.keys(payload.errors).join('、') }}。页面保留上次成功快照，请核对各项时间。</p>
   </section>
 </template>

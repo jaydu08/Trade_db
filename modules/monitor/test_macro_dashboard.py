@@ -58,6 +58,14 @@ class MacroDashboardTest(unittest.TestCase):
                 SimpleNamespace(symbol='AU0', name='黄金', date=d, close=880, source='commodity')]
         self.assertEqual(build_commodity_trends(bars, d)['7d'][0]['change_pct'], 10.0)
 
+    def test_commodity_trend_excludes_falling_contracts(self):
+        import datetime
+        from types import SimpleNamespace
+        d = datetime.date(2026, 10, 12)
+        bars = [SimpleNamespace(symbol='CU0', name='沪铜', date=d - datetime.timedelta(days=7), close=100, source='commodity'),
+                SimpleNamespace(symbol='CU0', name='沪铜', date=d, close=90, source='commodity')]
+        self.assertEqual(build_commodity_trends(bars, d)['7d'], [])
+
     @patch('modules.monitor.macro_dashboard.read_snapshot')
     @patch('modules.monitor.macro_dashboard.fetch_fred')
     @patch('modules.monitor.macro_dashboard.fetch_futures')
