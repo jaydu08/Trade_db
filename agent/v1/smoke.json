@@ -1,1 +1,1 @@
-{"schema_version":"1.0","service":"trend-market-agent","test_type":"connectivity","message":"trend-agent-link-ok","generated_at":"2026-10-13T20:52:42+08:00","status":"ok","markets":["CN","HK","US","CRYPTO","MACRO"]}
+{"schema_version":"1.0","service":"trend-market-agent","test_type":"connectivity","message":"trend-agent-link-ok","generated_at":"2026-10-13T21:02:28+08:00","status":"ok","markets":["CN","HK","US","CRYPTO","MACRO"]}
