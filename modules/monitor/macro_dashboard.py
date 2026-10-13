@@ -7,7 +7,8 @@ import math
 import os
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlencode
 from urllib.request import urlopen
 from zoneinfo import ZoneInfo
@@ -31,6 +32,109 @@ FUTURES = {
     'SI': ('COMEX白银', 'COMEX 白银', '美元/盎司', '贵金属'),
     'HG': ('COMEX铜', 'COMEX 铜', '美分/磅', '工业金属'),
 }
+GLOBAL_ASSETS = {
+    'SOX': ('费城半导体', '美股板块', '指数', 'https://www.nasdaq.com/market-activity/index/sox'),
+    'XBI': ('美国生物科技', '美股板块', 'ETF 代理', 'https://www.ssga.com/us/en/individual/etfs/state-street-spdr-sp-biotech-etf-xbi'),
+    'IBB': ('美国生物医药', '美股板块', 'ETF 代理', 'https://www.ishares.com/us/products/239699/ishares-biotechnology-etf'),
+    'EEM': ('新兴市场', '全球区域', 'ETF 代理', 'https://www.ishares.com/us/products/239637/ishares-msci-emerging-markets-etf'),
+    'VNM': ('越南', '全球区域', 'ETF 代理', 'https://www.vaneck.com/us/en/investments/vietnam-etf-vnm/'),
+    'EWZ': ('巴西', '全球区域', 'ETF 代理', 'https://www.ishares.com/us/products/239612/ishares-msci-brazil-capped-etf'),
+    'INDA': ('印度', '全球区域', 'ETF 代理', 'https://www.ishares.com/us/products/239659/ishares-msci-india-etf'),
+    'EWJ': ('日本', '全球区域', 'ETF 代理', 'https://www.ishares.com/us/products/239665/ishares-msci-japan-etf'),
+    'KWEB': ('中国互联网', '全球区域', 'ETF 代理', 'https://kraneshares.com/etf/kweb/'),
+    'XLE': ('美国能源股', '美股板块', 'ETF 代理', 'https://www.ssga.com/us/en/individual/etfs/state-street-energy-select-sector-spdr-etf-xle'),
+}
+
+
+def calendar_changes(points, windows=(3, 7, 30)):
+    """Nearest earlier daily close to each calendar-day anchor; no forward fill."""
+    if not points:
+        return {}
+    ordered = sorted((day, finite(price)) for day, price in points)
+    ordered = [(day, price) for day, price in ordered if price is not None and price > 0]
+    if not ordered:
+        return {}
+    asof, latest = ordered[-1]
+    result = {}
+    for days in windows:
+        target = asof - timedelta(days=days)
+        past = next(((day, value) for day, value in reversed(ordered[:-1]) if day <= target), None)
+        result[str(days) + 'd'] = round((latest / past[1] - 1) * 100, 2) if past and (target - past[0]).days <= 5 else None
+    return result
+
+
+def fetch_global_assets():
+    """Third-party daily closes, not live prices or licensed index feeds."""
+    import akshare as ak
+    def one(entry):
+        symbol, (name, group, kind, url) = entry
+        try:
+            frame = ak.index_us_stock_sina('.SOX') if symbol == 'SOX' else ak.stock_us_daily(symbol)
+            if frame is None or frame.empty:
+                return None
+            points = [(value.date() if hasattr(value, 'date') else value, close)
+                      for value, close in zip(frame['date'], frame['close'])]
+            points = [(value, finite(close)) for value, close in points if value]
+            points = [(day, close) for day, close in points if close is not None and close > 0]
+            if len(points) < 20:
+                return None
+            day, price = points[-1]
+            return {'id': symbol, 'name': name, 'group': group, 'kind': kind,
+                    'value': price, 'asof': day.isoformat(), 'changes': calendar_changes(points),
+                    'source': '新浪美股日线 / AkShare', 'url': url}
+        except Exception as exc:
+            LOG.warning('Global asset %s unavailable: %s', symbol, exc)
+            return None
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        result = [row for row in pool.map(one, GLOBAL_ASSETS.items()) if row]
+    if len(result) < 6:
+        raise ValueError('too few global index / ETF daily series')
+    return result
+
+
+def build_commodity_trends(bars, latest, windows=(3, 7, 30)):
+    grouped = {}
+    for bar in bars:
+        if finite(bar.close) is None or bar.close <= 0:
+            continue
+        by_day = grouped.setdefault(bar.symbol, {})
+        prior = by_day.get(bar.date)
+        if prior is None or (bar.source == 'commodity' and prior.source != 'commodity'):
+            by_day[bar.date] = bar
+    result = {str(days) + 'd': [] for days in windows}
+    from modules.monitor.commodity_scanner import CommodityScanner
+    for symbol, by_day in grouped.items():
+        points = sorted((day, row.close) for day, row in by_day.items())
+        if not points or (latest - points[-1][0]).days > 5:
+            continue
+        current = by_day[points[-1][0]]
+        changes = calendar_changes(points, windows)
+        for days in windows:
+            change = changes.get(str(days) + 'd')
+            if change is None:
+                continue
+            result[str(days) + 'd'].append({'symbol': symbol, 'name': current.name,
+                'category': CommodityScanner._determine_category(current.name),
+                'price': current.close, 'change_pct': change, 'date': str(current.date),
+                'source': current.source})
+    for rows in result.values():
+        rows.sort(key=lambda row: row['change_pct'], reverse=True)
+    return result
+
+
+def commodity_trends():
+    from sqlmodel import select
+    from core.db import get_ledger_session
+    from domain.ledger.analytics import TrendDailyBar
+    with get_ledger_session() as session:
+        latest = session.exec(select(TrendDailyBar.date).where(TrendDailyBar.market == 'CF')
+                              .order_by(TrendDailyBar.date.desc()).limit(1)).first()
+        if not latest:
+            return {}, None
+        bars = session.exec(select(TrendDailyBar).where(TrendDailyBar.market == 'CF')
+                            .where(TrendDailyBar.date >= latest - timedelta(days=40))
+                            .where(TrendDailyBar.date <= latest)).all()
+    return build_commodity_trends(bars, latest), str(latest)
 
 
 def finite(value):
@@ -135,7 +239,8 @@ def refresh_snapshot(force=False, now=None):
     snapshot = read_snapshot()
     errors = {}
     for key, ttl, fetcher in [('macro', 6 * 3600, fetch_fred),
-                              ('futures', 15 * 60, fetch_futures)]:
+                              ('futures', 15 * 60, fetch_futures),
+                              ('global_assets', 6 * 3600, fetch_global_assets)]:
         if not force and snapshot.get(key) and now - snapshot.get(key + '_checked_at', 0) < ttl:
             continue
         try:
@@ -212,7 +317,15 @@ def get_dashboard():
     except Exception:
         LOG.exception('Commodity movers unavailable')
         movers, mover_date = [], None
+    try:
+        trends, trend_date = commodity_trends()
+    except Exception:
+        LOG.exception('Commodity trends unavailable')
+        trends, trend_date = {}, None
     return {'macro': snapshot.get('macro', []), 'futures': snapshot.get('futures', []),
+            'global_assets': snapshot.get('global_assets', []),
+            'global_assets_checked_at': snapshot.get('global_assets_checked_at'),
+            'commodity_trends': trends, 'commodity_trend_date': trend_date,
             'stock_activity': stock_dashboard(), 'crypto_activity': crypto_dashboard(snapshot),
             'macro_checked_at': snapshot.get('macro_checked_at'),
             'futures_checked_at': snapshot.get('futures_checked_at'),

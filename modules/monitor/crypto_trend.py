@@ -17,6 +17,8 @@ ONCHAIN_SORTS = {'period_change', 'price', 'volume_24h', 'liquidity', 'market_ca
 ONCHAIN_DISPLAY_LIMIT = 10
 ONCHAIN_MIN_LIQUIDITY = float(os.getenv('ONCHAIN_TREND_MIN_LIQUIDITY_USD', '50000'))
 ONCHAIN_MIN_VOLUME_24H = float(os.getenv('ONCHAIN_TREND_MIN_VOLUME_24H_USD', '50000'))
+ONCHAIN_MIN_RISE = {'24h': 5.0, '3d': 10.0, '7d': 15.0, '30d': 25.0}
+ONCHAIN_MAX_RISE = 1000.0  # likely rebases, decimal changes, or pool-price discontinuities
 _identity_lock = threading.Lock()
 _identity_cache = {'until': 0, 'addresses': {}}
 _PLATFORMS = {'ethereum': 'ethereum', 'bsc': 'binance-smart-chain',
@@ -116,7 +118,7 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
     if market not in ('spot', 'futures', 'onchain'):
         raise ValueError('invalid market')
     allowed = ('24h', '3d', '7d', '30d') if market == 'onchain' else ('12h', '3d', '7d', '30d')
-    if (period not in allowed or risk not in ('pass', 'needs_review', 'review', 'unknown', 'blocked', 'all')
+    if (period not in allowed or risk not in ('visible', 'pass', 'needs_review', 'review', 'unknown', 'blocked', 'all')
             or sort_by not in ONCHAIN_SORTS or sort_dir not in ('asc', 'desc')):
         raise ValueError('invalid period or risk')
     now = time.time()
@@ -228,17 +230,19 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
                 counts[security['status']] += 1
                 if (item.get('liquidity') or 0) >= ONCHAIN_MIN_LIQUIDITY and (item.get('volume_24h') or 0) >= ONCHAIN_MIN_VOLUME_24H:
                     quality_counts[security['status']] += 1
-            if market == 'onchain' and risk not in ('all', 'needs_review') and security['status'] != risk:
+            if market == 'onchain' and risk == 'visible' and security['status'] == 'blocked':
+                continue
+            if market == 'onchain' and risk not in ('all', 'needs_review', 'visible') and security['status'] != risk:
                 continue
             if market == 'onchain' and risk == 'needs_review' and security['status'] not in ('review', 'unknown'):
                 continue
-            if market == 'onchain' and risk == 'pass' and (
+            if market == 'onchain' and risk in ('pass', 'visible') and (
                 (item.get('liquidity') or 0) < ONCHAIN_MIN_LIQUIDITY or
                 (item.get('volume_24h') or 0) < ONCHAIN_MIN_VOLUME_24H
             ):
                 continue
             if market == 'onchain':
-                if item['stale'] or value is None or value <= 0:
+                if item['stale'] or value is None or not ONCHAIN_MIN_RISE[period] <= value <= ONCHAIN_MAX_RISE:
                     continue
             items.append(item)
         if market == 'onchain':
@@ -260,14 +264,11 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
             items = merged
             # Counts must represent the current period's eligible rising assets, not the
             # historical security inventory. Calculate all statuses even under a risk tab.
-            status_order = {'pass': 0, 'review': 1, 'unknown': 2, 'blocked': 3}
-            items.sort(key=lambda x: (status_order[x['security']['status']] if risk in ('all', 'needs_review') else 0,
-                                      x.get(sort_by) is None,
+            items.sort(key=lambda x: (x.get(sort_by) is None,
                                       -(x.get(sort_by) or 0) if sort_dir == 'desc' else x.get(sort_by) or 0,
                                       -x['period_change']))
             matching_count = len(items)
-            if risk != 'pass':
-                items = items[:ONCHAIN_DISPLAY_LIMIT]
+            items = items[:ONCHAIN_DISPLAY_LIMIT]
         else:
             items.sort(key=lambda x: (not x['stale'] and x['period_change'] is not None,
                                        x['period_change'] if x['period_change'] is not None else float('-inf')), reverse=True)
@@ -285,7 +286,9 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
                 'quality_counts': dict(quality_counts),
                 'quality_thresholds': {'liquidity': ONCHAIN_MIN_LIQUIDITY, 'volume_24h': ONCHAIN_MIN_VOLUME_24H},
                 'inventory_counts': dict(inventory_counts), 'global_inventory_counts': dict(global_inventory_counts),
-                'matching_count': matching_count, 'display_limit': ONCHAIN_DISPLAY_LIMIT if market == 'onchain' and risk != 'pass' else None,
+                'matching_count': matching_count, 'display_limit': ONCHAIN_DISPLAY_LIMIT if market == 'onchain' else None,
+                'rise_threshold_pct': ONCHAIN_MIN_RISE.get(period) if market == 'onchain' else None,
+                'max_rise_pct': ONCHAIN_MAX_RISE if market == 'onchain' else None,
                 'risk': risk, 'chain': chain,
                 'universe_count': len(rows),
                 'ranked_count': rank, 'warning': '链上仅覆盖已发现标的；通过筛查不等于官方认证或保证可卖出。'

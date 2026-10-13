@@ -1,8 +1,7 @@
 <script setup lang="ts">
-import { ref, onMounted, watch, computed } from 'vue'
+import { ref, watch, computed } from 'vue'
 import { ElMessage } from 'element-plus'
 import api from '../api'
-import { useRoute } from 'vue-router'
 import HeatmapView from './HeatmapView.vue'
 
 interface CapitalSignalItem {
@@ -106,12 +105,10 @@ interface TrendCacheEntry {
 }
 
 const markets = ['CN', 'HK', 'US']
-const daysOptions = [3, 7, 14, 30, 60, 90, 180]
+const daysOptions = [1, 3, 7, 14, 30, 60, 90, 180]
 const activeMode = ref<TrendMode>('hot')
-const route = useRoute()
-const historyMode = ref(route.query.view !== 'trend')
 const activeMarket = ref('CN')
-const activeDays = ref(7)
+const activeDays = ref(1)
 const loading = ref(false)
 const loadingKey = ref('')
 const refreshingKey = ref('')
@@ -245,6 +242,7 @@ async function fetchTrend(force = false) {
   const mode = activeMode.value
   const market = activeMarket.value
   const days = activeDays.value
+  if (mode === 'hot' && days === 1) return
   const key = makeCacheKey(mode, market, days)
   const cached = trendCache.value[key]
   const isFresh = cached && (Date.now() - cached.ts < CACHE_TTL_MS)
@@ -494,20 +492,14 @@ function handleSortChange(payload: any) {
   currentPage.value = 1
 }
 
-onMounted(() => { if (!historyMode.value) fetchTrend() })
-watch(historyMode, (isDailyBoard) => { if (!isDailyBoard) fetchTrend() })
 </script>
 
 <template>
   <div class="trend-view">
-    <div class="market-subnav"><button :class="{ active: historyMode }" @click="historyMode = true">TG 当日强势榜</button><button :class="{ active: !historyMode }" @click="historyMode = false">多周期市场趋势</button></div>
-    <HeatmapView v-if="historyMode" @select-stock="openNarrative" />
-    <template v-else>
     <div style="margin-bottom: 16px"><router-link to="/trend/crypto">◈ 加密 Trend · 现货 / 合约 / 链上 →</router-link></div>
     <div class="toolbar">
       <div class="mode-group">
         <button class="mode-btn" :class="{ active: activeMode === 'hot' }" @click="activeMode = 'hot'">热门趋势</button>
-        <button class="mode-btn" :class="{ active: activeMode === 'daily' }" @click="activeMode = 'daily'">当日强势</button>
         <button class="mode-btn" :class="{ active: activeMode === 'slow' }" @click="activeMode = 'slow'">慢趋势机构票</button>
       </div>
       <div class="tab-group">
@@ -524,18 +516,19 @@ watch(historyMode, (isDailyBoard) => { if (!isDailyBoard) fetchTrend() })
           @click="activeDays = d"
         >{{ d }}天</button>
       </div>
-      <div v-else-if="activeMode === 'daily'" class="mode-criteria daily-criteria">本地日榜 · 基础过滤 · 不触发全市场 API</div>
       <div v-else class="mode-criteria slow-criteria">20日≥12% · 60日≥30% · 高市值/高成交额</div>
-      <div class="meta-text">
+      <div v-if="!(activeMode === 'hot' && activeDays === 1)" class="meta-text">
         {{ metaPrefix() }} {{ totalItems }} 个标的
         <span v-if="currentCacheAgeText"> · {{ currentCacheAgeText }}</span>
         <span v-if="isRefreshingCurrent"> · 后台刷新中</span>
       </div>
-      <button class="refresh-btn" :class="{ refreshing: isRefreshingCurrent }" :disabled="isRefreshingCurrent" @click="fetchTrend(true)">
+      <button v-if="!(activeMode === 'hot' && activeDays === 1)" class="refresh-btn" :class="{ refreshing: isRefreshingCurrent }" :disabled="isRefreshingCurrent" @click="fetchTrend(true)">
         {{ isRefreshingCurrent ? '更新中' : '刷新' }}
       </button>
     </div>
 
+    <HeatmapView v-if="activeMode === 'hot' && activeDays === 1" :initial-market="activeMarket" @select-stock="openNarrative" />
+    <template v-else>
     <el-table :data="pagedItems" v-loading="loading" size="small" @sort-change="handleSortChange">
       <el-table-column prop="rank" label="#" width="46" />
       <el-table-column prop="symbol" label="代码" width="98" />

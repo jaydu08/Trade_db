@@ -22,10 +22,13 @@ interface HeatmapItem {
 
 const markets = ["CN", "HK", "US"]
 const trendWindows = [1, 3, 7, 30, 90, 180]
-const activeMarket = ref("CN")
+const props = defineProps<{ initialMarket?: string }>()
+const activeMarket = ref(props.initialMarket || "CN")
+const selectedMonth = ref(`${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`)
 const selectedDate = ref("")
 const tradingDays = ref<string[]>([])
 const items = ref<HeatmapItem[]>([])
+const boardSource = ref('')
 const trendItems = ref<HeatmapItem[]>([])
 const trendDays = ref(1)
 const loading = ref(false)
@@ -44,7 +47,8 @@ const trendQuotaRule = computed(() => {
 })
 
 async function fetchTradingDays(month?: string) {
-  const m = month || new Date().toISOString().slice(0, 7)
+  const m = month || selectedMonth.value
+  selectedMonth.value = m
   const requestId = ++calendarRequestId
   try {
     const res = await api.get("/trading-days", { params: { month: m, market: activeMarket.value } })
@@ -52,6 +56,7 @@ async function fetchTradingDays(month?: string) {
     tradingDays.value = res.data.days || []
     selectedDate.value = tradingDays.value[tradingDays.value.length - 1] || ''
     items.value = []
+    boardSource.value = ''
     await fetchHeatmap()
   } catch {}
 }
@@ -64,7 +69,7 @@ async function fetchHeatmap() {
     const res = await api.get("/heatmap", {
       params: { date: selectedDate.value, market: activeMarket.value }
     })
-    if (requestId === boardRequestId) items.value = res.data.items || []
+    if (requestId === boardRequestId) { items.value = res.data.items || []; boardSource.value = res.data.board_source || '' }
   } catch {
     if (requestId === boardRequestId) ElMessage.error("加载TG日榜失败")
   } finally {
@@ -95,7 +100,7 @@ function fetchBoth() {
 }
 
 function isDisabledDate(date: Date) {
-  const dateStr = date.toISOString().slice(0, 10)
+  const dateStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
   return !tradingDays.value.includes(dateStr)
 }
 
@@ -136,6 +141,7 @@ function rowTags(row: HeatmapItem) {
 
 function handleDateChange(val: string) {
   selectedDate.value = val
+  showComparison.value = false
   fetchBoth()
 }
 
@@ -147,6 +153,7 @@ watch(activeMarket, () => {
   selectedDate.value = ''
   fetchTradingDays()
 })
+watch(() => props.initialMarket, (value) => { if (value && value !== activeMarket.value) activeMarket.value = value })
 watch(trendDays, () => { if (showComparison.value) fetchTrendPush() })
 watch(showComparison, (visible) => { if (visible) fetchTrendPush() })
 </script>
@@ -154,7 +161,7 @@ watch(showComparison, (visible) => { if (visible) fetchTrendPush() })
 <template>
   <div class="heatmap-view">
     <div class="toolbar">
-      <div class="tab-group market-tabs">
+      <div v-if="!props.initialMarket" class="tab-group market-tabs">
         <button
           v-for="m in markets" :key="m"
           class="tab-btn" :class="{ active: activeMarket === m }"
@@ -172,8 +179,9 @@ watch(showComparison, (visible) => { if (visible) fetchTrendPush() })
         @update:model-value="handleDateChange"
         style="width: 150px"
       />
-      <span class="board-hint">与股票 TG 推送使用同一份榜单 · 默认各市场最近交易日</span>
-      <button class="compare-toggle" @click="showComparison = !showComparison">{{ showComparison ? '收起算法对照' : '查看旧算法对照' }}</button>
+      <input v-model="selectedMonth" type="month" aria-label="选择日榜月份" @change="fetchTradingDays(selectedMonth)" />
+      <span class="board-hint">{{ boardSource === 'tg_selected_snapshot' ? '分层精选：与 TG 同一次选股快照' : '历史旧榜单：旧 Heatmap 选股快照，未必与当日 TG 完全一致' }} · 可按月份与日期回看</span>
+      <button v-if="boardSource !== 'tg_selected_snapshot'" class="compare-toggle" @click="showComparison = !showComparison">{{ showComparison ? '收起算法对照' : '查看分层算法对照' }}</button>
       <div v-if="showComparison" class="days-group">
         <span class="days-label">Trend窗口</span>
         <button
@@ -190,8 +198,8 @@ watch(showComparison, (visible) => { if (visible) fetchTrendPush() })
       <section class="panel-card heatmap-panel">
         <div class="panel-head">
           <div>
-            <h2>TG 当日强势榜</h2>
-            <p>{{ selectedDate || "-" }} · TG 同口径榜单，可切换交易日回看</p>
+            <h2>1天分层精选</h2>
+            <p>{{ selectedDate || "-" }} · {{ boardSource === 'tg_selected_snapshot' ? '当日 TG 选股快照' : '历史 Heatmap 选股快照' }}</p>
           </div>
           <span class="count-pill">{{ items.length }}只</span>
         </div>
@@ -325,6 +333,7 @@ watch(showComparison, (visible) => { if (visible) fetchTrendPush() })
 }
 .compare-grid.single-board { grid-template-columns: minmax(0, 1fr); }
 .board-hint { color: var(--text-secondary); font-size: 12px; }
+.toolbar input[type="month"]{border:1px solid var(--border);border-radius:6px;padding:5px 7px;background:white;font:inherit;font-size:12px;color:var(--text)}
 .compare-toggle, .profile-link { color: var(--el-color-primary); cursor: pointer; font-size: 12px; }
 .panel-card {
   min-width: 0;

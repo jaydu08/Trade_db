@@ -1290,36 +1290,37 @@ class MarketHeatMap:
             return f"市值:{cap:.1f}{unit}"
         return f"市值:{cap:.2f}{unit}"
 
-    def _broadcast_cn_trend_daily(self, target_date: datetime.date, cn_total_amount: float = 0.0) -> bool:
-        """Broadcast CN TG using the same Trend daily payload as the daily summary TXT."""
+    def _broadcast_trend_daily(self, market: str, target_date: datetime.date, cn_total_amount: float = 0.0) -> bool:
+        """Send one stratified shortlist and archive its exact date-bound selection."""
         try:
             from interface.api import get_heatmap_trend_push
 
             payload = get_heatmap_trend_push(
                 days=1,
-                market="CN",
+                market=market,
                 date=target_date.isoformat(),
                 user=None,
                 force_refresh=True,
             )
             items = list((payload or {}).get("items") or [])
             if not items:
-                logger.warning("CN Trend daily payload is empty; fallback to heatmap TG message.")
+                logger.warning("%s Trend daily payload is empty; fallback to heatmap TG message.", market)
                 return False
 
-            msg_lines = [f"🔥 **A股 当日Trend算法榜 (Top {len(items)})**"]
+            market_name = {'CN': 'A股', 'HK': '港股', 'US': '美股'}[market]
+            msg_lines = [f"🔥 **{market_name} 分层精选日榜 (Top {len(items)})**"]
             msg_lines.append(f"📅 日期: {target_date}")
-            if cn_total_amount > 0:
+            if market == 'CN' and cn_total_amount > 0:
                 vol_str = f"{cn_total_amount/1e8:.0f} 亿" if cn_total_amount < 1e12 else f"{cn_total_amount/1e12:.2f} 万亿"
                 msg_lines.append(f"📊 全市场成交额: **{vol_str}**")
 
             if self.enable_market_brief:
                 try:
-                    brief = self._get_market_brief("CN")
+                    brief = self._get_market_brief(market)
                     if brief:
                         msg_lines.append(f"🧭 市场简析: {brief}")
                 except Exception as e:
-                    logger.warning("Build CN market brief failed for Trend TG: %s", e)
+                    logger.warning("Build %s market brief failed for Trend TG: %s", market, e)
 
             msg_lines.append("")
             for idx, item in enumerate(items, 1):
@@ -1332,8 +1333,8 @@ class MarketHeatMap:
                 catalyst = str(item.get("catalyst_tags", "") or "").strip()
                 price_str = f"{price:.2f}" if price else "N/A"
                 pct_str = f"{pct:+.2f}%"
-                cap_str = self._format_trend_market_cap(item.get("market_cap"), "CN")
-                amount_str = self._format_trend_amount(item.get("amount"), "CN")
+                cap_str = self._format_trend_market_cap(item.get("market_cap"), market)
+                amount_str = self._format_trend_amount(item.get("amount"), market)
                 industry_text = f"  行业:[{industry}]" if industry else ""
                 catalyst_text = f"  催化:[{catalyst}]" if catalyst else ""
                 msg_lines.append(
@@ -1343,10 +1344,12 @@ class MarketHeatMap:
                 msg_lines.append("")
 
             Notifier.broadcast("\n".join(msg_lines))
-            logger.info("Broadcasted CN Trend daily TG message")
+            from modules.analysis.tg_daily_board import save_board
+            save_board(market, target_date, items)
+            logger.info("Broadcasted %s Trend daily TG message", market)
             return True
         except Exception as e:
-            logger.error("Failed to broadcast CN Trend daily TG message: %s", e, exc_info=True)
+            logger.error("Failed to broadcast %s Trend daily TG message: %s", market, e, exc_info=True)
             return False
 
     def process_and_notify(self, market: str):
@@ -1550,7 +1553,7 @@ class MarketHeatMap:
             logger.error(f"Failed to add heatmap results to TrendSeedPool: {e}")
 
         # 4. 组装消息并发送
-        if market == 'CN' and self._broadcast_cn_trend_daily(datetime.date.today(), cn_total_amount):
+        if self._broadcast_trend_daily(market, datetime.date.today(), cn_total_amount):
             return
 
         market_names = {'CN': 'A股', 'HK': '港股', 'US': '美股'}

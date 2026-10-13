@@ -2282,6 +2282,10 @@ def get_heatmap(
         date = dt.date.today().strftime("%Y-%m-%d")
 
     target_date = dt.date.fromisoformat(date)
+    from modules.analysis.tg_daily_board import read_board
+    archived = read_board(market, target_date)
+    if archived:
+        return archived
 
     with Session(db_manager.ledger_engine) as session:
         stmt = (
@@ -2312,7 +2316,8 @@ def get_heatmap(
     # Enrich with market cap (lightweight - only 5~10 items)
     _enrich_heatmap_market_cap(items, market)
 
-    return {"date": date, "market": market, "items": items}
+    return {"date": date, "market": market, "items": items,
+            "board_source": "legacy_heatmap_selection"}
 
 
 

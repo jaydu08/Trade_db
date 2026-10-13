@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from modules.monitor.macro_dashboard import parse_fred_csv, parse_fred_response, parse_futures_frame, refresh_snapshot
+from modules.monitor.macro_dashboard import parse_fred_csv, parse_fred_response, parse_futures_frame, refresh_snapshot, calendar_changes, build_commodity_trends
 
 
 class FakeFrame:
@@ -41,6 +41,23 @@ class MacroDashboardTest(unittest.TestCase):
         self.assertEqual({row['id'] for row in parse_fred_response(buffer.getvalue())},
                          {'DFEDTARU', 'DGS2', 'DGS10'})
 
+    def test_calendar_changes_use_prior_close_without_forward_fill(self):
+        import datetime
+        d = datetime.date(2026, 10, 12)
+        points = [(d - datetime.timedelta(days=7), 80),
+                  (d - datetime.timedelta(days=3), 90), (d, 100)]
+        self.assertEqual(calendar_changes(points)["3d"], 11.11)
+        self.assertEqual(calendar_changes(points)["7d"], 25.0)
+        self.assertIsNone(calendar_changes(points)["30d"])
+
+    def test_commodity_trend_is_built_from_existing_daily_bars(self):
+        import datetime
+        from types import SimpleNamespace
+        d = datetime.date(2026, 10, 12)
+        bars = [SimpleNamespace(symbol='AU0', name='黄金', date=d - datetime.timedelta(days=7), close=800, source='commodity'),
+                SimpleNamespace(symbol='AU0', name='黄金', date=d, close=880, source='commodity')]
+        self.assertEqual(build_commodity_trends(bars, d)['7d'][0]['change_pct'], 10.0)
+
     @patch('modules.monitor.macro_dashboard.read_snapshot')
     @patch('modules.monitor.macro_dashboard.fetch_fred')
     @patch('modules.monitor.macro_dashboard.fetch_futures')
@@ -51,6 +68,7 @@ class MacroDashboardTest(unittest.TestCase):
         fred.side_effect = RuntimeError('upstream unavailable')
         futures.return_value = [{'id': 'CL'}]
         with tempfile.TemporaryDirectory() as folder, patch.object(module, 'SNAPSHOT_PATH', folder + '/snapshot.json'), \
+                patch('modules.monitor.macro_dashboard.fetch_global_assets', return_value=[{'id': 'SOX'}]), \
                 patch('modules.monitor.market_activity.fetch_binance', return_value={'value': 1, 'pairs': 1}), \
                 patch('modules.monitor.market_activity.fetch_dex', return_value={'value': 1}), \
                 patch('modules.monitor.market_activity.fetch_sentiment', return_value={'value': 50}):

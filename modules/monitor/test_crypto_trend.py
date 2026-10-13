@@ -110,10 +110,13 @@ class TrendTest(unittest.TestCase):
             db.close()
             with patch.object(crypto_trend, 'DB_PATH', path), patch.object(crypto_trend, 'ALPHA_ROOT', folder), patch.object(crypto_trend, 'project_identities', return_value={}):
                 result = crypto_trend.get_crypto_trend(market='onchain', period='24h', risk='all')
+                visible = crypto_trend.get_crypto_trend(market='onchain', period='24h', risk='visible')
                 solana = crypto_trend.get_crypto_trend(market='onchain', period='24h', risk='unknown',
                                                        chain='solana', sort_by='volume_24h', sort_dir='asc')
             self.assertEqual(result['matching_count'], 30)
             self.assertEqual(len(result['items']), 10)
+            self.assertEqual(visible['matching_count'], 1)
+            self.assertEqual(visible['rise_threshold_pct'], 5.0)
             self.assertEqual(result['counts']['unknown'], 29)
             self.assertEqual(result['items'][0]['security']['status'], 'pass')
             self.assertEqual(solana['matching_count'], 15)
