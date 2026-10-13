@@ -29,7 +29,8 @@ def publish(root, crypto_db, repo):
         now = datetime.now(ZoneInfo("Asia/Shanghai"))
         output = repo / "agent/v1"
         snapshot, size = generate(root, crypto_db, output, now)
-        write_smoke(output / "smoke.json", now)
+        if not (output / "smoke.json").exists():
+            write_smoke(output / "smoke.json", now)
         history_path = f"agent/v1/history/{now.date().isoformat()}.json"
         allowed = {"agent/v1/latest.json", "agent/v1/smoke.json", history_path}
         git(repo, "add", "--", *sorted(allowed))
