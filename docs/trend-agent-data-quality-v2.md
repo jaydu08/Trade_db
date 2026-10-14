@@ -47,6 +47,8 @@ CN 1 只无报价，HK 3 只被识别为未达收盘时间的报价，未补造�
 
 生产每天北京时间 18:10 首次尝试、18:30/18:40 重试；扫描及发布在现有 GitHub `agent-data` 独立 checkout 内原子写档、幂等提交。若独立扫描覆盖不足、当天 A/H 日线/成交总额未就绪、加密源过期，不发布伪完整日档；健康报告只有成功冻结后随同发布。`weekly/`、`monthly/` 继续沿用现有 7/30 日独立导出，不从日榜拼装。周/月本次未改算法。
 
+部署当晚定时器曾因新增 18:10 条目立即补触发，遇到 10-14 已存在的旧 schema 档并由新版门禁拒绝；未覆盖或推送任何数据。发布器现对当日既有旧版不可变档幂等跳过，手动重试输出 `Published []`，不会为旧版档伪造新版健康报告；10-15 起才首次创建 v2 正式日档。
+
 部署后验证：检查 `systemctl list-timers trend-agent-snapshot.timer`、`journalctl -u trend-agent-snapshot.service`；下一个工作日在 `agent-data` 分支读取 `agent/v1/history/YYYY-MM-DD.json` 与 `agent/v1/health/YYYY-MM-DD.json`，核对同一 `snapshot_id`、正负覆盖和 FRED 质量。18:45 前发布需以**下一实际交易日**的 GitHub 文件时间和日志最终确认；只读回放不能代替这项生产时点验证。若 18:40 后仍未就绪，应报告未发布，不得伪装成功。
 
 快速回滚：在 Trade_db `main` 对本次代码提交执行 `git revert <commit>`（不动数据目录）；将 `/etc/systemd/system/trend-agent-snapshot.timer` 恢复原 18:30/18:40 配置，`systemctl daemon-reload && systemctl restart trend-agent-snapshot.timer`。已冻结 GitHub 历史档保持不变；不要重写 `agent-data` 历史。`/root/alpha_news` 无本次修改，不需重启。

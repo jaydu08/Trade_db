@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import json
 import subprocess
 from datetime import datetime
 from datetime import timedelta
@@ -34,12 +35,16 @@ def publish(root, crypto_db, repo, preview_periods=False):
         allowed = set()
         published = []
         if now.weekday() < 5 and not preview_periods:
-            if not (output / 'history' / f'{now.date().isoformat()}.json').exists():
+            today_archive = output / 'history' / f'{now.date().isoformat()}.json'
+            legacy_archive = (today_archive.exists() and
+                              not json.loads(today_archive.read_text(encoding='utf-8')).get('market_anomalies'))
+            if not today_archive.exists():
                 scan_agent_market(root, root / 'data/agent_market_scan', now)
-            snapshot, size = generate(root, crypto_db, output, now, require_daily_ready=True)
-            allowed.update({"agent/v1/latest.json", f"agent/v1/history/{now.date().isoformat()}.json",
-                            f"agent/v1/health/{now.date().isoformat()}.json"})
-            published.append((snapshot["snapshot_id"], size))
+            if not legacy_archive:
+                snapshot, size = generate(root, crypto_db, output, now, require_daily_ready=True)
+                allowed.update({"agent/v1/latest.json", f"agent/v1/history/{now.date().isoformat()}.json",
+                                f"agent/v1/health/{now.date().isoformat()}.json"})
+                published.append((snapshot["snapshot_id"], size))
         due = [(7, now.weekday() == 6),
                (30, (now + timedelta(days=1)).month != now.month)]
         for days, scheduled in due:
