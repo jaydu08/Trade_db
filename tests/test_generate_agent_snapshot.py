@@ -60,11 +60,15 @@ class SnapshotTest(unittest.TestCase):
                        "asof": "2026-10-13", "source": "FRED"}],
             "crypto_activity": {"spot": {"value": 100000, "checked_at": self.now.timestamp() - 60}}
         }), encoding="utf-8")
+        (self.data / "market_activity_stock.json").write_text(json.dumps([
+            {"market": "CN", "day": "2026-10-13", "amount": 1000000},
+            {"market": "HK", "day": "2026-10-13", "amount": 2000000},
+        ]), encoding="utf-8")
 
     def test_real_fields_direction_session_and_immutable_history(self):
         first, size = MODULE.generate(self.root, self.crypto, self.output, self.now)
         self.assertLess(size, 100_000)
-        self.assertEqual(first["schema_version"], "1.0")
+        self.assertEqual(first["schema_version"], "1.1")
         self.assertEqual(first["overview"]["markets"][2]["session_date"], "2026-10-12")
         self.assertEqual(first["overview"]["macro"][0]["value"], 4.5)
         self.assertIn("BBB", [x["symbol"] for x in first["anomalies"]["stocks_down"]])
@@ -85,6 +89,16 @@ class SnapshotTest(unittest.TestCase):
         self.crypto.unlink()
         absent = MODULE.build_snapshot(self.root, self.crypto, later)
         self.assertEqual(next(h for h in absent["source_health"] if h["domain"] == "crypto")["quality"], "missing")
+
+    def test_completed_session_gate_and_asset_types(self):
+        snapshot = MODULE.build_snapshot(self.root, self.crypto, self.now)
+        MODULE.ensure_daily_ready(snapshot, self.now)
+        self.assertEqual(snapshot["anomalies"]["stocks_up"][0]["asset_type"], "UNKNOWN")
+        self.assertEqual(MODULE.classify_stock_asset("107.SOXL", "三倍做多半导体ETF")[0], "LEVERAGED_ETF")
+        self.assertEqual(MODULE.classify_stock_asset("105.SPY", "标普500ETF")[0], "ETF")
+        snapshot["overview"]["markets"][0]["session_date"] = "2026-10-12"
+        with self.assertRaisesRegex(ValueError, "CN completed session"):
+            MODULE.ensure_daily_ready(snapshot, self.now)
 
 
 if __name__ == "__main__":

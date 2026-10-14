@@ -6,11 +6,13 @@ import argparse
 import fcntl
 import subprocess
 from datetime import datetime
+from datetime import timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from generate_agent_smoke import write_smoke
 from generate_agent_snapshot import generate
+from generate_agent_period_snapshot import generate as generate_period
 
 
 def git(repo, *arguments):
@@ -18,7 +20,7 @@ def git(repo, *arguments):
                           text=True, capture_output=True, timeout=45).stdout.strip()
 
 
-def publish(root, crypto_db, repo):
+def publish(root, crypto_db, repo, preview_periods=False):
     if git(repo, "branch", "--show-current") != "agent-data":
         raise RuntimeError("refusing to publish outside isolated agent-data branch")
     lock_path = repo / ".git/trend-agent-publish.lock"
@@ -28,11 +30,25 @@ def publish(root, crypto_db, repo):
         git(repo, "merge", "--ff-only", "FETCH_HEAD")
         now = datetime.now(ZoneInfo("Asia/Shanghai"))
         output = repo / "agent/v1"
-        snapshot, size = generate(root, crypto_db, output, now)
+        allowed = set()
+        published = []
+        if now.weekday() < 5 and not preview_periods:
+            snapshot, size = generate(root, crypto_db, output, now, require_daily_ready=True)
+            allowed.update({"agent/v1/latest.json", f"agent/v1/history/{now.date().isoformat()}.json"})
+            published.append((snapshot["snapshot_id"], size))
+        due = [(7, now.weekday() == 6),
+               (30, (now + timedelta(days=1)).month != now.month)]
+        for days, scheduled in due:
+            if scheduled or preview_periods:
+                snapshot, size = generate_period(root, crypto_db, output, days, now)
+                folder = "weekly" if days == 7 else "monthly"
+                allowed.add(f"agent/v1/{folder}/{now.date().isoformat()}.json")
+                published.append((snapshot["snapshot_id"], size))
+        if not published:
+            return [], git(repo, "rev-parse", "HEAD")
         if not (output / "smoke.json").exists():
             write_smoke(output / "smoke.json", now)
-        history_path = f"agent/v1/history/{now.date().isoformat()}.json"
-        allowed = {"agent/v1/latest.json", "agent/v1/smoke.json", history_path}
+        allowed.add("agent/v1/smoke.json")
         git(repo, "add", "--", *sorted(allowed))
         staged = set(git(repo, "diff", "--cached", "--name-only").splitlines())
         if staged - allowed:
@@ -43,7 +59,7 @@ def publish(root, crypto_db, repo):
                 "-c", "user.email=trend-agent@localhost",
                 "commit", "-m", f"Publish Trend snapshot {now.date().isoformat()}")
         git(repo, "push", "origin", "HEAD:agent-data")
-        return snapshot["snapshot_id"], size, git(repo, "rev-parse", "HEAD")
+        return published, git(repo, "rev-parse", "HEAD")
 
 
 def main():
@@ -51,9 +67,11 @@ def main():
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--crypto-db", type=Path, default=Path("/root/alpha_news/data/crypto_trend.sqlite"))
     parser.add_argument("--repo", type=Path, required=True, help="isolated agent-data Git checkout")
+    parser.add_argument("--preview-periods", action="store_true",
+                        help="publish today's 7d/30d initial previews only, without daily")
     args = parser.parse_args()
-    snapshot_id, size, commit = publish(args.root, args.crypto_db, args.repo)
-    print(f"Published {snapshot_id}, {size} bytes, commit {commit}")
+    published, commit = publish(args.root, args.crypto_db, args.repo, args.preview_periods)
+    print(f"Published {published}, commit {commit}")
 
 
 if __name__ == "__main__":

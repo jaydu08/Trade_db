@@ -9,6 +9,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sqlite3
 import tempfile
 from contextlib import closing
@@ -24,6 +25,27 @@ CRYPTO_STALE_SECONDS = 900
 ONCHAIN_MIN_LIQUIDITY = 50_000
 ONCHAIN_MIN_VOLUME = 50_000
 CURRENCY = {"CN": "CNY", "HK": "HKD", "US": "USD"}
+LEVERAGED_TICKERS = {"SOXL", "SOXS", "TQQQ", "SQQQ", "SPXL", "SPXS", "NVDL", "NVDS",
+                     "TSLL", "TSLS", "LABU", "LABD", "FNGU", "FNGD", "YINN", "YANG"}
+
+
+def classify_stock_asset(symbol, name, catalog_type=None):
+    """Keep a visible ETF/leveraged-ETF distinction even if meta.asset says STOCK."""
+    ticker = str(symbol or "").split(".")[-1].upper()
+    label = str(name or "")
+    lower = label.lower()
+    leverage = (ticker in LEVERAGED_TICKERS or bool(re.search(r"(?<!\d)[23](?:\.0)?\s*[xX倍]", label))
+                or any(word in label for word in ("两倍", "三倍", "反向", "做空ETF"))
+                or any(word in lower for word in ("leveraged", "inverse", "ultra bull", "ultra bear")))
+    etf = ("etf" in lower or "交易型开放式" in label or ticker in LEVERAGED_TICKERS
+           or str(catalog_type or "").upper() in {"ETF", "LEVERAGED_ETF"})
+    if etf and leverage:
+        return "LEVERAGED_ETF", "name_or_ticker_heuristic"
+    if etf:
+        return "ETF", "name_or_catalog"
+    if str(catalog_type or "").upper() == "STOCK":
+        return "STOCK", "meta.asset"
+    return "UNKNOWN", "insufficient_asset_metadata"
 
 
 def number(value):
@@ -134,6 +156,12 @@ def stock_snapshot(root, now):
                                 quality="missing", stale=True, missing_reason="ledger.db unavailable",
                                 turnover=None, turnover_currency=CURRENCY[market], breadth=None, major_index=None))
         return markets, up, down, health, ["股票日线数据库不可用"]
+    catalog = {}
+    meta = root / "data/meta.db"
+    if meta.exists():
+        with closing(readonly_db(meta)) as meta_db:
+            for row in meta_db.execute("SELECT symbol,asset_type FROM asset"):
+                catalog[str(row["symbol"])] = row["asset_type"]
     with closing(readonly_db(ledger)) as db:
         for market in CURRENCY:
             row = db.execute("SELECT MAX(date) AS day FROM trenddailybar WHERE market=?", (market,)).fetchone()
@@ -189,9 +217,13 @@ def stock_snapshot(root, now):
                 board_item = board_by_symbol.get(symbol)
                 if board_item and number(board_item.get("change_pct")) is not None:
                     returns["1d"] = number(board_item["change_pct"])
+                asset_type, type_source = classify_stock_asset(symbol, bar["name"], catalog.get(symbol))
                 item = dict(market=market, symbol=symbol, name=str(bar["name"] or ""),
+                            asset_type=asset_type, asset_type_source=type_source,
                             session_date=session, data_asof=utc_naive_iso(bar["updated_at"]),
                             price=price, price_type="close_or_archived_latest", currency=CURRENCY[market],
+                            price_adjustment="unknown_from_existing_archive",
+                            coverage_pool="TrendDailyBar candidates, not full market",
                             returns_pct=returns, amount=number(bar["amount"]) if (number(bar["amount"]) or 0) > 0 else None,
                             volume=None, turnover_rate=number(bar["turnover_rate"]) if (number(bar["turnover_rate"]) or 0) > 0 else None,
                             industry=(board_item or {}).get("industry_label") or None,
@@ -297,6 +329,7 @@ def crypto_snapshot(db_path, now):
                         if old and new is not None:
                             oi_change = round((new / old - 1) * 100, 3)
                 candidates.append(dict(market=market, exchange="Binance" if market != "onchain" else None,
+                                       asset_type={"spot": "SPOT", "futures": "PERPETUAL", "onchain": "ONCHAIN_TOKEN"}[market],
                                        chain=item.get("chain") if market == "onchain" else None,
                                        symbol=item.get("symbol"), contract_address=item.get("address") if market == "onchain" else None,
                                        direction="up" if change > 0 else "down" if change < 0 else "flat",
@@ -307,6 +340,8 @@ def crypto_snapshot(db_path, now):
                                        funding_rate_percent=number(item.get("funding_rate_percent")) if market == "futures" else None,
                                        data_asof=epoch_iso(updated), session_date=now.date().isoformat(),
                                        source=item.get("price_source") or "alpha_news crypto trend worker",
+                                       coverage_pool="discovered contracts" if market == "onchain" else "Binance 24h quote-volume Top 150",
+                                       price_adjustment="not_applicable",
                                        quality="partial" if status in ("unknown", "review") else "ok", stale=False))
             ups = sorted((v for v in candidates if v["direction"] == "up"), key=lambda v: v["change_pct"], reverse=True)
             downs = sorted((v for v in candidates if v["direction"] == "down"), key=lambda v: v["change_pct"])
@@ -367,25 +402,64 @@ def build_snapshot(root, crypto_db, now):
                         "加密 CEX 仅覆盖 Binance USDT 现货/永续按 24h 成交额各前 150；链上仅覆盖已发现合约，安全通过不保证可卖出",
                         "主要综合指数与完整市场广度当前无可靠归档，保持 null；20:00 北京时间美股采用上一已完成纽约交易日",
                         "跨市场因果归因与交易评级未实现"])
-    return dict(schema_version="1.0", snapshot_id=f"{now.date().isoformat()}-{int(now.timestamp())}",
+    all_health = stock_health + crypto_health + [macro_health]
+    return dict(schema_version="1.1", snapshot_id=f"{now.date().isoformat()}-{int(now.timestamp())}",
                 generated_at=now.isoformat(timespec="seconds"), timezone="Asia/Shanghai",
+                session_date={m['market']: m['session_date'] for m in markets},
+                data_asof={h['domain']: h['data_asof'] for h in all_health},
+                stale=any(h['stale'] for h in all_health), quality="partial",
+                missing_reason="major-index/breadth and some baseline/adjustment fields unavailable; see limitations",
                 overview=dict(markets=markets, macro=macro, crypto_activity=crypto_activity),
                 anomalies=dict(stocks_up=stocks_up, stocks_down=stocks_down, crypto=crypto, cross_market=[]),
-                source_health=stock_health + crypto_health + [macro_health], limitations=limitations)
+                source_health=all_health, limitations=limitations)
 
 
-def generate(root, crypto_db, output, now=None):
+def ensure_daily_ready(snapshot, now):
+    """Refuse a weekday 'complete' publication when finished upstream sessions are absent."""
+    if now.weekday() >= 5:
+        raise ValueError("daily publication is for Monday-Friday only")
+    today = now.date().isoformat()
+    markets = {m["market"]: m for m in snapshot["overview"]["markets"]}
+    for market in ("CN", "HK"):
+        row = markets[market]
+        if row["session_date"] != today or not row.get("candidate_universe"):
+            raise ValueError(f"{market} completed session not ready for {today}")
+        if row.get("turnover") is None:
+            raise ValueError(f"{market} current-day turnover archive not ready")
+        asof = row.get("data_asof")
+        if not asof or datetime.fromisoformat(asof).astimezone(SHANGHAI).hour < 16:
+            raise ValueError(f"{market} current-day data has no post-close observation")
+    us = markets["US"]
+    us_asof = us.get("data_asof")
+    if not us_asof or not us.get("candidate_universe"):
+        raise ValueError("US completed session unavailable")
+    ny_asof = datetime.fromisoformat(us_asof).astimezone(NEW_YORK)
+    if (us["session_date"] != ny_asof.date().isoformat() or ny_asof.hour < 16
+            or ny_asof.date() >= now.astimezone(NEW_YORK).date()
+            or (now.astimezone(NEW_YORK).date() - ny_asof.date()).days > 4):
+        raise ValueError("US archive is not a recent completed New York session")
+    health = {h["domain"]: h for h in snapshot["source_health"]}
+    for domain in ("crypto_spot", "crypto_futures", "crypto_onchain", "macro"):
+        if health[domain]["stale"] or health[domain]["quality"] == "missing":
+            raise ValueError(f"{domain} source not ready")
+
+
+def generate(root, crypto_db, output, now=None, require_daily_ready=False):
     now = now or datetime.now(SHANGHAI)
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("generation time must be timezone-aware")
     archive = output / "history" / f"{now.date().isoformat()}.json"
     if archive.exists():
         data = archive.read_bytes()
-        json.loads(data)
+        existing = json.loads(data)
+        if require_daily_ready:
+            ensure_daily_ready(existing, now)
         if len(data) > MAX_BYTES:
             raise ValueError("existing archive exceeds 100 KB")
     else:
         snapshot = build_snapshot(root, crypto_db, now)
+        if require_daily_ready:
+            ensure_daily_ready(snapshot, now)
         data = (json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
         if len(data) > MAX_BYTES:
             raise ValueError("snapshot exceeds 100 KB")
