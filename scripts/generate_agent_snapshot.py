@@ -20,13 +20,79 @@ from zoneinfo import ZoneInfo
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 NEW_YORK = ZoneInfo("America/New_York")
-MAX_BYTES = 100_000
+MAX_BYTES = 220_000
 CRYPTO_STALE_SECONDS = 900
 ONCHAIN_MIN_LIQUIDITY = 50_000
 ONCHAIN_MIN_VOLUME = 50_000
 CURRENCY = {"CN": "CNY", "HK": "HKD", "US": "USD"}
 LEVERAGED_TICKERS = {"SOXL", "SOXS", "TQQQ", "SQQQ", "SPXL", "SPXS", "NVDL", "NVDS",
                      "TSLL", "TSLS", "LABU", "LABD", "FNGU", "FNGD", "YINN", "YANG"}
+
+
+def _nth_weekday(year, month, weekday, occurrence):
+    first = date(year, month, 1)
+    return first + timedelta(days=(weekday - first.weekday()) % 7 + 7 * (occurrence - 1))
+
+
+def _last_weekday(year, month, weekday):
+    first_next = date(year + (month == 12), month % 12 + 1, 1)
+    last = first_next - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def _observed_holiday(year, month, day):
+    actual = date(year, month, day)
+    return actual - timedelta(days=1) if actual.weekday() == 5 else actual + timedelta(days=1) if actual.weekday() == 6 else actual
+
+
+def _us_h15_holidays(year):
+    return {_observed_holiday(year, 1, 1), _nth_weekday(year, 1, 0, 3),
+            _nth_weekday(year, 2, 0, 3), _last_weekday(year, 5, 0),
+            _observed_holiday(year, 6, 19), _observed_holiday(year, 7, 4),
+            _nth_weekday(year, 9, 0, 1), _nth_weekday(year, 10, 0, 2),
+            _observed_holiday(year, 11, 11), _nth_weekday(year, 11, 3, 4),
+            _observed_holiday(year, 12, 25), _observed_holiday(year + 1, 1, 1)}
+
+
+def expected_h15_observation(now):
+    """Latest US business date whose standard 16:15 ET H.15 release has passed."""
+    ny = now.astimezone(NEW_YORK)
+    candidate = ny.date() if (ny.hour, ny.minute) >= (16, 45) else ny.date() - timedelta(days=1)
+    while candidate.weekday() >= 5 or candidate in _us_h15_holidays(candidate.year):
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def macro_freshness(item_id, observed, checked, now, category='macro'):
+    """Observation freshness is independent of how recently the collector ran."""
+    if not observed:
+        return 'missing', True, 'observation date unavailable', None
+    try:
+        observed_day = date.fromisoformat(str(observed)[:10])
+    except ValueError:
+        return 'missing', True, 'invalid observation date', None
+    if observed_day > now.date():
+        return 'error', True, 'observation date is in the future', None
+    if category == 'macro' and item_id in {'DGS2', 'DGS10', 'DFII10', 'T10YIE'}:
+        expected = expected_h15_observation(now)
+        if observed_day < expected:
+            return 'stale', True, f'H.15 expected observation {expected}; source still {observed_day}', expected.isoformat()
+        return 'ok', False, None, expected.isoformat()
+    if category == 'macro' and item_id == 'DTWEXBGS':
+        # H.10 dollar-index publication cadence differs from H.15; do not
+        # label the last business day as current without release-date evidence.
+        if (now.date() - observed_day).days > 10:
+            return 'stale', True, 'broad dollar index observation older than 10 calendar days', None
+        return 'unknown', False, 'H.10 publication-date mapping not stored', None
+    if category == 'macro' and item_id == 'DFEDTARU':
+        return 'unknown', False, 'policy target changes on announcement, not each trading day', None
+    if category == 'futures':
+        age = (now.date() - observed_day).days
+        return ('stale', True, 'futures quote is not from the current session', now.date().isoformat()) if age > 1 else ('ok', False, None, now.date().isoformat())
+    if category == 'global_assets':
+        expected = expected_h15_observation(now)
+        return ('stale', True, f'last completed US session {expected} newer than quote', expected.isoformat()) if observed_day < expected else ('ok', False, None, expected.isoformat())
+    return 'unknown', False, 'no confirmed publication policy', None
 
 
 def classify_stock_asset(symbol, name, catalog_type=None):
@@ -250,6 +316,136 @@ def stock_snapshot(root, now):
     return markets, up, down, health, limitations
 
 
+def stock_anomaly_snapshot(root, now):
+    """Independent bidirectional 1d ranking over observed prices, not TG selection."""
+    ledger = root / 'data/ledger.db'
+    scan_dir = Path(os.getenv('AGENT_MARKET_SCAN_DIR') or root / 'data/agent_market_scan')
+    scan = read_json(scan_dir / f'{now.date().isoformat()}.json', {})
+    scanned = scan.get('markets', {}) if isinstance(scan, dict) else {}
+    up, down, relative_up, relative_down, coverage = [], [], [], [], []
+    if not ledger.exists():
+        return up, down, relative_up, relative_down, [dict(market=m, quality='missing',
+            negative_coverage_status='insufficient', missing_reason='ledger.db unavailable') for m in CURRENCY]
+    catalog = {}
+    meta = root / 'data/meta.db'
+    if meta.exists():
+        with closing(readonly_db(meta)) as db:
+            for row in db.execute('SELECT symbol,asset_type FROM asset'):
+                catalog[str(row['symbol'])] = row['asset_type']
+    with closing(readonly_db(ledger)) as db:
+        for market in CURRENCY:
+            archive = db.execute('SELECT MAX(date) AS day FROM trenddailybar WHERE market=?', (market,)).fetchone()['day']
+            bars = db.execute('SELECT symbol,name,close,amount,turnover_rate,source,updated_at FROM trenddailybar '
+                              'WHERE market=? AND date=? AND close>0', (market, archive)).fetchall() if archive else []
+            by_symbol = {}
+            preference = {'heatmap': 3, 'daily_hot': 2, 'trend_pool_refresh_eod': 1}
+            for bar in bars:
+                sym = str(bar['symbol'])
+                if sym not in by_symbol or preference.get(bar['source'], 0) > preference.get(by_symbol[sym]['source'], 0):
+                    by_symbol[sym] = bar
+            excluded = {}
+            available = len(by_symbol) if market == 'US' else 0
+            rows = []
+            if market in ('CN', 'HK'):
+                segment = scanned.get(market, {})
+                if segment.get('session_date') == now.date().isoformat():
+                    rows = segment.get('items') or []
+                    excluded.update(segment.get('excluded_reason_counts') or {})
+                    source_count = segment.get('source_universe_count')
+                else:
+                    source_count = None
+                    excluded['agent_scan_unavailable'] = 1
+            else:
+                source_date = date.fromisoformat(archive) if archive else None
+                seed_cutoff = (source_date - timedelta(days=120)).isoformat() if source_date else None
+                seeds = {str(r['symbol']) for r in db.execute(
+                    'SELECT symbol FROM trendseedpool WHERE market=? AND date>=?', (market, seed_cutoff))} if seed_cutoff else set()
+                source_count = len(seeds | set(by_symbol))
+                for symbol, bar in by_symbol.items():
+                    price = number(bar['close'])
+                    change = bar_returns(db, market, symbol, archive, price)['1d'] if price else None
+                    if change is None:
+                        excluded['insufficient_1d_history'] = excluded.get('insufficient_1d_history', 0) + 1
+                        continue
+                    rows.append(dict(symbol=symbol, name=bar['name'], price=price,
+                                     change_pct=change, observed_at=None,
+                                     source_checked_at=utc_naive_iso(bar['updated_at']),
+                                     provider=f"TrendDailyBar:{bar['source']}", price_type='archived_latest'))
+            items, contributions = [], {}
+            for row in rows:
+                symbol = str(row.get('symbol') or '')
+                price, change = number(row.get('price')), number(row.get('change_pct'))
+                if not symbol or not price or change is None:
+                    excluded['invalid_ranking_input'] = excluded.get('invalid_ranking_input', 0) + 1
+                    continue
+                bar = by_symbol.get(symbol)
+                asset_type, type_source = classify_stock_asset(symbol, row.get('name'), catalog.get(symbol))
+                canonical = (symbol.split('.', 1)[1].upper()
+                             if market == 'US' and re.fullmatch(r'\d{3}\.[A-Za-z][A-Za-z0-9.\-]*', symbol)
+                             else symbol)
+                leverage = {'SOXL': 3, 'SOXS': -3, 'TQQQ': 3, 'SQQQ': -3,
+                            'SPXL': 3, 'SPXS': -3}.get(canonical.upper())
+                amount = number(bar['amount']) if bar else None
+                amount = amount if amount is not None and amount > 0 else None
+                source = row.get('provider') or 'unknown'
+                contributions[source] = contributions.get(source, 0) + 1
+                session = archive
+                item = dict(market=market, symbol=symbol, raw_symbol=symbol,
+                            canonical_symbol=canonical, asset_id=f'{market}:{symbol}', exchange=None,
+                            name=str(row.get('name') or ''), asset_type=asset_type,
+                            instrument_type=asset_type, asset_type_source=type_source,
+                            leverage_factor=leverage, underlying_asset=None,
+                            direction='up' if change > 0 else 'down' if change < 0 else 'flat',
+                            change_pct=round(change, 3), returns_pct={'1d': round(change, 3)},
+                            price=price, price_type=row.get('price_type') or 'unknown',
+                            price_adjustment='unknown_from_existing_source', currency=CURRENCY[market],
+                            amount=amount, amount_unit=CURRENCY[market],
+                            turnover_rate=number(bar['turnover_rate']) if bar and (number(bar['turnover_rate']) or 0) > 0 else None,
+                            volatility_zscore=None, zscore_missing_reason='20 comparable daily returns not verified',
+                            trend_score=None, relative_strength_pct=None,
+                            relative_strength_basis='same-market eligible candidate median; not an index',
+                            session_date=session, observed_at=row.get('observed_at'),
+                            source_checked_at=row.get('source_checked_at'),
+                            data_asof=row.get('observed_at') or row.get('source_checked_at'),
+                            source=source, coverage_pool='independent Agent market scan',
+                            ranking_method='observed_1d_return_not_zscore',
+                            quality='partial', stale=False,
+                            missing_reason='price adjustment or exact exchange not confirmed')
+                items.append(item)
+            sorted_returns = sorted(i['change_pct'] for i in items)
+            median = sorted_returns[len(sorted_returns) // 2] if sorted_returns else None
+            for item in items:
+                item['relative_strength_pct'] = round(item['change_pct'] - median, 3) if median is not None else None
+            positive = sorted((i for i in items if i['change_pct'] > 0), key=lambda i: i['change_pct'], reverse=True)
+            negative = sorted((i for i in items if i['change_pct'] < 0), key=lambda i: i['change_pct'])
+            up.extend(positive[:10]); down.extend(negative[:10])
+            relative_up.extend(sorted(items, key=lambda i: i['relative_strength_pct'], reverse=True)[:3])
+            relative_down.extend(sorted(items, key=lambda i: i['relative_strength_pct'])[:3])
+            if market != 'US':
+                available = len(rows)
+            eligible = len(items)
+            ratio = round(available / source_count, 3) if source_count else None
+            enough = bool(source_count and ratio is not None and ratio >= 0.5 and eligible >= 10)
+            coverage.append(dict(market=market, session_date=items[0]['session_date'] if items else None,
+                                 data_asof=max((i['data_asof'] for i in items if i['data_asof']), default=None),
+                                 source_universe_count=source_count, available_universe_count=available,
+                                 eligible_universe_count=eligible,
+                                 selected_count=len(positive[:10]) + len(negative[:10]),
+                                 positive_eligible_count=len(positive), negative_eligible_count=len(negative),
+                                 flat_eligible_count=eligible - len(positive) - len(negative),
+                                 coverage_scope='rolling_120d_TrendSeedPool_union_current_archived_bars',
+                                 selection_version='agent_anomaly_v1', coverage_ratio=ratio,
+                                 excluded_reason_counts=excluded, source_contributions=contributions,
+                                 negative_coverage_status=('insufficient' if not enough else
+                                                           'none_observed' if not negative else 'complete'),
+                                 negative_coverage_reason=(
+                                     'independent scan coverage insufficient' if not enough else
+                                     'no negative returns in eligible sample' if not negative else None),
+                                 quality='partial' if enough else 'missing', stale=not enough,
+                                 missing_reason=None if enough else 'independent quote scan absent or covered under half the candidate pool'))
+    return up, down, relative_up, relative_down, coverage
+
+
 def bar_return(db, item, window, fixed_hour=None):
     source = "dex:" + str(item.get("pair") or "") if item.get("market") == "onchain" else "binance"
     target = (fixed_hour if fixed_hour is not None else item["updated"]) - window
@@ -363,16 +559,23 @@ def macro_snapshot(root, now):
             if not isinstance(item, dict) or item.get("id") not in ids:
                 continue
             asof = item.get("asof")
-            try:
-                stale = (now.date() - date.fromisoformat(str(asof)[:10])).days > 7
-            except ValueError:
+            checked = number(payload.get(category + '_checked_at'))
+            status, stale, reason, expected_day = macro_freshness(item.get('id'), asof, checked, now, category)
+            ttl = 7200 if category == 'futures' else 86400
+            collector_stale = checked is None or now.timestamp() - checked > ttl
+            if collector_stale:
                 stale = True
+                reason = (reason + '; ' if reason else '') + 'source collector has not checked recently'
+            quality = 'stale' if stale else 'partial' if status == 'unknown' else status
             observations.append(dict(category=category, id=item.get("id"), name=item.get("name"),
                                      value=number(item.get("value")), unit=item.get("unit"),
                                      change_pct=number(item.get("change_pct")), observed_at=asof,
                                      data_asof=asof, session_date=str(asof)[:10] if asof else None,
-                                     source=item.get("source"), quality="partial" if stale else "ok",
-                                     stale=stale, missing_reason="observed_at unavailable" if not asof else None))
+                                     source_checked_at=epoch_iso(checked),
+                                     expected_observation_date=expected_day,
+                                     freshness_status=status, source=item.get("source"), quality=quality,
+                                     stale=stale, stale_reason=reason if stale else None,
+                                     missing_reason=reason if status in ('missing', 'unknown') else None))
     activity = payload.get("crypto_activity") or {}
     crypto_activity = {}
     for key in ("spot", "perp", "dex", "sentiment"):
@@ -386,35 +589,72 @@ def macro_snapshot(root, now):
                                     stale=not entry.get("checked_at") or now.timestamp() - entry["checked_at"] > 86400,
                                     missing_reason=None if entry.get("value") is not None else "not in macro cache")
     checked = epoch_iso(payload.get("refreshed_at"))
+    cache_stale = not payload.get("refreshed_at") or now.timestamp() - payload["refreshed_at"] > 86400
+    stale_count = sum(bool(row['stale']) for row in observations)
     health = dict(domain="macro", session_date=now.date().isoformat(), data_asof=checked,
-                  source="Trade_db macro_dashboard_snapshot.json", quality="partial" if observations else "missing",
-                  stale=not payload.get("refreshed_at") or now.timestamp() - payload["refreshed_at"] > 86400,
-                  missing_reason=None if observations else "macro cache unavailable")
+                  source_checked_at=checked, source="Trade_db macro_dashboard_snapshot.json",
+                  quality="stale" if cache_stale else "partial" if observations else "missing",
+                  stale=cache_stale, stale_indicator_count=stale_count,
+                  missing_reason="macro cache unavailable" if not observations else
+                  f'{stale_count} macro observations stale' if stale_count else None)
     return observations, crypto_activity, health
 
 
 def build_snapshot(root, crypto_db, now):
-    markets, stocks_up, stocks_down, stock_health, limitations = stock_snapshot(root, now)
+    markets, legacy_up, legacy_down, stock_health, limitations = stock_snapshot(root, now)
+    stocks_up, stocks_down, relative_up, relative_down, coverage = stock_anomaly_snapshot(root, now)
+    coverage_by_market = {row['market']: row for row in coverage}
+    for market in markets:
+        row = coverage_by_market.get(market['market'], {})
+        market.update({key: row.get(key) for key in (
+            'source_universe_count', 'available_universe_count', 'eligible_universe_count',
+            'selected_count', 'coverage_scope', 'coverage_ratio', 'excluded_reason_counts',
+            'negative_coverage_status', 'selection_version')})
+        market['candidate_universe_definition'] = 'current-day valid TrendDailyBar symbols at generation time; not full market'
+        market['observed_at'] = row.get('data_asof')
+        market['source_checked_at'] = row.get('data_asof')
+    trend_selected = []
+    for market in markets:
+        board = read_json(root / 'data/tg_daily_boards' /
+                          f"{market['market']}_{market.get('archive_date')}.json", {})
+        for item in (board.get('items') or [])[:10] if isinstance(board, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            trend_selected.append(dict(market=market['market'], symbol=item.get('symbol'),
+                                       name=item.get('name'), change_pct=number(item.get('change_pct')),
+                                       trend_score=number(item.get('trend_score')),
+                                       selection_source='TG daily selected board',
+                                       session_date=market['session_date']))
     crypto, crypto_health, crypto_limits = crypto_snapshot(crypto_db, now)
     macro, crypto_activity, macro_health = macro_snapshot(root, now)
     limitations.extend(crypto_limits)
-    limitations.extend(["股票候选池不是全市场；负向候选仅为可验证区间跌幅排序，未做波动率标准化",
+    limitations.extend(["Trend Selection与独立Market Anomaly Scan分开；后者仅为可观测样本的真实1日涨跌幅，不是全市场或Z-score",
                         "加密 CEX 仅覆盖 Binance USDT 现货/永续按 24h 成交额各前 150；链上仅覆盖已发现合约，安全通过不保证可卖出",
                         "主要综合指数与完整市场广度当前无可靠归档，保持 null；20:00 北京时间美股采用上一已完成纽约交易日",
                         "跨市场因果归因与交易评级未实现"])
-    all_health = stock_health + crypto_health + [macro_health]
-    return dict(schema_version="1.1", snapshot_id=f"{now.date().isoformat()}-{int(now.timestamp())}",
+    anomaly_health = [dict(domain=f"agent_anomaly_{row['market']}", session_date=row['session_date'],
+                           data_asof=row['data_asof'], quality=row['quality'], stale=row['stale'],
+                           source='independent Agent market scan', missing_reason=row['missing_reason']) for row in coverage]
+    all_health = stock_health + anomaly_health + crypto_health + [macro_health]
+    return dict(schema_version="1.2", snapshot_id=f"{now.date().isoformat()}-{int(now.timestamp())}",
                 generated_at=now.isoformat(timespec="seconds"), timezone="Asia/Shanghai",
+                snapshot_generated_at=now.isoformat(timespec="seconds"),
                 session_date={m['market']: m['session_date'] for m in markets},
                 data_asof={h['domain']: h['data_asof'] for h in all_health},
-                stale=any(h['stale'] for h in all_health), quality="partial",
+                stale=any(h['stale'] for h in all_health) or any(o['stale'] for o in macro), quality="partial",
                 missing_reason="major-index/breadth and some baseline/adjustment fields unavailable; see limitations",
                 overview=dict(markets=markets, macro=macro, crypto_activity=crypto_activity),
-                anomalies=dict(stocks_up=stocks_up, stocks_down=stocks_down, crypto=crypto, cross_market=[]),
+                trend_selected=trend_selected,
+                market_anomalies=dict(stocks_up=stocks_up, stocks_down=stocks_down,
+                                      relative_strong=relative_up, relative_weak=relative_down,
+                                      coverage=coverage),
+                anomalies=dict(stocks_up=stocks_up, stocks_down=stocks_down, crypto=crypto,
+                               relative_strong=relative_up, relative_weak=relative_down,
+                               cross_market=[]),
                 source_health=all_health, limitations=limitations)
 
 
-def ensure_daily_ready(snapshot, now):
+def ensure_daily_ready(snapshot, now, require_market_scan=True):
     """Refuse a weekday 'complete' publication when finished upstream sessions are absent."""
     if now.weekday() >= 5:
         raise ValueError("daily publication is for Monday-Friday only")
@@ -442,9 +682,16 @@ def ensure_daily_ready(snapshot, now):
     for domain in ("crypto_spot", "crypto_futures", "crypto_onchain", "macro"):
         if health[domain]["stale"] or health[domain]["quality"] == "missing":
             raise ValueError(f"{domain} source not ready")
+    if require_market_scan:
+        for market in ('CN', 'HK', 'US'):
+            row = next((r for r in snapshot.get('market_anomalies', {}).get('coverage', [])
+                        if r.get('market') == market), None)
+            if not row or row['negative_coverage_status'] == 'insufficient':
+                raise ValueError(f'{market} independent anomaly scan coverage insufficient')
 
 
 def generate(root, crypto_db, output, now=None, require_daily_ready=False):
+    from agent_snapshot_health import audit, write_health
     now = now or datetime.now(SHANGHAI)
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("generation time must be timezone-aware")
@@ -454,20 +701,25 @@ def generate(root, crypto_db, output, now=None, require_daily_ready=False):
         existing = json.loads(data)
         if require_daily_ready:
             ensure_daily_ready(existing, now)
+            if audit(existing, output, now)['failures']:
+                raise ValueError('existing archive failed Agent quality audit')
         if len(data) > MAX_BYTES:
-            raise ValueError("existing archive exceeds 100 KB")
+            raise ValueError("existing archive exceeds 220 KB")
     else:
         snapshot = build_snapshot(root, crypto_db, now)
         if require_daily_ready:
             ensure_daily_ready(snapshot, now)
+            if audit(snapshot, output, now)['failures']:
+                raise ValueError('Agent quality audit failed')
         data = (json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
         if len(data) > MAX_BYTES:
-            raise ValueError("snapshot exceeds 100 KB")
+            raise ValueError("snapshot exceeds 220 KB")
         if not snapshot["overview"]["macro"] and not any(x["candidate_universe"] for x in snapshot["overview"]["markets"]):
             raise ValueError("no usable market data; latest not updated")
         immutably_create(archive, data)
         data = archive.read_bytes()
         json.loads(data)
+    write_health(json.loads(data), output, now)
     atomically_write(output / "latest.json", data)
     return json.loads(data), len(data)
 

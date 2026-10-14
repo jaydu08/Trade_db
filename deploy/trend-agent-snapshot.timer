@@ -4,6 +4,7 @@ Description=Run Trend Agent public snapshot before 18:45 Asia/Shanghai
 [Timer]
 OnCalendar=*-*-* 18:30:00
 OnCalendar=*-*-* 18:40:00
+OnCalendar=*-*-* 18:10:00
 AccuracySec=1min
 Persistent=false
 Unit=trend-agent-snapshot.service

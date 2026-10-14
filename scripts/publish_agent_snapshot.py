@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from generate_agent_smoke import write_smoke
 from generate_agent_snapshot import generate
 from generate_agent_period_snapshot import generate as generate_period
+from agent_market_scan import scan as scan_agent_market
 
 
 def git(repo, *arguments):
@@ -33,8 +34,11 @@ def publish(root, crypto_db, repo, preview_periods=False):
         allowed = set()
         published = []
         if now.weekday() < 5 and not preview_periods:
+            if not (output / 'history' / f'{now.date().isoformat()}.json').exists():
+                scan_agent_market(root, root / 'data/agent_market_scan', now)
             snapshot, size = generate(root, crypto_db, output, now, require_daily_ready=True)
-            allowed.update({"agent/v1/latest.json", f"agent/v1/history/{now.date().isoformat()}.json"})
+            allowed.update({"agent/v1/latest.json", f"agent/v1/history/{now.date().isoformat()}.json",
+                            f"agent/v1/health/{now.date().isoformat()}.json"})
             published.append((snapshot["snapshot_id"], size))
         due = [(7, now.weekday() == 6),
                (30, (now + timedelta(days=1)).month != now.month)]

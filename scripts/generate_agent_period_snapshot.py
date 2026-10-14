@@ -12,7 +12,7 @@ from pathlib import Path
 
 from generate_agent_snapshot import (NEW_YORK, SHANGHAI, classify_stock_asset,
                                      epoch_iso, immutably_create, number, read_json,
-                                     readonly_db, utc_naive_iso)
+                                     readonly_db, utc_naive_iso, macro_freshness)
 
 MAX_BYTES = 200_000
 
@@ -268,12 +268,20 @@ def macro_period(root, days, now):
         median = ordered[len(ordered) // 2]
         for row in result:
             row['relative_strength_pct'] = round(row['return_pct'] - median, 3)
-    rates = [{'symbol': i.get('id'), 'name': i.get('name'), 'value': number(i.get('value')),
-              'unit': i.get('unit'), 'period_return_pct': None, 'data_asof': i.get('asof'),
-              'source': i.get('source'), 'quality': 'partial',
-              'stale': not i.get('asof') or (now.date() - date.fromisoformat(str(i['asof'])[:10])).days > 7,
-              'missing_reason': 'no 7/30-day historical series in current macro cache'}
-             for i in payload.get('macro', []) if i.get('id') in ('DGS2', 'DGS10', 'DFII10', 'DFEDTARU', 'DTWEXBGS')]
+    rates = []
+    for item in payload.get('macro', []):
+        if item.get('id') not in ('DGS2', 'DGS10', 'DFII10', 'DFEDTARU', 'DTWEXBGS'):
+            continue
+        status, stale, reason, expected = macro_freshness(
+            item.get('id'), item.get('asof'), payload.get('macro_checked_at'), now)
+        rates.append({'symbol': item.get('id'), 'name': item.get('name'),
+                      'value': number(item.get('value')), 'unit': item.get('unit'),
+                      'period_return_pct': None, 'data_asof': item.get('asof'),
+                      'source_checked_at': epoch_iso(payload.get('macro_checked_at')),
+                      'expected_observation_date': expected, 'source': item.get('source'),
+                      'quality': 'stale' if stale else 'partial', 'stale': stale,
+                      'stale_reason': reason if stale else None,
+                      'missing_reason': 'no 7/30-day historical series in current macro cache'})
     return list(_rank(result, 8)), rates
 
 

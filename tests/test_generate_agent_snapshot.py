@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import sqlite3
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -10,6 +11,7 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/generate_agent_snapshot.py"
+sys.path.insert(0, str(SCRIPT.parent))
 SPEC = importlib.util.spec_from_file_location("generate_agent_snapshot", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -27,6 +29,7 @@ class SnapshotTest(unittest.TestCase):
         self.now = datetime(2026, 10, 13, 19, 45, tzinfo=timezone(timedelta(hours=8)))
         with sqlite3.connect(self.data / "ledger.db") as db:
             db.execute("CREATE TABLE trenddailybar (date TEXT, market TEXT, symbol TEXT, name TEXT, close REAL, amount REAL, turnover_rate REAL, source TEXT, catalyst_tags TEXT, updated_at TEXT)")
+            db.execute("CREATE TABLE trendseedpool (date TEXT, market TEXT, symbol TEXT, name TEXT)")
             db.execute("CREATE TABLE dailyrank (id INTEGER PRIMARY KEY, date TEXT, market TEXT, symbol TEXT, change_pct REAL)")
             rows = [
                 ("2026-10-12", "CN", "AAA", "上涨股", 10, 100, 1, "heatmap", "", "2026-10-12 09:30:00"),
@@ -64,11 +67,28 @@ class SnapshotTest(unittest.TestCase):
             {"market": "CN", "day": "2026-10-13", "amount": 1000000},
             {"market": "HK", "day": "2026-10-13", "amount": 2000000},
         ]), encoding="utf-8")
+        (self.data / 'agent_market_scan').mkdir()
+        (self.data / 'agent_market_scan/2026-10-13.json').write_text(json.dumps({
+            'markets': {
+                'CN': {'session_date': '2026-10-13', 'source_universe_count': 2,
+                       'available_universe_count': 2, 'excluded_reason_counts': {},
+                       'items': [dict(symbol='AAA', name='上涨股', price=11, change_pct=10,
+                                      observed_at='2026-10-13T15:30:00+08:00',
+                                      source_checked_at='2026-10-13T18:20:00+08:00', provider='Sina'),
+                                 dict(symbol='BBB', name='下跌股', price=9, change_pct=-10,
+                                      observed_at='2026-10-13T15:30:00+08:00',
+                                      source_checked_at='2026-10-13T18:20:00+08:00', provider='Sina')]},
+                'HK': {'session_date': '2026-10-13', 'source_universe_count': 1,
+                       'available_universe_count': 1, 'excluded_reason_counts': {},
+                       'items': [dict(symbol='00001', name='港股', price=80, change_pct=14,
+                                      observed_at='2026-10-13T16:03:00+08:00',
+                                      source_checked_at='2026-10-13T18:20:00+08:00', provider='Sina')]}
+            }}), encoding='utf-8')
 
     def test_real_fields_direction_session_and_immutable_history(self):
         first, size = MODULE.generate(self.root, self.crypto, self.output, self.now)
         self.assertLess(size, 100_000)
-        self.assertEqual(first["schema_version"], "1.1")
+        self.assertEqual(first["schema_version"], "1.2")
         self.assertEqual(first["overview"]["markets"][2]["session_date"], "2026-10-12")
         self.assertEqual(first["overview"]["macro"][0]["value"], 4.5)
         self.assertIn("BBB", [x["symbol"] for x in first["anomalies"]["stocks_down"]])
@@ -92,13 +112,13 @@ class SnapshotTest(unittest.TestCase):
 
     def test_completed_session_gate_and_asset_types(self):
         snapshot = MODULE.build_snapshot(self.root, self.crypto, self.now)
-        MODULE.ensure_daily_ready(snapshot, self.now)
+        MODULE.ensure_daily_ready(snapshot, self.now, require_market_scan=False)
         self.assertEqual(snapshot["anomalies"]["stocks_up"][0]["asset_type"], "UNKNOWN")
         self.assertEqual(MODULE.classify_stock_asset("107.SOXL", "三倍做多半导体ETF")[0], "LEVERAGED_ETF")
         self.assertEqual(MODULE.classify_stock_asset("105.SPY", "标普500ETF")[0], "ETF")
         snapshot["overview"]["markets"][0]["session_date"] = "2026-10-12"
         with self.assertRaisesRegex(ValueError, "CN completed session"):
-            MODULE.ensure_daily_ready(snapshot, self.now)
+            MODULE.ensure_daily_ready(snapshot, self.now, require_market_scan=False)
 
 
 if __name__ == "__main__":
