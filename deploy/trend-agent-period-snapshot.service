@@ -1,0 +1,12 @@
+[Unit]
+Description=Publish public-only Trend Agent weekly and monthly snapshots
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/Trade_db
+ExecStart=/root/.pyenv/versions/3.12.12/bin/python3 /root/Trade_db/scripts/publish_agent_snapshot.py --root /root/Trade_db --crypto-db /root/alpha_news/data/crypto_trend.sqlite --repo /root/trend_agent_public --period-only
+TimeoutStartSec=180
+Nice=10
+UMask=0022

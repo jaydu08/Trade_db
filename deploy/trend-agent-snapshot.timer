@@ -1,10 +1,10 @@
 [Unit]
-Description=Run Trend Agent public snapshot before 18:45 Asia/Shanghai
+Description=Run Trend Agent daily snapshot after A/H pool refresh
 
 [Timer]
-OnCalendar=*-*-* 18:30:00
-OnCalendar=*-*-* 18:40:00
-OnCalendar=*-*-* 18:10:00
+OnCalendar=Mon..Fri *-*-* 19:25:00
+OnCalendar=Mon..Fri *-*-* 19:40:00
+OnCalendar=Mon..Fri *-*-* 19:55:00
 AccuracySec=1min
 Persistent=false
 Unit=trend-agent-snapshot.service

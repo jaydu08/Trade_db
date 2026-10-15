@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Trend Agent period snapshot before 18:45 Asia/Shanghai
+
+[Timer]
+OnCalendar=*-*-* 18:30:00
+OnCalendar=*-*-* 18:40:00
+AccuracySec=1min
+Persistent=false
+Unit=trend-agent-period-snapshot.service
+
+[Install]
+WantedBy=timers.target

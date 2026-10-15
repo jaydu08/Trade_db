@@ -22,7 +22,9 @@ def git(repo, *arguments):
                           text=True, capture_output=True, timeout=45).stdout.strip()
 
 
-def publish(root, crypto_db, repo, preview_periods=False):
+def publish(root, crypto_db, repo, preview_periods=False, daily_only=False, period_only=False):
+    if sum((preview_periods, daily_only, period_only)) > 1:
+        raise ValueError('choose only one publication mode')
     if git(repo, "branch", "--show-current") != "agent-data":
         raise RuntimeError("refusing to publish outside isolated agent-data branch")
     lock_path = repo / ".git/trend-agent-publish.lock"
@@ -34,7 +36,7 @@ def publish(root, crypto_db, repo, preview_periods=False):
         output = repo / "agent/v1"
         allowed = set()
         published = []
-        if now.weekday() < 5 and not preview_periods:
+        if now.weekday() < 5 and not (preview_periods or period_only):
             today_archive = output / 'history' / f'{now.date().isoformat()}.json'
             legacy_archive = (today_archive.exists() and
                               not json.loads(today_archive.read_text(encoding='utf-8')).get('market_anomalies'))
@@ -51,7 +53,7 @@ def publish(root, crypto_db, repo, preview_periods=False):
         due = [(7, now.weekday() == 6),
                (30, (now + timedelta(days=1)).month != now.month)]
         for days, scheduled in due:
-            if scheduled or preview_periods:
+            if not daily_only and (scheduled or preview_periods):
                 snapshot, size = generate_period(root, crypto_db, output, days, now)
                 folder = "weekly" if days == 7 else "monthly"
                 allowed.add(f"agent/v1/{folder}/{now.date().isoformat()}.json")
@@ -79,10 +81,14 @@ def main():
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--crypto-db", type=Path, default=Path("/root/alpha_news/data/crypto_trend.sqlite"))
     parser.add_argument("--repo", type=Path, required=True, help="isolated agent-data Git checkout")
-    parser.add_argument("--preview-periods", action="store_true",
-                        help="publish today's 7d/30d initial previews only, without daily")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--preview-periods", action="store_true",
+                      help="publish today's 7d/30d initial previews only, without daily")
+    mode.add_argument("--daily-only", action="store_true", help="publish weekday daily only")
+    mode.add_argument("--period-only", action="store_true", help="publish due weekly/monthly only")
     args = parser.parse_args()
-    published, commit = publish(args.root, args.crypto_db, args.repo, args.preview_periods)
+    published, commit = publish(args.root, args.crypto_db, args.repo,
+                                args.preview_periods, args.daily_only, args.period_only)
     print(f"Published {published}, commit {commit}")
 
 

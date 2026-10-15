@@ -120,6 +120,13 @@ class SnapshotTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "CN completed session"):
             MODULE.ensure_daily_ready(snapshot, self.now, require_market_scan=False)
 
+    def test_daily_requires_postclose_trend_pool_refresh(self):
+        snapshot = MODULE.build_snapshot(self.root, self.crypto, self.now)
+        cn = snapshot['overview']['markets'][0]
+        self.assertEqual(cn['archive_source_counts'].get('trend_pool_refresh_eod'), None)
+        with self.assertRaisesRegex(ValueError, 'CN current-day trend pool refresh not ready'):
+            MODULE.ensure_daily_ready(snapshot, self.now)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,7 @@ import os
 import re
 import sqlite3
 import tempfile
+from collections import Counter
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -240,6 +241,7 @@ def stock_snapshot(root, now):
             bars = db.execute("SELECT symbol,name,close,amount,turnover_rate,source,catalyst_tags,updated_at "
                               "FROM trenddailybar WHERE market=? AND date=? AND close>0",
                               (market, source_date)).fetchall()
+            archive_source_counts = dict(Counter(str(bar['source']) for bar in bars))
             preference = {"heatmap": 3, "daily_hot": 2, "trend_pool_refresh_eod": 1}
             latest = {}
             for bar in bars:
@@ -268,7 +270,7 @@ def stock_snapshot(root, now):
                                 quality="partial", stale=old, missing_reason=None if latest else "no valid close",
                                 turnover=number(activity_row.get("amount")) if activity_row else None,
                                 turnover_currency=CURRENCY[market], breadth=None, major_index=None,
-                                candidate_universe=len(latest)))
+                                candidate_universe=len(latest), archive_source_counts=archive_source_counts))
             health.append(dict(domain=f"stocks_{market}", session_date=session, data_asof=last_asof,
                                source="Trade_db ledger.db", quality="partial", stale=old,
                                missing_reason=None if latest else "no valid close"))
@@ -669,6 +671,9 @@ def ensure_daily_ready(snapshot, now, require_market_scan=True):
         asof = row.get("data_asof")
         if not asof or datetime.fromisoformat(asof).astimezone(SHANGHAI).hour < 16:
             raise ValueError(f"{market} current-day data has no post-close observation")
+        counts = row.get('archive_source_counts')
+        if require_market_scan and counts is not None and not counts.get('trend_pool_refresh_eod'):
+            raise ValueError(f"{market} current-day trend pool refresh not ready")
     us = markets["US"]
     us_asof = us.get("data_asof")
     if not us_asof or not us.get("candidate_universe"):
