@@ -701,16 +701,18 @@ def generate(root, crypto_db, output, now=None, require_daily_ready=False):
         existing = json.loads(data)
         if require_daily_ready:
             ensure_daily_ready(existing, now)
-            if audit(existing, output, now)['failures']:
-                raise ValueError('existing archive failed Agent quality audit')
+            failures = audit(existing, output, now)['failures']
+            if failures:
+                raise ValueError(f'existing archive failed Agent quality audit: {list(dict.fromkeys(failures))[:3]}')
         if len(data) > MAX_BYTES:
             raise ValueError("existing archive exceeds 220 KB")
     else:
         snapshot = build_snapshot(root, crypto_db, now)
         if require_daily_ready:
             ensure_daily_ready(snapshot, now)
-            if audit(snapshot, output, now)['failures']:
-                raise ValueError('Agent quality audit failed')
+            failures = audit(snapshot, output, now)['failures']
+            if failures:
+                raise ValueError(f'Agent quality audit failed: {list(dict.fromkeys(failures))[:3]}')
         data = (json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
         if len(data) > MAX_BYTES:
             raise ValueError("snapshot exceeds 220 KB")

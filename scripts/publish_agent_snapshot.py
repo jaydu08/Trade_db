@@ -40,6 +40,9 @@ def publish(root, crypto_db, repo, preview_periods=False):
                               not json.loads(today_archive.read_text(encoding='utf-8')).get('market_anomalies'))
             if not today_archive.exists():
                 scan_agent_market(root, root / 'data/agent_market_scan', now)
+                # The quote scan runs after the timer fires. Audit against its
+                # completion time, not the earlier timer-entry timestamp.
+                now = datetime.now(ZoneInfo("Asia/Shanghai"))
             if not legacy_archive:
                 snapshot, size = generate(root, crypto_db, output, now, require_daily_ready=True)
                 allowed.update({"agent/v1/latest.json", f"agent/v1/history/{now.date().isoformat()}.json",
