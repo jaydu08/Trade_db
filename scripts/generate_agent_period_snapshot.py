@@ -87,7 +87,17 @@ def stock_period(root, days, now, scores):
                          ((now.date() - timedelta(days=days + 25)).isoformat(),)).fetchall()
         seen = defaultdict(dict)
         preference = {'heatmap': 4, 'daily_hot': 3, 'commodity': 3, 'trend_pool_refresh_eod': 1}
+        local_now = now.astimezone(SHANGHAI)
+        today = local_now.date().isoformat()
+        incomplete_markets = set()
         for row in raw:
+            # A/H and commodity bars from a morning trading session are not a
+            # completed close. The month-end 10:00 report excludes them.
+            if row['market'] in ('CN', 'HK', 'CF') and row['date'] == today and local_now.hour < 17:
+                incomplete_markets.add(row['market'])
+                continue
+            if row['date'] > today:
+                continue
             key = (row['market'], str(row['symbol']))
             prior = seen[key].get(row['date'])
             if prior is None or preference.get(row['source'], 0) > preference.get(prior['source'], 0):
@@ -134,10 +144,13 @@ def stock_period(root, days, now, scores):
             second_half = round(((1 + change / 100) / (1 + first_half / 100) - 1) * 100, 3)
         else:
             second_half = None
+        score = scores.get((market, symbol)) if market not in incomplete_markets else None
         row = {'market': market, 'symbol': symbol, 'name': latest['name'],
                'asset_type': asset_type, 'asset_type_source': asset_source,
-               'return_pct': change, 'trend_score': scores.get((market, symbol)),
-               'trend_score_missing_reason': None if (market, symbol) in scores else 'not selected by rising-only Trend algorithm',
+               'return_pct': change, 'trend_score': score,
+               'trend_score_missing_reason': (None if score is not None else
+                   'current-day incomplete bars excluded; live Trend score not comparable' if market in incomplete_markets else
+                   'not selected by rising-only Trend algorithm'),
                'price': number(latest['close']), 'price_adjustment': 'unknown_from_existing_archive',
                'volume_change_pct': None, 'amount_change_pct': amount_change,
                'amount_change_missing_reason': None if amount_change is not None else 'insufficient comparable amount bars',
@@ -304,12 +317,21 @@ def build(root, crypto_db, days, now, scores=None):
                        'missing_reason': None if global_assets or rates else 'macro cache unavailable'})
     sessions = {market: max((r['session_date'] for r in stocks if r['market'] == market), default=None)
                 for market in ('CN', 'HK', 'US', 'CF')}
-    return {'schema_version': '1.1', 'snapshot_id': f'{days}d-{now.date().isoformat()}-{int(now.timestamp())}',
+    month_end_morning = (days == 30 and (now + timedelta(days=1)).month != now.month
+                         and now.astimezone(SHANGHAI).hour < 17)
+    return {'schema_version': '1.2', 'snapshot_id': f'{days}d-{now.date().isoformat()}-{int(now.timestamp())}',
             'generated_at': now.isoformat(timespec='seconds'), 'timezone': 'Asia/Shanghai',
             'session_date': sessions,
             'data_asof': {h['domain']: h['data_asof'] for h in all_health},
             'period': 'weekly' if days == 7 else 'monthly',
             'run_kind': 'scheduled' if (now.weekday() == 6 if days == 7 else (now + timedelta(days=1)).month != now.month) else 'initial_preview',
+            'publication_context': {
+                'report_cutoff': now.isoformat(timespec='seconds'),
+                'full_calendar_month_complete': False if month_end_morning else None,
+                'month_end_morning_note': ('Month-end current day is not complete: CN/HK/CF exclude unfinished current-day bars; '
+                                           'stocks use each market latest completed archived session, crypto uses actual sample time. '
+                                           'This is a rolling 30-calendar-day report, not a full finished calendar month.')
+                    if month_end_morning else None},
             'window_definition': {'stocks_and_commodities': f'{days} calendar days between archived closes; non-trading dates use nearest earlier close within TrendCalculator tolerance',
                                   'crypto': f'{days}*24 rolling hours from each actual sample, baseline <=1h old',
                                   'global_assets': f'{days} calendar days in existing macro cache; exact baseline date unavailable'},

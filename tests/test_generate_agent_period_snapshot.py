@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import generate_agent_period_snapshot as period
@@ -72,6 +73,33 @@ class PeriodTest(unittest.TestCase):
         points = [(datetime(2026, 9, 1).date(), {'close': 100}),
                   (datetime(2026, 10, 14).date(), {'close': 110})]
         self.assertIsNone(period._return(points, 30)[0])
+
+    def test_month_end_morning_excludes_incomplete_stock_session(self):
+        morning = datetime(2026, 11, 30, 9, 35, tzinfo=timezone(timedelta(hours=8)))
+        with sqlite3.connect(self.root / 'data/ledger.db') as db:
+            for day, price in [('2026-10-28', 100), ('2026-11-27', 110),
+                               ('2026-11-30', 250)]:
+                db.execute('INSERT INTO trenddailybar VALUES (?,?,?,?,?,?,?,?,?)',
+                           (day, 'CN', 'UP', 'UP', price, 1000, 1, 'heatmap',
+                            '2026-11-30 01:30:00'))
+        rows, _ = period.stock_period(self.root, 30, morning, {('CN', 'UP'): 99})
+        item = next(row for row in rows if row['symbol'] == 'UP')
+        self.assertEqual(item['window_end'], '2026-11-27')
+        self.assertEqual(item['price'], 110)
+        self.assertIsNone(item['trend_score'])
+        self.assertIn('incomplete bars excluded', item['trend_score_missing_reason'])
+
+    def test_month_end_morning_is_explicitly_partial(self):
+        morning = datetime(2026, 11, 30, 9, 35, tzinfo=timezone(timedelta(hours=8)))
+        with patch.object(period, 'stock_period', return_value=(
+                [{'market': 'CN', 'session_date': '2026-11-27'}], [])), \
+             patch.object(period, 'crypto_period', return_value=([{'market': 'spot'}], [])), \
+             patch.object(period, 'macro_period', return_value=([], [])):
+            snapshot = period.build(self.root, self.crypto, 30, morning, scores={})
+        self.assertFalse(snapshot['publication_context']['full_calendar_month_complete'])
+        self.assertIn('not a full finished calendar month',
+                      snapshot['publication_context']['month_end_morning_note'])
+        self.assertEqual(snapshot['run_kind'], 'scheduled')
 
 
 if __name__ == '__main__':
