@@ -23,6 +23,7 @@ from modules.ingestion.market_cap import (
     format_mv_hk,
 )
 from modules.ingestion.us_market_cap import get_us_market_metrics
+from modules.analysis.market_relative_strength import build_benchmark, qualifies, save_benchmark
 
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ class MarketHeatMap:
             os.getenv("ENABLE_HEATMAP_MARKET_BRIEF", "1")
         ).strip().lower() in {"1", "true", "yes", "on"}
         # A股热榜参数（可通过环境变量在线调参）
-        # 入池使用分板块绝对涨幅门槛，避免 20cm 大票涨 6~10% 被统一归一化门槛误杀。
+        # 指数基准可用时按相对强度入池；缺失时保留原分板块绝对涨幅门槛。
         self.cn_pct_min_main = float(os.getenv("CN_HEAT_MAIN_PCT_MIN", "5.0"))
         self.cn_pct_min_20cm = float(os.getenv("CN_HEAT_20CM_PCT_MIN", "6.0"))
         self.cn_pct_min_bj = float(os.getenv("CN_HEAT_BJ_PCT_MIN", "8.0"))
@@ -54,7 +55,7 @@ class MarketHeatMap:
         self.cn_turnover_fetch_cap = int(os.getenv("CN_HEAT_TURNOVER_FETCH_CAP", "220"))
         self.cn_hard_amount_min = float(os.getenv("CN_HARD_AMOUNT_MIN", "200000000"))
         self.cn_hard_total_mv_100m_min = float(os.getenv("CN_HARD_TOTAL_MV_100M_MIN", "50"))
-        self.hk_hard_amount_min = float(os.getenv("HK_HARD_AMOUNT_MIN", "250000000"))
+        self.hk_hard_amount_min = float(os.getenv("HK_HARD_AMOUNT_MIN", "100000000"))
         self.us_hard_mcap_musd_min = float(os.getenv("US_HARD_MCAP_MUSD_MIN", "1000"))
         self.us_mcap_fetch_cap = int(os.getenv("US_HEAT_MCAP_FETCH_CAP", "160"))
         self.fomo_upper_shadow_pct = float(os.getenv("FOMO_UPPER_SHADOW_PCT", "0.03"))
@@ -823,7 +824,7 @@ class MarketHeatMap:
         )
         return work
 
-    def _generate_heatmap(self, df: pd.DataFrame, market: str, top_n: int = 10, min_amount: float = 50000000) -> List[Dict]:
+    def _generate_heatmap(self, df: pd.DataFrame, market: str, top_n: int = 10, min_amount: float = 50000000, benchmark_pct=None) -> List[Dict]:
         """从行情 DataFrame 中选出榜单"""
         if df.empty:
             return []
@@ -871,6 +872,8 @@ class MarketHeatMap:
 
         # 过滤成交额太小的仙股 (默认 5000 万)
         filtered = renamed_df[renamed_df["amount"] >= min_amount].copy()
+        if filtered.empty:
+            return []
         
         if market == 'CN':
             filtered = self._apply_cn_hard_funnel(renamed_df, min_amount)
@@ -892,10 +895,15 @@ class MarketHeatMap:
 
             normalized_pct = filtered["pct_chg"] / limits
 
-            # 入池门槛（可配置）：主板/20cm/北交所分别使用绝对涨幅线。
+            # 有当日基准时使用板块差异化相对强度；无基准才回退旧绝对涨幅线。
             pct_thresholds = self._cn_pct_gate_thresholds(filtered)
-            pool_mask = filtered["pct_chg"] >= pct_thresholds
-            if not bool(pool_mask.any()):
+            if benchmark_pct is not None:
+                pool_mask = filtered.apply(
+                    lambda row: qualifies(market, row["symbol"], row["pct_chg"], benchmark_pct), axis=1
+                )
+            else:
+                pool_mask = filtered["pct_chg"] >= pct_thresholds
+            if not bool(pool_mask.any()) and benchmark_pct is None:
                 fallback_thresholds = self._cn_pct_gate_thresholds(filtered, fallback=True)
                 logger.warning(
                     "CN: pct gate main/20cm/bj >= %.1f/%.1f/%.1f 无满足标的，降级到 %.1f/%.1f/%.1f",
@@ -967,8 +975,15 @@ class MarketHeatMap:
                 w["trend"],
             )
         else:
-            # HK / US：同样改用百分位归一化
-            filtered = filtered[filtered["pct_chg"] >= 5.0].copy()
+            # HK / US：先筛同日相对强度，再用涨幅/成交额/换手率排序。
+            if benchmark_pct is not None:
+                filtered = filtered[
+                    filtered.apply(
+                        lambda row: qualifies(market, row["symbol"], row["pct_chg"], benchmark_pct), axis=1
+                    )
+                ].copy()
+            else:
+                filtered = filtered[filtered["pct_chg"] >= 5.0].copy()
 
             if market == 'HK':
                 filtered = self._apply_hk_hard_funnel(filtered)
@@ -1337,9 +1352,12 @@ class MarketHeatMap:
                 amount_str = self._format_trend_amount(item.get("amount"), market)
                 industry_text = f"  行业:[{industry}]" if industry else ""
                 catalyst_text = f"  催化:[{catalyst}]" if catalyst else ""
+                rs = item.get("relative_strength_pct")
+                rs_basis = str(item.get("relative_strength_basis", "") or "").strip()
+                rs_text = f"  相对{rs_basis}:{float(rs):+.2f}pp" if rs is not None and rs_basis else ""
                 msg_lines.append(
                     f"**{idx}. {name} ({symbol})**  💰 现价: {price_str}  `{pct_str}`  "
-                    f"{cap_str}  {amount_str}  评分:{score:.2f}{industry_text}{catalyst_text}"
+                    f"{cap_str}  {amount_str}  评分:{score:.2f}{rs_text}{industry_text}{catalyst_text}"
                 )
                 msg_lines.append("")
 
@@ -1415,13 +1433,33 @@ class MarketHeatMap:
             except Exception as exc:
                 logger.warning('Market activity turnover recording failed for %s: %s', market, exc)
 
-        persist_stocks = self._generate_heatmap(df, market, top_n=persist_n, min_amount=min_amt)
+        benchmark = build_benchmark(df, market, datetime.date.today()) if not df.empty else None
+        if benchmark:
+            try:
+                save_benchmark(benchmark)
+                logger.info(
+                    "%s relative-strength benchmark: %s %.2f%% (%s)",
+                    market, benchmark["basis"], benchmark["return_pct"], benchmark["source"],
+                )
+            except OSError as exc:
+                logger.warning("Could not save %s relative-strength benchmark: %s", market, exc)
+                benchmark = None
+        else:
+            logger.warning("%s relative-strength benchmark unavailable; retaining legacy absolute gate", market)
+
+        persist_stocks = self._generate_heatmap(
+            df, market, top_n=persist_n, min_amount=min_amt,
+            benchmark_pct=benchmark["return_pct"] if benchmark else None,
+        )
         if market == "US":
             top_stocks = self._cap_us_leveraged_ranked(persist_stocks, push_n)
         else:
             top_stocks = persist_stocks[:push_n]
         
         if not top_stocks:
+            if benchmark:
+                logger.info("%s has no stocks meeting the relative-strength gate; no fallback alert", market)
+                return
             logger.warning(f"No stocks found for {market} heat map. Fallback to daily top ranks.")
             fallback_df = akshare_client.get_daily_top_ranks(
                 market=market, rank_type="change_pct", top_n=persist_n

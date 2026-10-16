@@ -2340,7 +2340,7 @@ def get_heatmap_trend_push(
     except Exception:
         raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
 
-    cache_key = f"api_heatmap_trend_push_v10_{market_filter}_{target_date}_{days}"
+    cache_key = f"api_heatmap_trend_push_v11_{market_filter}_{target_date}_{days}"
     cached = get_cache(cache_key) if not force_refresh else None
     if isinstance(cached, dict):
         return cached
@@ -2353,6 +2353,9 @@ def get_heatmap_trend_push(
         from modules.monitor.trend_service import TrendCalculator
         from modules.monitor.trend_report_service import TrendReportService
         from modules.monitor.industry_intel import enrich_industry_labels
+        from modules.analysis.market_relative_strength import load_benchmark, qualifies
+
+        benchmark = load_benchmark(market_filter, target_date) if days == 1 else None
 
         def _env_int(name: str, default: int) -> int:
             try:
@@ -2538,12 +2541,12 @@ def get_heatmap_trend_push(
                 amount = _safe_float(r.amount)
                 if market_filter == "CN" and (amount < 200000000 or pct < 2.0):
                     continue
-                if market_filter == "HK" and (amount < 500000000 or pct < 3.0):
+                if market_filter == "HK" and (amount < (100000000 if benchmark else 500000000) or pct < (1.0 if benchmark else 3.0)):
                     continue
                 if market_filter == "US":
                     if TrendCalculator._is_leveraged_like(f"{sym} {str(r.name or '')}"):
                         continue
-                    if amount < 20000000 or pct < 3.0:
+                    if amount < 20000000 or pct < (1.5 if benchmark else 3.0):
                         continue
                 rec = by_symbol.setdefault(sym, {
                     "symbol": sym,
@@ -2626,6 +2629,8 @@ def get_heatmap_trend_push(
                     rec["name"] = str(daily.get("name") or "")
                 if _safe_float(daily.get("turnover_rate")) > 0:
                     rec["turnover_rate"] = _safe_float(daily.get("turnover_rate"))
+                if benchmark and not qualifies(market_filter, sym, ret, benchmark["return_pct"]):
+                    continue
             else:
                 series = [(d, vals[0], vals[1]) for d, vals in sorted((series_map.get(sym) or {}).items()) if vals[0] > 0]
                 ret, current_price, price_date = _series_return(series, days)
@@ -2646,6 +2651,7 @@ def get_heatmap_trend_push(
             item.update({
                 "current_price": current_price,
                 "return_pct": ret,
+                "relative_strength_pct": round(ret - benchmark["return_pct"], 3) if benchmark and days == 1 else None,
                 "price_date": price_date,
                 "reason_records": reasons,
                 "aggregated_reason": aggregated_reason,
@@ -2746,6 +2752,8 @@ def get_heatmap_trend_push(
                 "trend_score": _safe_float(s.get("trend_score")),
                 "return_score": _safe_float(s.get("return_score", s.get("return_pct"))),
                 "signal_strength": _safe_float(s.get("signal_strength")),
+                "relative_strength_pct": s.get("relative_strength_pct"),
+                "relative_strength_basis": benchmark["basis"] if benchmark and days == 1 else None,
                 "mcap_mult": _safe_float(s.get("mcap_mult"), 1.0),
                 "days_on_list": days_on_list,
                 "price_date": str(s.get("price_date", "") or ""),
@@ -2757,6 +2765,7 @@ def get_heatmap_trend_push(
             "days": days,
             "market": market_filter,
             "quota": quota,
+            "relative_strength_benchmark": benchmark if days == 1 else None,
             "items": items,
         }
         set_cache(cache_key, payload, ttl=600)
