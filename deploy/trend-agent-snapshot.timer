@@ -2,9 +2,9 @@
 Description=Run Trend Agent daily snapshot after A/H pool refresh
 
 [Timer]
-OnCalendar=Mon..Fri *-*-* 19:25:00
-OnCalendar=Mon..Fri *-*-* 19:40:00
-OnCalendar=Mon..Fri *-*-* 19:55:00
+OnCalendar=Mon..Fri *-*-* 19:12:00
+OnCalendar=Mon..Fri *-*-* 19:18:00
+OnCalendar=Mon..Fri *-*-* 19:23:00
 AccuracySec=1min
 Persistent=false
 Unit=trend-agent-snapshot.service
