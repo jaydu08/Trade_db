@@ -1844,11 +1844,12 @@ def get_daily_hot_trend(
 ):
     """当日强势榜：只使用本地 DailyRank/TrendDailyBar 截面，避免 Web 打开时触发全市场 API。"""
     market_filter = _normalize_trend_market(market, {"CN", "HK", "US"})
-    cache_key = f"api_trend_daily_hot_v6_{market_filter or 'ALL'}_{date or 'latest'}_{limit}"
+    cache_key = f"api_trend_daily_hot_v7_{market_filter or 'ALL'}_{date or 'latest'}_{limit}"
 
     def _refresh_current_daily_payload(payload: Dict[str, Any]) -> None:
         if not isinstance(payload, dict):
             return
+        from modules.analysis.market_relative_strength import load_benchmark, qualifies
         today_text = dt.date.today().isoformat()
         markets_payload = payload.get("markets") or {}
         market_dates = payload.get("market_dates") or {}
@@ -1856,11 +1857,17 @@ def get_daily_hot_trend(
             if str(market_dates.get(mkt, "") or "") != today_text:
                 continue
             _refresh_trend_display_prices({mkt: rows}, mkt, return_mode="daily")
+            benchmark = load_benchmark(mkt, dt.date.today())
             rows[:] = [
                 row for row in rows
                 if _trend_float(row.get("return_pct")) > 0
                 and _trend_float(row.get("price")) > 0
+                and (not benchmark or qualifies(mkt, row.get("symbol", ""), row.get("return_pct"), benchmark["return_pct"]))
             ]
+            if benchmark:
+                for row in rows:
+                    row["relative_strength_pct"] = round(_trend_float(row.get("return_pct")) - benchmark["return_pct"], 3)
+                    row["relative_strength_basis"] = benchmark["basis"]
             rows.sort(
                 key=lambda row: (
                     _trend_float(row.get("return_pct")),
@@ -1885,6 +1892,7 @@ def get_daily_hot_trend(
         from modules.ingestion.market_cap import get_cn_market_metrics, get_hk_market_metrics
         from modules.ingestion.us_market_cap import get_us_market_metrics, get_us_market_metrics_light
         from modules.monitor.trend_service import TrendCalculator
+        from modules.analysis.market_relative_strength import load_benchmark, qualifies
         from sqlmodel import select, func
         import math
 
@@ -1918,7 +1926,8 @@ def get_daily_hot_trend(
                 "price_min": _env_float("DAILY_HOT_CN_PRICE_MIN", 1.0),
             },
             "HK": {
-                "amount_min": _env_float("DAILY_HOT_HK_AMOUNT_MIN", 500_000_000.0),
+                "amount_min": _env_float("DAILY_HOT_HK_AMOUNT_MIN", 100_000_000.0),
+                "legacy_amount_min": _env_float("DAILY_HOT_HK_LEGACY_AMOUNT_MIN", 500_000_000.0),
                 "price_min": _env_float("DAILY_HOT_HK_PRICE_MIN", 2.0),
             },
             "US": {
@@ -2063,18 +2072,21 @@ def get_daily_hot_trend(
                 )
             return list(store.values())
 
-        def _passes_pre_filter(market: str, item: dict) -> bool:
+        def _passes_pre_filter(market: str, item: dict, benchmark: dict) -> bool:
             pct = _to_float(item.get("return_pct"))
             price = _to_float(item.get("price"))
             amount = _to_float(item.get("amount"))
             if pct <= 0 or price <= 0:
+                return False
+            if benchmark and not qualifies(market, item.get("symbol", ""), pct, benchmark["return_pct"]):
                 return False
             if market == "CN":
                 return price >= thresholds["CN"]["price_min"] and amount >= thresholds["CN"]["amount_min"]
             if market == "HK":
                 if _is_hk_product(item.get("symbol", ""), item.get("name", "")):
                     return False
-                return price >= thresholds["HK"]["price_min"] and amount >= thresholds["HK"]["amount_min"]
+                amount_min = thresholds["HK"]["amount_min" if benchmark else "legacy_amount_min"]
+                return price >= thresholds["HK"]["price_min"] and amount >= amount_min
             if market == "US":
                 if _is_us_product(item.get("symbol", ""), item.get("name", "")):
                     return False
@@ -2175,13 +2187,20 @@ def get_daily_hot_trend(
 
         result = {}
         market_dates = {}
+        relative_strength_benchmarks = {}
         with get_ledger_session() as session:
             for mkt in markets:
                 market_date = _latest_market_date(session, mkt)
                 market_dates[mkt] = str(market_date or "")
+                benchmark = load_benchmark(mkt, market_date) if market_date else None
+                relative_strength_benchmarks[mkt] = benchmark
                 candidates = _load_candidates_for_market(session, mkt, market_date)
-                pre_filtered = [x for x in candidates if _passes_pre_filter(mkt, x)]
+                pre_filtered = [x for x in candidates if _passes_pre_filter(mkt, x, benchmark)]
                 cap_filtered = _enrich_and_filter_market_cap(mkt, pre_filtered)
+                if benchmark:
+                    for row in cap_filtered:
+                        row["relative_strength_pct"] = round(_to_float(row.get("return_pct")) - benchmark["return_pct"], 3)
+                        row["relative_strength_basis"] = benchmark["basis"]
                 final_rows = _score_rows(mkt, cap_filtered)
                 result[mkt] = final_rows
 
@@ -2251,6 +2270,7 @@ def get_daily_hot_trend(
             "candidate_source": "local DailyRank + TrendDailyBar",
             "thresholds": thresholds,
             "cap_lookup_limits": cap_lookup_limits,
+            "relative_strength_benchmarks": relative_strength_benchmarks,
             "markets": result,
         }
         if refresh_prices:
