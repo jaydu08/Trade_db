@@ -98,6 +98,9 @@ def macro_freshness(item_id, observed, checked, now, category='macro'):
 
 def classify_stock_asset(symbol, name, catalog_type=None):
     """Keep a visible ETF/leveraged-ETF distinction even if meta.asset says STOCK."""
+    verified = verified_hk_product(symbol)
+    if verified:
+        return verified["asset_type"], verified["classification_source"]
     ticker = str(symbol or "").split(".")[-1].upper()
     label = str(name or "")
     lower = label.lower()
@@ -113,6 +116,31 @@ def classify_stock_asset(symbol, name, catalog_type=None):
     if str(catalog_type or "").upper() == "STOCK":
         return "STOCK", "meta.asset"
     return "UNKNOWN", "insufficient_asset_metadata"
+
+
+def verified_hk_product(symbol):
+    """Exchange-verified product identity; a counter is not an ordinary share.
+
+    09747 is retained as a historical USD counter; HKEX terminated it in Sep 2026.
+    The product facts are from HKEX IFP fund pages BWT200 and BVZ635.
+    """
+    products = {
+        "07709": ("BWT200", "SK Hynix", "000660.KS", "HKD", "07709"),
+        "07747": ("BVZ635", "Samsung Electronics", "005930.KS", "HKD", "07747"),
+        "09747": ("BVZ635", "Samsung Electronics", "005930.KS", "USD", "07747"),
+    }
+    entry = products.get(str(symbol or "").split(".")[-1].zfill(5))
+    if not entry:
+        return None
+    fund_id, underlying, underlying_symbol, currency, primary = entry
+    return {"asset_type": "LEVERAGED_ETF", "classification_source":
+            f"HKEX IFP https://ifp.hkex.com.hk/fund-repository/zh-HK/fund/{fund_id}",
+            "leverage_factor": 2, "leverage_reset_period": "daily",
+            "underlying": underlying, "underlying_symbol": underlying_symbol,
+            "currency": currency, "product_id": fund_id,
+            "primary_counter": primary, "trading_counter": str(symbol or "").split(".")[-1].zfill(5),
+            "counter_status": "terminated_2026-09-18" if str(symbol or "").endswith("09747") else "unknown",
+            "classification_verified_at": "2026-10-19"}
 
 
 def number(value):
@@ -288,6 +316,7 @@ def stock_snapshot(root, now):
                 asset_type, type_source = classify_stock_asset(symbol, bar["name"], catalog.get(symbol))
                 item = dict(market=market, symbol=symbol, name=str(bar["name"] or ""),
                             asset_type=asset_type, asset_type_source=type_source,
+                            **({"product_metadata": verified_hk_product(symbol)} if verified_hk_product(symbol) else {}),
                             session_date=session, data_asof=utc_naive_iso(bar["updated_at"]),
                             price=price, price_type="close_or_archived_latest", currency=CURRENCY[market],
                             price_adjustment="unknown_from_existing_archive",
@@ -382,6 +411,7 @@ def stock_anomaly_snapshot(root, now):
                     continue
                 bar = by_symbol.get(symbol)
                 asset_type, type_source = classify_stock_asset(symbol, row.get('name'), catalog.get(symbol))
+                verified_product = verified_hk_product(symbol)
                 canonical = (symbol.split('.', 1)[1].upper()
                              if market == 'US' and re.fullmatch(r'\d{3}\.[A-Za-z][A-Za-z0-9.\-]*', symbol)
                              else symbol)
@@ -396,7 +426,9 @@ def stock_anomaly_snapshot(root, now):
                             canonical_symbol=canonical, asset_id=f'{market}:{symbol}', exchange=None,
                             name=str(row.get('name') or ''), asset_type=asset_type,
                             instrument_type=asset_type, asset_type_source=type_source,
-                            leverage_factor=leverage, underlying_asset=None,
+                            leverage_factor=verified_product['leverage_factor'] if verified_product else leverage,
+                            underlying_asset=verified_product['underlying_symbol'] if verified_product else None,
+                            product_metadata=verified_product,
                             direction='up' if change > 0 else 'down' if change < 0 else 'flat',
                             change_pct=round(change, 3), returns_pct={'1d': round(change, 3)},
                             price=price, price_type=row.get('price_type') or 'unknown',
