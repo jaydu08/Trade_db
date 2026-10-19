@@ -78,7 +78,7 @@ GROUP BY market,symbol,source;
 | 宏观过期指标 | 3，顶层 false | 3，顶层 true |
 | 周报字节数 | 104502 | 197410 |
 
-本次新增/覆盖的单测 31 项，另有原 Agent 数据质量测试 5 项、其余 Agent 生成器/冒烟/发布测试 9 项：生产仓库测试 **45/45 通过**。T01—T05 覆盖旧交易日、美股归档、停牌与缺源区分、重算相对强弱、统一终点；T06—T09 覆盖香港产品与多柜台及美股杠杆回归；T10—T14 覆盖缺失/可证实零金额、变化率可比性与商品零值；T15—T19 覆盖股票/宏观过期传播及领域隔离；T20—T21 覆盖 07747 基准缺口和正常休市；T22—T24 覆盖日快照兼容、30D 复用、不可变归档；T25 包括隔离回放 JSON Schema、语义校验和无 NaN/Infinity。额外加入商品归档日期不误标交易日、已终止柜台不可排名回归。30D 生产输入独立预览 `2026-10-19`：185985 字节、股票/商品 60、Crypto 30，通过同一校验，**不是月底正式发布**。最初月度预览因排除诊断过大达到 203647 字节，压缩月度诊断上限后通过；正式排名规则未变。最初 CF 空会话聚合在隔离回放触发 `TypeError`，增加回归并修复后通过；这两次失败均未发布。
+本次新增/覆盖的单测 31 项，另有原 Agent 数据质量测试 5 项、其余 Agent 生成器/冒烟/发布测试 9 项：生产仓库测试 **45/45 通过**。T01—T05 覆盖旧交易日、美股归档、停牌与缺源区分、重算相对强弱、统一终点；T06—T09 覆盖香港产品与多柜台及美股杠杆回归；T10—T14 覆盖缺失/可证实零金额、变化率可比性与商品零值；T15—T19 覆盖股票/宏观过期传播及领域隔离；T20—T21 覆盖 07747 基准缺口和正常休市；T22—T24 覆盖日快照兼容、30D 复用、不可变归档；T25 包括隔离回放 JSON Schema、语义校验和无 NaN/Infinity。额外加入商品归档日期不误标交易日、已终止柜台不可排名回归。30D 生产输入独立预览 `2026-10-19`：最终代码生成 185993 字节、股票/商品 60、Crypto 30，通过同一校验，**不是月底正式发布**。最初月度预览因排除诊断过大达到 203647 字节，压缩月度诊断上限后通过；正式排名规则未变。最初 CF 空会话聚合在隔离回放触发 `TypeError`，增加回归并修复后通过；这两次失败均未发布。
 
 验证命令：
 
@@ -87,7 +87,7 @@ python3 -B -m unittest discover -s tests -p 'test_generate_agent*.py' -q
 python3 -B -m unittest discover -s tests -p 'test_agent_data_quality.py' -q
 python3 -B -m unittest discover -s tests -p 'test_publish_agent_snapshot.py' -q
 python3 -B scripts/validate_agent_period_quality.py data/agent_replay/agent/v1/replay/weekly-2026-10-18-quality-v2.json
-python3 -B scripts/validate_agent_period_quality.py data/agent_preview/agent/v1/monthly/2026-10-19.json
+python3 -B scripts/validate_agent_period_quality.py data/agent_preview_final/agent/v1/monthly/2026-10-19.json
 ```
 
 ## 文件、发布边界与回滚
