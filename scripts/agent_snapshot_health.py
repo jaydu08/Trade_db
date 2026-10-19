@@ -24,6 +24,12 @@ def audit(snapshot, output, now):
     previous = sorted(archive.glob('*.json'), reverse=True) if archive.exists() else []
     for market in ('CN', 'HK', 'US'):
         current = next((row for row in coverage if row.get('market') == market), {})
+        if current.get('negative_coverage_status') == 'market_closed':
+            comparisons[market] = dict(eligible_universe_count=0, comparable_days=0,
+                                       baseline_median=None, drop_pct=None, significant_drop=False,
+                                       comparison_status='market_closed',
+                                       explanation='exchange-verified full-day closure; no current-session scan')
+            continue
         scope, version = current.get('coverage_scope'), current.get('selection_version')
         counts = []
         for path in previous:

@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from generate_agent_snapshot import SHANGHAI, atomically_write, number, readonly_db
+from agent_market_calendar import SOURCES, closed_reason, last_session
 
 
 def parse_observed_at(value):
@@ -69,6 +70,19 @@ def scan(root, output, now=None, quote_getter=None):
     results = {}
     for market in ('CN', 'HK'):
         candidates = candidate_symbols(root, market, now.date())
+        closure = closed_reason(market, now.date())
+        if closure:
+            results[market] = {
+                'session_date': last_session(market, now.date()).isoformat(),
+                'market_status': 'closed', 'closure_reason': closure,
+                'calendar_source': SOURCES.get(market),
+                'source_universe_count': len(candidates),
+                'available_universe_count': 0,
+                'coverage_scope': 'market_closed_no_current_session',
+                'excluded_reason_counts': {'market_closed': len(candidates)},
+                'items': [],
+            }
+            continue
         rows, excluded = [], Counter()
         def fetch(pair):
             symbol, name = pair
@@ -92,6 +106,7 @@ def scan(root, output, now=None, quote_getter=None):
                              'provider': str(quote.get('provider') or 'unknown'),
                              'price_type': 'eod_vendor_close'})
         results[market] = {'session_date': now.date().isoformat(),
+                           'market_status': 'open',
                            'source_universe_count': len(candidates),
                            'available_universe_count': len(rows),
                            'coverage_scope': 'rolling_120d_TrendSeedPool_union_current_archived_bars',

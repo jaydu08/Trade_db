@@ -10,9 +10,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from agent_market_scan import scan, validate_quote
+from agent_market_calendar import closed_reason, last_session
 from agent_snapshot_health import audit
 from generate_agent_snapshot import (classify_stock_asset, ensure_daily_ready,
-                                     macro_freshness, stock_anomaly_snapshot)
+                                     macro_freshness, stock_anomaly_snapshot, stock_snapshot)
 
 
 class AgentDataQualityTest(unittest.TestCase):
@@ -24,15 +25,16 @@ class AgentDataQualityTest(unittest.TestCase):
         self.now = datetime(2026, 10, 14, 18, 30, tzinfo=timezone(timedelta(hours=8)))
         with sqlite3.connect(self.root / 'data/ledger.db') as db:
             db.execute('CREATE TABLE trendseedpool (date TEXT,market TEXT,symbol TEXT,name TEXT)')
-            db.execute('CREATE TABLE trenddailybar (date TEXT,market TEXT,symbol TEXT,name TEXT,close REAL,amount REAL,turnover_rate REAL,source TEXT,updated_at TEXT)')
+            db.execute('CREATE TABLE trenddailybar (date TEXT,market TEXT,symbol TEXT,name TEXT,close REAL,amount REAL,turnover_rate REAL,source TEXT,updated_at TEXT,catalyst_tags TEXT)')
+            db.execute('CREATE TABLE dailyrank (id INTEGER PRIMARY KEY,date TEXT,market TEXT,symbol TEXT,change_pct REAL)')
             for market in ('CN', 'HK'):
                 for i in range(12):
                     db.execute('INSERT INTO trendseedpool VALUES (?,?,?,?)',
                                ('2026-10-13', market, f'{market}{i}', f'公司{i}'))
                     if i < 3:
-                        db.execute('INSERT INTO trenddailybar VALUES (?,?,?,?,?,?,?,?,?)',
+                        db.execute('INSERT INTO trenddailybar VALUES (?,?,?,?,?,?,?,?,?,?)',
                                    ('2026-10-14', market, f'{market}{i}', f'公司{i}',
-                                    100, 10000, 1, 'heatmap', '2026-10-14 09:35:00'))
+                                    100, 10000, 1, 'heatmap', '2026-10-14 09:35:00', ''))
 
     def test_independent_scan_finds_downs_despite_three_hk_hot_bars(self):
         def quotes(symbol, market):
@@ -117,6 +119,61 @@ class AgentDataQualityTest(unittest.TestCase):
         self.assertEqual(hk['negative_coverage_status'], 'none_observed')
         self.assertEqual(hk['negative_eligible_count'], 0)
         self.assertEqual(classify_stock_asset('107.SOXS', '三倍做空半导体ETF')[0], 'LEVERAGED_ETF')
+
+    def test_hk_holiday_keeps_cn_scan_and_excludes_false_hk_current_session(self):
+        holiday = datetime(2026, 10, 19, 19, 15, tzinfo=self.now.tzinfo)
+        self.assertIsNone(closed_reason('CN', holiday.date()))
+        self.assertEqual(last_session('HK', holiday.date()).isoformat(), '2026-10-16')
+        with sqlite3.connect(self.root / 'data/ledger.db') as db:
+            for market, day in (('CN', '2026-10-19'), ('HK', '2026-10-16'), ('HK', '2026-10-19')):
+                for i in range(12):
+                    db.execute('INSERT INTO trenddailybar VALUES (?,?,?,?,?,?,?,?,?,?)',
+                               (day, market, f'{market}{i}', f'公司{i}', 100, 10000, 1,
+                                'trend_pool_refresh_eod', f'{day} 09:35:00', ''))
+        def quotes(symbol, market):
+            if market == 'HK':
+                self.fail('closed HK market must not call live quote provider')
+            return dict(price=110, pct_chg=10, timestamp='2026-10-19 15:35:00')
+        result = scan(self.root, self.root / 'data/agent_market_scan', holiday, quotes)
+        self.assertEqual(result['markets']['CN']['available_universe_count'], 12)
+        self.assertEqual(result['markets']['HK']['market_status'], 'closed')
+        self.assertEqual(result['markets']['HK']['session_date'], '2026-10-16')
+        markets, *_ = stock_snapshot(self.root, holiday)
+        self.assertEqual(next(m for m in markets if m['market'] == 'HK')['session_date'], '2026-10-16')
+        up, down, _, _, coverage = stock_anomaly_snapshot(self.root, holiday)
+        self.assertTrue([item for item in up if item['market'] == 'CN'])
+        self.assertFalse([item for item in up + down if item['market'] == 'HK'])
+        self.assertEqual(next(r for r in coverage if r['market'] == 'HK')['negative_coverage_status'],
+                         'market_closed')
+        coverage[:] = [r for r in coverage if r['market'] != 'US']
+        coverage.append(dict(market='US', session_date='2026-10-16',
+                             negative_coverage_status='complete',
+                             coverage_scope='archived_us', selection_version='agent_anomaly_v1',
+                             eligible_universe_count=12))
+        minimal = dict(overview={'markets': [dict(market='CN', session_date='2026-10-19',
+            candidate_universe=12, turnover=100, data_asof='2026-10-19T16:05:00+08:00',
+            archive_source_counts={'trend_pool_refresh_eod': 12}),
+            dict(market='HK', session_date='2026-10-16', market_status='closed',
+                 candidate_universe=12, turnover=100, data_asof='2026-10-16T16:05:00+08:00'),
+            dict(market='US', session_date='2026-10-16', candidate_universe=12,
+                 data_asof='2026-10-17T00:20:00+00:00')]},
+            source_health=[dict(domain=domain, stale=False, quality='ok')
+                for domain in ('crypto_spot', 'crypto_futures', 'crypto_onchain', 'macro')],
+            market_anomalies={'coverage': coverage})
+        ensure_daily_ready(minimal, holiday)
+        report = audit(dict(schema_version='1.2', snapshot_id='holiday', generated_at=holiday.isoformat(),
+            overview={'macro': []}, source_health=[], market_anomalies={
+                'coverage': coverage, 'stocks_up': up, 'stocks_down': down}),
+            self.root / 'public/agent/v1', holiday)
+        self.assertFalse(report['failures'])
+        self.assertEqual(report['coverage_change']['HK']['comparison_status'], 'market_closed')
+        minimal['overview']['markets'][0]['session_date'] = '2026-10-16'
+        with self.assertRaisesRegex(ValueError, 'CN completed session'):
+            ensure_daily_ready(minimal, holiday)
+        minimal['overview']['markets'][0]['session_date'] = '2026-10-19'
+        minimal['overview']['markets'][1]['market_status'] = 'open'
+        with self.assertRaisesRegex(ValueError, 'HK closed-market previous session'):
+            ensure_daily_ready(minimal, holiday)
 
 
 if __name__ == '__main__':

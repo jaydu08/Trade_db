@@ -18,6 +18,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from agent_market_calendar import SOURCES as MARKET_CALENDAR_SOURCES, closed_reason, last_session
+
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 NEW_YORK = ZoneInfo("America/New_York")
@@ -259,7 +261,10 @@ def stock_snapshot(root, now):
                 catalog[str(row["symbol"])] = row["asset_type"]
     with closing(readonly_db(ledger)) as db:
         for market in CURRENCY:
-            row = db.execute("SELECT MAX(date) AS day FROM trenddailybar WHERE market=?", (market,)).fetchone()
+            closure = closed_reason(market, now.date()) if market in ('CN', 'HK') else None
+            expected_day = last_session(market, now.date()) if market in ('CN', 'HK') else now.date()
+            row = db.execute("SELECT MAX(date) AS day FROM trenddailybar WHERE market=? AND date<=?",
+                             (market, expected_day.isoformat())).fetchone()
             source_date = row["day"] if row else None
             if not source_date:
                 markets.append(dict(market=market, session_date=None, data_asof=None, source="TrendDailyBar",
@@ -294,12 +299,16 @@ def stock_snapshot(root, now):
             old = (now.date() - date.fromisoformat(source_date)).days > 4
             activity_row = next((a for a in activity if a.get("market") == market and a.get("day") == source_date), None)
             markets.append(dict(market=market, session_date=session, archive_date=source_date,
+                                market_status='closed' if closure else 'open' if market in ('CN', 'HK') else 'latest_complete',
+                                closure_reason=closure, calendar_source=MARKET_CALENDAR_SOURCES.get(market) if closure else None,
                                 data_asof=last_asof, source="TrendDailyBar; TG daily board when present",
                                 quality="partial", stale=old, missing_reason=None if latest else "no valid close",
                                 turnover=number(activity_row.get("amount")) if activity_row else None,
                                 turnover_currency=CURRENCY[market], breadth=None, major_index=None,
                                 candidate_universe=len(latest), archive_source_counts=archive_source_counts))
             health.append(dict(domain=f"stocks_{market}", session_date=session, data_asof=last_asof,
+                               market_status='closed' if closure else 'open' if market in ('CN', 'HK') else 'latest_complete',
+                               closure_reason=closure,
                                source="Trade_db ledger.db", quality="partial", stale=old,
                                missing_reason=None if latest else "no valid close"))
             candidates = []
@@ -365,6 +374,29 @@ def stock_anomaly_snapshot(root, now):
                 catalog[str(row['symbol'])] = row['asset_type']
     with closing(readonly_db(ledger)) as db:
         for market in CURRENCY:
+            closure = closed_reason(market, now.date()) if market in ('CN', 'HK') else None
+            if closure:
+                previous = last_session(market, now.date()).isoformat()
+                latest_row = db.execute(
+                    'SELECT MAX(updated_at) AS asof FROM trenddailybar WHERE market=? AND date=? AND close>0',
+                    (market, previous)).fetchone()
+                segment = scanned.get(market, {})
+                coverage.append(dict(market=market, session_date=previous,
+                                     market_status='closed', closure_reason=closure,
+                                     calendar_source=MARKET_CALENDAR_SOURCES[market],
+                                     data_asof=utc_naive_iso(latest_row['asof']) if latest_row else None,
+                                     source_universe_count=segment.get('source_universe_count'),
+                                     available_universe_count=0, eligible_universe_count=0,
+                                     selected_count=0, positive_eligible_count=0,
+                                     negative_eligible_count=0, flat_eligible_count=0,
+                                     coverage_scope='market_closed_no_current_session',
+                                     selection_version='agent_anomaly_v1', coverage_ratio=None,
+                                     excluded_reason_counts=segment.get('excluded_reason_counts') or {},
+                                     source_contributions={},
+                                     negative_coverage_status='market_closed',
+                                     negative_coverage_reason='exchange-verified full-day closure',
+                                     quality='partial', stale=False, missing_reason=None))
+                continue
             archive = db.execute('SELECT MAX(date) AS day FROM trenddailybar WHERE market=?', (market,)).fetchone()['day']
             bars = db.execute('SELECT symbol,name,close,amount,turnover_rate,source,updated_at FROM trenddailybar '
                               'WHERE market=? AND date=? AND close>0', (market, archive)).fetchall() if archive else []
@@ -644,11 +676,18 @@ def build_snapshot(root, crypto_db, now):
             'source_universe_count', 'available_universe_count', 'eligible_universe_count',
             'selected_count', 'coverage_scope', 'coverage_ratio', 'excluded_reason_counts',
             'negative_coverage_status', 'selection_version')})
-        market['candidate_universe_definition'] = 'current-day valid TrendDailyBar symbols at generation time; not full market'
+        market['candidate_universe_definition'] = (
+            'last completed archived session; market closed today; not full market'
+            if market.get('market_status') == 'closed' else
+            'current-day valid TrendDailyBar symbols at generation time; not full market')
         market['observed_at'] = row.get('data_asof')
         market['source_checked_at'] = row.get('data_asof')
     trend_selected = []
     for market in markets:
+        if market.get('market_status') == 'closed':
+            limitations.append(f"{market['market']}: {now.date()} 交易所全天休市；最近完整交易日 "
+                               f"{market['session_date']}；当日异动及 TG 精选不生成")
+            continue
         board = read_json(root / 'data/tg_daily_boards' /
                           f"{market['market']}_{market.get('archive_date')}.json", {})
         for item in (board.get('items') or [])[:10] if isinstance(board, dict) else []:
@@ -668,6 +707,8 @@ def build_snapshot(root, crypto_db, now):
                         "跨市场因果归因与交易评级未实现"])
     anomaly_health = [dict(domain=f"agent_anomaly_{row['market']}", session_date=row['session_date'],
                            data_asof=row['data_asof'], quality=row['quality'], stale=row['stale'],
+                           market_status=row.get('market_status', 'open'),
+                           closure_reason=row.get('closure_reason'),
                            source='independent Agent market scan', missing_reason=row['missing_reason']) for row in coverage]
     all_health = stock_health + anomaly_health + crypto_health + [macro_health]
     return dict(schema_version="1.2", snapshot_id=f"{now.date().isoformat()}-{int(now.timestamp())}",
@@ -694,8 +735,17 @@ def ensure_daily_ready(snapshot, now, require_market_scan=True):
         raise ValueError("daily publication is for Monday-Friday only")
     today = now.date().isoformat()
     markets = {m["market"]: m for m in snapshot["overview"]["markets"]}
+    if all(closed_reason(market, now.date()) for market in ('CN', 'HK')):
+        raise ValueError('neither CN nor HK has a completed current-day session')
     for market in ("CN", "HK"):
         row = markets[market]
+        closure = closed_reason(market, now.date())
+        if closure:
+            previous = last_session(market, now.date()).isoformat()
+            if (row.get('market_status') != 'closed' or row.get('session_date') != previous
+                    or not row.get('candidate_universe')):
+                raise ValueError(f'{market} closed-market previous session unavailable')
+            continue
         if row["session_date"] != today or not row.get("candidate_universe"):
             raise ValueError(f"{market} completed session not ready for {today}")
         if row.get("turnover") is None:
@@ -723,6 +773,12 @@ def ensure_daily_ready(snapshot, now, require_market_scan=True):
         for market in ('CN', 'HK', 'US'):
             row = next((r for r in snapshot.get('market_anomalies', {}).get('coverage', [])
                         if r.get('market') == market), None)
+            closure = closed_reason(market, now.date()) if market in ('CN', 'HK') else None
+            if closure:
+                if (not row or row.get('negative_coverage_status') != 'market_closed'
+                        or row.get('session_date') != last_session(market, now.date()).isoformat()):
+                    raise ValueError(f'{market} closed-market anomaly status invalid')
+                continue
             if not row or row['negative_coverage_status'] == 'insufficient':
                 raise ValueError(f'{market} independent anomaly scan coverage insufficient')
 
