@@ -94,6 +94,8 @@ python3 -B scripts/validate_agent_period_quality.py data/agent_preview/agent/v1/
 
 改动仅限 `scripts/generate_agent_period_snapshot.py`、`scripts/generate_agent_snapshot.py`、新增 `scripts/replay_agent_weekly_quality.py`、`scripts/validate_agent_period_quality.py`、`tests/test_generate_agent_period_snapshot.py` 与本文件。无 `/trend` 前端、Trend 算法、TG 推送、调度器和端口变更。新增字段不删除旧字段；`amount_latest` 的零值语义改为“未证实则 null”，正式榜资产集合会变化，调用方不得依赖固定 Top 数量。日快照只扩展验证过的香港产品分类/元数据，原 `agent/v1/history/` 结构和发布触发不变。
 
-隔离回放目标路径是 `agent/v1/replay/weekly-2026-10-18-quality-v2.json`，不是 `weekly/2026-10-18.json`。代码可通过还原对应提交回滚；历史正式 JSON 不需也不得回滚覆盖。若新发布质量异常，应暂停未来的 `trend-agent-period-snapshot.timer`、保留现有归档，修复并先在隔离路径验证，再恢复定时任务；不要手工改旧归档。`agent-data` 发布及 GitHub 回读另记在交付说明，生成成功与推送成功分别验收。
+隔离回放目标路径是 `agent/v1/replay/weekly-2026-10-18-quality-v2.json`，不是 `weekly/2026-10-18.json`。代码可通过还原对应提交回滚；历史正式 JSON 不需也不得回滚覆盖。若新发布质量异常，应暂停未来的 `trend-agent-period-snapshot.timer`、保留现有归档，修复并先在隔离路径验证，再恢复定时任务；不要手工改旧归档。
+
+发布验证分两步完成：本地生成/校验通过后，源代码提交 `main:1d913dc`；独立回放提交 `agent-data:0cbff33`。通过 GitHub 文件读取接口，以显式 `ref=agent-data` 回读 `agent/v1/replay/weekly-2026-10-18-quality-v2.json`，blob `29c677ed6c551e445ddaa55d63994f17f8a4d65b`，JSON 可解析、57 条正式股票/商品、11 条指定旧行情均在排除诊断、顶层 `stale=true`、过期项 3。再次回读正式 `agent/v1/weekly/2026-10-18.json`，blob 仍为 `06c2c62d0f668c3712f4f984226ea6e0b64a57ab`。这是 GitHub 远端读取，不仅是本地工作树存在。月底正式归档未发布，10/19 月度文件只在隔离预览目录。
 
 剩余缺口：没有逐证券供应商成交时间、停牌/退市权威事件、全市场官方交易日历、商品交易所会话映射、成交额零值确认标志、跨来源成交额单位契约、Crypto/宏观的 point-in-time 输入版本。代码选择保守 null/排除/partial，不为这些缺口补造数值。
