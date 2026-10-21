@@ -19,11 +19,13 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from agent_market_calendar import SOURCES as MARKET_CALENDAR_SOURCES, closed_reason, last_session
+from agent_research_focus import build_focus
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 NEW_YORK = ZoneInfo("America/New_York")
-MAX_BYTES = 220_000
+# Includes legacy duplicate anomaly fields plus a bounded 100 KB research focus.
+MAX_BYTES = 350_000
 CRYPTO_STALE_SECONDS = 900
 ONCHAIN_MIN_LIQUIDITY = 50_000
 ONCHAIN_MIN_VOLUME = 50_000
@@ -720,6 +722,7 @@ def build_snapshot(root, crypto_db, now):
                 missing_reason="major-index/breadth and some baseline/adjustment fields unavailable; see limitations",
                 overview=dict(markets=markets, macro=macro, crypto_activity=crypto_activity),
                 trend_selected=trend_selected,
+                research_focus=build_focus(root, now),
                 market_anomalies=dict(stocks_up=stocks_up, stocks_down=stocks_down,
                                       relative_strong=relative_up, relative_weak=relative_down,
                                       coverage=coverage),
@@ -798,7 +801,7 @@ def generate(root, crypto_db, output, now=None, require_daily_ready=False):
             if failures:
                 raise ValueError(f'existing archive failed Agent quality audit: {list(dict.fromkeys(failures))[:3]}')
         if len(data) > MAX_BYTES:
-            raise ValueError("existing archive exceeds 220 KB")
+            raise ValueError(f"existing archive exceeds {MAX_BYTES} bytes")
     else:
         snapshot = build_snapshot(root, crypto_db, now)
         if require_daily_ready:
@@ -808,7 +811,7 @@ def generate(root, crypto_db, output, now=None, require_daily_ready=False):
                 raise ValueError(f'Agent quality audit failed: {list(dict.fromkeys(failures))[:3]}')
         data = (json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
         if len(data) > MAX_BYTES:
-            raise ValueError("snapshot exceeds 220 KB")
+            raise ValueError(f"snapshot exceeds {MAX_BYTES} bytes")
         if not snapshot["overview"]["macro"] and not any(x["candidate_universe"] for x in snapshot["overview"]["markets"]):
             raise ValueError("no usable market data; latest not updated")
         immutably_create(archive, data)

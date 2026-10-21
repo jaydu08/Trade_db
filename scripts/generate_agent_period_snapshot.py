@@ -9,12 +9,13 @@ from collections import defaultdict
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from agent_research_focus import build_focus
 
 from generate_agent_snapshot import (NEW_YORK, SHANGHAI, classify_stock_asset, verified_hk_product,
                                      epoch_iso, immutably_create, number, read_json,
                                      readonly_db, utc_naive_iso, macro_freshness)
 
-MAX_BYTES = 200_000
+MAX_BYTES = 300_000  # existing period payload plus up to 100 KB research focus
 
 
 def archive_session(market, archive_day):
@@ -464,6 +465,7 @@ def build(root, crypto_db, days, now, scores=None):
                          and now.astimezone(SHANGHAI).hour < 17)
     return {'schema_version': '1.2', 'snapshot_id': f'{days}d-{now.date().isoformat()}-{int(now.timestamp())}',
             'generated_at': now.isoformat(timespec='seconds'), 'timezone': 'Asia/Shanghai',
+            'research_focus': build_focus(root, now),
             'session_date': sessions,
             'data_asof': {h['domain']: h['data_asof'] for h in all_health},
             'period': 'weekly' if days == 7 else 'monthly',
