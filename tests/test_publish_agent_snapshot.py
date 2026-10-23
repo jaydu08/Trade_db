@@ -13,6 +13,26 @@ import publish_agent_snapshot as publisher
 
 
 class PublishClockTest(unittest.TestCase):
+    def test_extensions_mode_does_not_freeze_daily_or_period(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / 'public'
+            (repo / '.git').mkdir(parents=True)
+            def fake_git(_repo, *args):
+                return 'agent-data' if args == ('branch', '--show-current') else ''
+            with patch.object(publisher, 'git', side_effect=fake_git), \
+                 patch.object(publisher, 'write_extensions', return_value={'snapshot_id': 'extensions'}) as export, \
+                 patch.object(publisher, 'scan_agent_market') as scan, \
+                 patch.object(publisher, 'generate') as daily, \
+                 patch.object(publisher, 'generate_period') as period, \
+                 patch.object(publisher, 'write_smoke'):
+                result, _ = publisher.publish(root, root / 'crypto.sqlite', repo, extensions_only=True)
+            self.assertEqual(result, [('extensions', 'supplemental')])
+            export.assert_called_once()
+            scan.assert_not_called()
+            daily.assert_not_called()
+            period.assert_not_called()
+
     def test_snapshot_clock_is_after_scan(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / 'trade'

@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 from agent_market_calendar import SOURCES as MARKET_CALENDAR_SOURCES, closed_reason, last_session
 from agent_research_focus import build_focus
+from agent_market_extensions import build_extensions
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -723,6 +724,7 @@ def build_snapshot(root, crypto_db, now):
                 overview=dict(markets=markets, macro=macro, crypto_activity=crypto_activity),
                 trend_selected=trend_selected,
                 research_focus=build_focus(root, now),
+                market_extensions=build_extensions(root, crypto_db, now),
                 market_anomalies=dict(stocks_up=stocks_up, stocks_down=stocks_down,
                                       relative_strong=relative_up, relative_weak=relative_down,
                                       coverage=coverage),

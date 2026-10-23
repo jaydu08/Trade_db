@@ -16,6 +16,7 @@ from generate_agent_snapshot import generate
 from generate_agent_period_snapshot import generate as generate_period
 from agent_market_scan import scan as scan_agent_market
 from agent_research_focus import write_focus
+from agent_market_extensions import write_extensions
 
 
 def git(repo, *arguments):
@@ -23,8 +24,8 @@ def git(repo, *arguments):
                           text=True, capture_output=True, timeout=45).stdout.strip()
 
 
-def publish(root, crypto_db, repo, preview_periods=False, daily_only=False, period_only=False, focus_only=False):
-    if sum((preview_periods, daily_only, period_only, focus_only)) > 1:
+def publish(root, crypto_db, repo, preview_periods=False, daily_only=False, period_only=False, focus_only=False, extensions_only=False):
+    if sum((preview_periods, daily_only, period_only, focus_only, extensions_only)) > 1:
         raise ValueError('choose only one publication mode')
     if git(repo, "branch", "--show-current") != "agent-data":
         raise RuntimeError("refusing to publish outside isolated agent-data branch")
@@ -41,7 +42,7 @@ def publish(root, crypto_db, repo, preview_periods=False, daily_only=False, peri
         if focus is not None:
             allowed.add('agent/v1/focus.json')
             published.append(('research_focus', focus['count']))
-        if now.weekday() < 5 and not (preview_periods or period_only or focus_only):
+        if now.weekday() < 5 and not (preview_periods or period_only or focus_only or extensions_only):
             today_archive = output / 'history' / f'{now.date().isoformat()}.json'
             legacy_archive = (today_archive.exists() and
                               not json.loads(today_archive.read_text(encoding='utf-8')).get('market_anomalies'))
@@ -58,11 +59,16 @@ def publish(root, crypto_db, repo, preview_periods=False, daily_only=False, peri
         due = [(7, now.weekday() == 6),
                (30, (now + timedelta(days=1)).month != now.month)]
         for days, scheduled in due:
-            if not (daily_only or focus_only) and (scheduled or preview_periods):
+            if not (daily_only or focus_only or extensions_only) and (scheduled or preview_periods):
                 snapshot, size = generate_period(root, crypto_db, output, days, now)
                 folder = "weekly" if days == 7 else "monthly"
                 allowed.add(f"agent/v1/{folder}/{now.date().isoformat()}.json")
                 published.append((snapshot["snapshot_id"], size))
+        if not focus_only:
+            extensions = write_extensions(root, crypto_db, output, now)
+            if extensions is not None:
+                allowed.add('agent/v1/market_extensions.json')
+                published.append((extensions['snapshot_id'], 'supplemental'))
         if not published:
             return [], git(repo, "rev-parse", "HEAD")
         if not (output / "smoke.json").exists():
@@ -92,9 +98,10 @@ def main():
     mode.add_argument("--daily-only", action="store_true", help="publish weekday daily only")
     mode.add_argument("--period-only", action="store_true", help="publish due weekly/monthly only")
     mode.add_argument("--focus-only", action="store_true", help="publish research universe only, without market scans")
+    mode.add_argument("--extensions-only", action="store_true", help="publish classified securities and global ETF supplement without freezing daily/period archives")
     args = parser.parse_args()
     published, commit = publish(args.root, args.crypto_db, args.repo,
-                                args.preview_periods, args.daily_only, args.period_only, args.focus_only)
+                                args.preview_periods, args.daily_only, args.period_only, args.focus_only, args.extensions_only)
     print(f"Published {published}, commit {commit}")
 
 

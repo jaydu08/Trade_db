@@ -10,6 +10,7 @@ from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from agent_research_focus import build_focus
+from agent_market_extensions import build_extensions
 
 from generate_agent_snapshot import (NEW_YORK, SHANGHAI, classify_stock_asset, verified_hk_product,
                                      epoch_iso, immutably_create, number, read_json,
@@ -467,6 +468,7 @@ def build(root, crypto_db, days, now, scores=None):
     return {'schema_version': '1.2', 'snapshot_id': f'{days}d-{now.date().isoformat()}-{int(now.timestamp())}',
             'generated_at': now.isoformat(timespec='seconds'), 'timezone': 'Asia/Shanghai',
             'research_focus': build_focus(root, now),
+            'market_extensions': build_extensions(root, crypto_db, now, days=days),
             'session_date': sessions,
             'data_asof': {h['domain']: h['data_asof'] for h in all_health},
             'period': 'weekly' if days == 7 else 'monthly',
