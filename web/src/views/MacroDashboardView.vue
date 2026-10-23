@@ -8,6 +8,7 @@ const error = ref('')
 const category = ref('全部')
 const commodityWindow = ref<'3d' | '7d' | '30d'>('7d')
 const globalGroup = ref('全部')
+const globalSort = ref('1d')
 let timer: ReturnType<typeof setInterval> | undefined
 let serial = 0
 
@@ -19,7 +20,8 @@ const macroRows = computed(() => macroOrder.map(id => (payload.value.macro || []
 const futureRows = computed(() => futureOrder.map(id => (payload.value.futures || []).find((r: any) => r.id === id)).filter(Boolean))
 const categories = computed(() => ['全部', ...new Set<string>((payload.value.movers || []).map((r: any) => r.category).filter(Boolean))])
 const movers = computed(() => (payload.value.movers || []).filter((r: any) => category.value === '全部' || r.category === category.value))
-const globalRows = computed(() => (payload.value.global_assets || []).filter((r: any) => globalGroup.value === '全部' || r.group === globalGroup.value))
+const globalGroups = computed(() => ['全部', ...new Set<string>((payload.value.global_assets || []).map((r: any) => r.group))])
+const globalRows = computed(() => [...(payload.value.global_assets || [])].filter((r: any) => globalGroup.value === '全部' || r.group === globalGroup.value).sort((a: any, b: any) => (b.changes?.[globalSort.value] ?? -Infinity) - (a.changes?.[globalSort.value] ?? -Infinity)))
 const commodityTrendRows = computed(() => (payload.value.commodity_trends?.[commodityWindow.value] || []).slice(0, 20))
 const ten = computed(() => macroRows.value.find((r: any) => r.id === 'DGS10'))
 const two = computed(() => macroRows.value.find((r: any) => r.id === 'DGS2'))
@@ -88,12 +90,12 @@ function sentimentName(value: number): string {
     <div class="context-line"><span>10Y－2Y 利差：<b>{{ signed(curve, 3) }} 个百分点</b></span><span>10Y 盈亏平衡通胀率＝名义 10Y－实际 10Y；并非未来 CPI 预测。</span><a href="https://www.cmegroup.com/fedwatch" target="_blank" rel="noopener noreferrer">CME FedWatch ↗</a></div>
 
     <div class="section-head"><h3>全球方向性指数与 ETF</h3><span>日线收盘 · 快照 {{ timeText(payload.global_assets_checked_at) }}</span></div>
-    <div class="filter-row"><button v-for="g in ['全部', '美股板块', '全球区域']" :key="g" :class="{ active: globalGroup === g }" @click="globalGroup = g">{{ g }}</button></div>
-    <div class="table-scroll"><table><thead><tr><th>方向</th><th>标的</th><th>类型</th><th>最新收盘</th><th>3日</th><th>7日</th><th>30日</th><th>日期</th></tr></thead><tbody>
-      <tr v-for="r in globalRows" :key="r.id"><td><strong>{{ r.name }}</strong></td><td><a :href="r.url" target="_blank" rel="noopener noreferrer">{{ r.id }} ↗</a></td><td>{{ r.kind }}</td><td>{{ number(r.value, 3) }}</td><td :class="Number(r.changes?.['3d']) >= 0 ? 'up' : 'down'">{{ r.changes?.['3d'] == null ? '—' : signed(r.changes['3d']) + '%' }}</td><td :class="Number(r.changes?.['7d']) >= 0 ? 'up' : 'down'">{{ r.changes?.['7d'] == null ? '—' : signed(r.changes['7d']) + '%' }}</td><td :class="Number(r.changes?.['30d']) >= 0 ? 'up' : 'down'">{{ r.changes?.['30d'] == null ? '—' : signed(r.changes['30d']) + '%' }}</td><td>{{ r.asof }}</td></tr>
-      <tr v-if="!globalRows.length"><td colspan="8" class="empty-row">指数与 ETF 日线尚未取得。</td></tr>
+    <div class="filter-row"><button v-for="g in globalGroups" :key="g" :class="{ active: globalGroup === g }" @click="globalGroup = g">{{ g }}</button><select v-model="globalSort" aria-label="ETF排序周期"><option value="1d">按当日涨跌排序</option><option value="3d">按3日排序</option><option value="7d">按7日排序</option><option value="30d">按30日排序</option></select></div>
+    <div class="table-scroll"><table><thead><tr><th>方向</th><th>标的</th><th>上市地 / 币种</th><th>类型</th><th>最新收盘</th><th>当日</th><th>3日</th><th>7日</th><th>30日</th><th>交易日</th></tr></thead><tbody>
+      <tr v-for="r in globalRows" :key="r.id"><td><strong>{{ r.name }}</strong></td><td><a :href="r.url" target="_blank" rel="noopener noreferrer">{{ r.symbol || r.id }} ↗</a></td><td>{{ r.listing_market || 'US' }} / {{ r.currency || 'USD' }}</td><td>{{ r.kind }}</td><td>{{ number(r.value, 3) }}</td><td v-for="d in ['1d', '3d', '7d', '30d']" :key="d" :class="r.changes?.[d] == null ? '' : Number(r.changes[d]) >= 0 ? 'up' : 'down'">{{ r.changes?.[d] == null ? '—' : signed(r.changes[d]) + '%' }}</td><td>{{ r.asof }}<small v-if="r.collection_quality === 'stale' || r.observation_stale"> · 数据待更新</small></td></tr>
+      <tr v-if="!globalRows.length"><td colspan="10" class="empty-row">指数与 ETF 日线尚未取得。</td></tr>
     </tbody></table></div>
-    <p class="source-note">SOX 为费城半导体指数；XBI、IBB、EEM、VNM、EWZ、INDA、EWJ、KWEB、XLE 是不同板块或国家的美股 ETF 代理，并非当地现货指数。收益率按日历日寻找最近较早收盘价计算，美元计价 ETF 同时受汇率影响；数据来自新浪日线经 AkShare 获取。</p>
+    <p class="source-note">当日＝最近完整交易日相对前一交易日收盘涨跌，不是盘中实时涨幅；3/7/30日按自然日锚定。SOX 为指数，其余注明 ETF，国家/行业敞口不等于当地现货指数。A股与港股上市ETF使用本地日线；美股ETF为美元计价代理，受汇率和交易时段影响。均为未复权收盘价，不含分红收益；来源为新浪日线 / AkShare。</p>
 
     <div class="section-head"><h3>A/H 股成交活跃度</h3><span>复用盘后 TG 榜单的原始行情覆盖池 · 每交易日更新</span></div>
     <div class="card-grid">

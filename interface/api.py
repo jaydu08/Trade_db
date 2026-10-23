@@ -2868,11 +2868,12 @@ def crypto_trend(
     risk: str = Query(default='pass'), q: str = Query(default='', max_length=120),
     pushed_only: bool = Query(default=False), chain: str = Query(default='all', max_length=30),
     sort_by: str = Query(default='period_change'), sort_dir: str = Query(default='desc'),
+    asset_group: str = Query(default='crypto'),
     user: UserContext = Depends(get_current_user),
 ):
     from modules.monitor.crypto_trend import get_crypto_trend
     try:
-        return get_crypto_trend(market, period, risk, q, pushed_only, chain, sort_by, sort_dir)
+        return get_crypto_trend(market, period, risk, q, pushed_only, chain, sort_by, sort_dir, asset_group)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception:

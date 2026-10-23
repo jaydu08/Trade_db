@@ -317,7 +317,7 @@ def crypto_period(path, days, now):
         for market in ('spot', 'futures', 'onchain'):
             hr = db.execute('SELECT updated,payload FROM health WHERE component=?', (market,)).fetchone()
             hp = json.loads(hr['payload']) if hr else {}
-            selected = set(hp.get('selected_symbols') or []) if market != 'onchain' else None
+            selected = set(hp.get('crypto_selected_symbols', hp.get('selected_symbols')) or []) if market != 'onchain' else None
             age = now.timestamp() - hr['updated'] if hr else None
             health.append({'domain': f'crypto_{market}', 'data_asof': epoch_iso(hr['updated']) if hr else None,
                            'quality': 'partial' if hr and age is not None and age >= -300 else 'missing',
@@ -389,7 +389,8 @@ def macro_period(root, days, now):
                        'asset_type': 'INDEX' if item.get('kind') == '指数' else 'ETF',
                        'return_pct': change, 'trend_score': None, 'relative_strength_pct': None,
                        'relative_strength_basis': 'global index/ETF candidate median',
-                       'price': number(item.get('value')), 'price_adjustment': 'unknown_from_source',
+                       'price': number(item.get('value')), 'price_adjustment': item.get('price_adjustment') or 'unknown_from_source',
+                       'listing_market': item.get('listing_market'), 'currency': item.get('currency'),
                        'window_start_target': (date.fromisoformat(str(item['asof'])[:10]) - timedelta(days=days)).isoformat(),
                        'baseline_date': None, 'window_end': str(item['asof'])[:10],
                        'session_date': str(item['asof'])[:10], 'data_asof': item.get('asof'),

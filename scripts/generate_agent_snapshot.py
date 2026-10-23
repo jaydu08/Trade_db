@@ -541,7 +541,7 @@ def crypto_snapshot(db_path, now):
         for market in ("spot", "futures", "onchain"):
             hr = db.execute("SELECT updated,payload FROM health WHERE component=?", (market,)).fetchone()
             health_payload = json.loads(hr["payload"]) if hr else {}
-            selected = set(health_payload.get("selected_symbols") or []) if market != "onchain" else None
+            selected = set(health_payload.get("crypto_selected_symbols", health_payload.get("selected_symbols")) or []) if market != "onchain" else None
             age = now.timestamp() - hr["updated"] if hr and hr["updated"] else None
             stale = age is None or age > CRYPTO_STALE_SECONDS
             health.append(dict(domain=f"crypto_{market}", session_date=now.date().isoformat(),
@@ -550,7 +550,7 @@ def crypto_snapshot(db_path, now):
                                quality="partial" if market == "onchain" or health_payload.get("status") != "ok" else "ok",
                                stale=stale, missing_reason="health unavailable" if not hr else None,
                                coverage="discovered contracts" if market == "onchain" else "Binance 24h quote-volume Top 150",
-                               universe_count=health_payload.get("count")))
+                               universe_count=len(selected) if selected is not None else health_payload.get("count")))
             rows = db.execute("SELECT a.payload,s.payload AS security_payload FROM assets a "
                               "LEFT JOIN security s ON a.id=s.id WHERE a.market=?", (market,)).fetchall()
             candidates = []

@@ -58,6 +58,19 @@ class MacroDashboardTest(unittest.TestCase):
                 SimpleNamespace(symbol='AU0', name='黄金', date=d, close=880, source='commodity')]
         self.assertEqual(build_commodity_trends(bars, d)['7d'][0]['change_pct'], 10.0)
 
+    def test_one_day_is_previous_trading_session_not_three_calendar_days(self):
+        from datetime import date
+        points = [(date(2026, 10, 8), 80), (date(2026, 10, 9), 100), (date(2026, 10, 12), 110)]
+        self.assertEqual(calendar_changes(points, (1, 3))['1d'], 10.0)
+        self.assertIsNone(calendar_changes(points[:1], (1,))['1d'])
+
+    def test_universe_contains_local_ah_and_global_sector_etfs(self):
+        from modules.monitor.macro_dashboard import GLOBAL_ASSETS
+        from modules.monitor.global_etf_universe import ASSET_META
+        self.assertTrue({'XLK', 'XLV', 'EWY', 'EWT', 'CN.512480', 'HK.03033', 'HK.03191'}.issubset(GLOBAL_ASSETS))
+        self.assertEqual(ASSET_META['CN.512480']['currency'], 'CNY')
+        self.assertEqual(ASSET_META['HK.03033']['currency'], 'HKD')
+
     def test_commodity_trend_excludes_falling_contracts(self):
         import datetime
         from types import SimpleNamespace

@@ -114,10 +114,12 @@ def english_dominant(text):
 
 
 def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_only=False,
-                     chain='all', sort_by='period_change', sort_dir='desc'):
+                     chain='all', sort_by='period_change', sort_dir='desc', asset_group='crypto'):
     if market not in ('spot', 'futures', 'onchain'):
         raise ValueError('invalid market')
     allowed = ('24h', '3d', '7d', '30d') if market == 'onchain' else ('12h', '3d', '7d', '30d')
+    if asset_group not in ('crypto', 'securities', 'macro', 'unknown', 'all'):
+        raise ValueError('invalid asset group')
     if (period not in allowed or risk not in ('visible', 'pass', 'needs_review', 'review', 'unknown', 'blocked', 'all')
             or sort_by not in ONCHAIN_SORTS or sort_dir not in ('asc', 'desc')):
         raise ValueError('invalid period or risk')
@@ -180,6 +182,8 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
         quality_counts = Counter()
         items = []
         for row, item in zip(rows, all_items):
+            if market != 'onchain' and asset_group != 'all' and item.get('asset_group', 'crypto') != asset_group:
+                continue
             security = effective_security(json.loads(row['security']) if row['security'] else None,
                                           item.get('pair', ''), now)
             if market == 'onchain':
@@ -207,7 +211,7 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
                 value, baseline, source = period_return(db, item, PERIODS[period])
             item.update(period_change=value, baseline_at=baseline, return_source=source,
                         stale=now - item['updated'] > 900, oi_change_percent=None,
-                        relative_change_percent=(value - benchmark if value is not None and benchmark is not None else None))
+                        relative_change_percent=(value - benchmark if value is not None and benchmark is not None and item.get('asset_group', 'crypto') == 'crypto' else None))
             if market == 'onchain':
                 item['age_hours'] = trading_pool_age_hours(item.get('pair_created_at'), now)
             if market != 'onchain':
@@ -280,7 +284,7 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
                 item['rank'] = rank
             else:
                 item['rank'] = None
-        return {'market': market, 'period': period, 'items': items, 'health': health,
+        return {'market': market, 'period': period, 'asset_group': asset_group, 'items': items, 'health': health,
                 'available_chains': available_chains,
                 'asof': now, 'counts': dict(counts), 'history_counts': dict(history_counts),
                 'quality_counts': dict(quality_counts),
@@ -292,6 +296,6 @@ def get_crypto_trend(market='spot', period='12h', risk='pass', query='', pushed_
                 'risk': risk, 'chain': chain,
                 'universe_count': len(rows),
                 'ranked_count': rank, 'warning': '链上仅覆盖已发现标的；通过筛查不等于官方认证或保证可卖出。'
-                if market == 'onchain' else 'USDT现货 / USDT永续各按24h成交额选前150；历史基准为小时级。相对强度是同期涨幅减去BTC/ETH等权涨幅；盘口冲击为$5k模拟，不含手续费。'}
+                if market == 'onchain' else '加密与股票/ETF各自按24h成交额选前150，商品/汇率另列。bStock现货与股票永续是不同产品；现货标记依据币安完整交易目录，不受本榜前150限制。历史基准为小时级；BTC/ETH相对强度仅用于加密筛选。'}
     finally:
         db.close()

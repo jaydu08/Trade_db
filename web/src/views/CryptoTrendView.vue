@@ -5,6 +5,7 @@ import api from '../api'
 type Market = 'spot' | 'futures' | 'onchain'
 type SortKey = 'period_change' | 'price' | 'volume_24h' | 'relative_change_percent' | 'hourly_volume_ratio' | 'depth_impact_percent' | 'oi_change_percent' | 'oi_notional' | 'funding_rate_percent' | 'liquidity' | 'market_cap' | 'fdv' | 'age_hours' | 'updated'
 const market = ref<Market>('spot')
+const assetGroup = ref('crypto')
 const period = ref('12h')
 const risk = ref('visible')
 const query = ref('')
@@ -33,7 +34,7 @@ const rows = computed(() => {
   if (market.value === 'onchain') return payload.value.items || []
   const result = (payload.value.items || []).filter((r: any) =>
     (chain.value === 'all' || r.chain === chain.value) && !r.stale && r.history_available && Number(r.period_change) > 0 &&
-    (!focused.value || (Number(r.relative_change_percent) > 0 &&
+    (assetGroup.value !== 'crypto' || !focused.value || (Number(r.relative_change_percent) > 0 &&
       (r.depth_impact_percent == null || Number(r.depth_impact_percent) <= 0.5) &&
       (period.value !== '12h' || Number(r.hourly_volume_ratio) >= 1) &&
       (market.value !== 'futures' || r.oi_change_percent == null || Number(r.oi_change_percent) > 0))))
@@ -47,7 +48,7 @@ const rows = computed(() => {
   })
   return sorted
 })
-const visible = computed(() => rows.value.slice((page.value - 1) * 25, page.value * 25).map((r: any, i: number) => ({ ...r, display_rank: (page.value - 1) * 25 + i + 1 })))
+const visible = computed(() => rows.value.slice((page.value - 1) * 25, page.value * 25).map((r: any, i: number) => ({ ...r, name: r.market === 'onchain' ? r.name : [r.name, r.instrument_label, r.spot_available ? '（' + r.spot_label + '）' : ''].filter(Boolean).join(' · '), display_rank: (page.value - 1) * 25 + i + 1 })))
 const chains = computed(() => payload.value.available_chains || [])
 let timer: ReturnType<typeof setInterval> | undefined
 let serial = 0
@@ -56,14 +57,14 @@ async function fetchData() {
   loading.value = true
   error.value = ''
   try {
-    const res = await api.get('/crypto/trend', { params: { market: market.value, period: period.value, risk: risk.value, q: query.value, pushed_only: pushed.value, chain: chain.value, sort_by: market.value === 'onchain' ? sortKey.value : 'period_change', sort_dir: sortDirection.value } })
+    const res = await api.get('/crypto/trend', { params: { market: market.value, asset_group: assetGroup.value, period: period.value, risk: risk.value, q: query.value, pushed_only: pushed.value, chain: chain.value, sort_by: market.value === 'onchain' ? sortKey.value : 'period_change', sort_dir: sortDirection.value } })
     if (request === serial) payload.value = res.data
   } catch (e: any) {
     if (request === serial) error.value = e?.response?.data?.detail || '数据读取失败，显示的旧数据不可视为最新结果'
   } finally { if (request === serial) loading.value = false }
 }
 watch(market, () => { period.value = market.value === 'onchain' ? '24h' : '12h'; risk.value = 'visible'; chain.value = 'all'; selected.value = null; pushed.value = false; sortKey.value = 'period_change'; sortDirection.value = 'desc' })
-watch([market, period, risk, pushed, chain], () => { page.value = 1; payload.value = { ...payload.value, items: [] }; fetchData() })
+watch([market, assetGroup, period, risk, pushed, chain], () => { page.value = 1; payload.value = { ...payload.value, items: [] }; fetchData() })
 watch([sortKey, sortDirection], () => { if (market.value === 'onchain') { page.value = 1; payload.value = { ...payload.value, items: [] }; fetchData() } })
 watch(rows, (current) => { page.value = Math.min(page.value, Math.max(1, Math.ceil(current.length / 25))) })
 onMounted(() => { fetchData(); timer = setInterval(fetchData, 60000) })
@@ -94,6 +95,7 @@ function url(r: any): string {
     <div class="controls">
       <div class="segments"><button v-for="m in (['spot', 'futures', 'onchain'] as Market[])" :key="m" :class="{ active: market === m }" @click="market = m">{{ { spot: '币安现货', futures: '币安合约', onchain: '链上' }[m] }}</button></div>
       <div class="segments period"><button v-for="p in periods" :key="p" :class="{ active: period === p }" @click="period = p">{{ labels[p] }}</button></div>
+      <select v-if="market !== 'onchain'" v-model="assetGroup"><option value="crypto">加密资产</option><option value="securities">股票 / ETF</option><option value="macro">商品 / 汇率</option><option value="all">全部资产</option></select>
       <button @click="fetchData" :disabled="loading">{{ loading ? '读取中…' : '刷新' }}</button>
     </div>
     <div class="status-row"><span v-for="(h, name) in payload.health" :key="name" :class="{ bad: h.stale || h.status !== 'ok' }">{{ name }} · {{ h.stale ? '数据过期' : h.status }} · {{ timeText(h.updated) }}<template v-if="h.count !== undefined"> · {{ h.count }}/{{ h.available ?? h.count }}</template></span></div>
@@ -102,10 +104,10 @@ function url(r: any): string {
     <div class="filters">
       <template v-if="market === 'onchain'"><button :class="{ active: risk === 'visible' }" @click="risk = 'visible'">直接呈现</button><button :class="{ active: risk === 'blocked' }" @click="risk = 'blocked'">已明确拦截</button><select v-model="chain"><option value="all">全部链</option><option v-for="c in chains" :key="c">{{ c }}</option></select></template>
       <input v-model="query" placeholder="代码 / 名称 / 合约地址" @keyup.enter="page = 1; fetchData()" aria-label="搜索代码或合约" />
-      <button @click="page = 1; fetchData()">搜索</button><label v-if="market !== 'onchain'"><input type="checkbox" v-model="focused" @change="page = 1" />聚焦主线</label><label><input type="checkbox" v-model="pushed" />仅看曾推送</label>
+      <button @click="page = 1; fetchData()">搜索</button><label v-if="market !== 'onchain' && assetGroup === 'crypto'"><input type="checkbox" v-model="focused" @change="page = 1" />聚焦主线</label><label><input type="checkbox" v-model="pushed" />仅看曾推送</label>
     </div>
     <p v-if="market === 'onchain' && dataReady" class="count">筛选标准：{{ labels[period] }}涨幅 ≥ {{ payload.rise_threshold_pct }}% · 24h成交额 ≥ $50k · 池流动性 ≥ $50k（直接呈现）· 同池历史完整且行情未过期。涨幅超过 1000% 作为换池/拆分异常暂不入榜。当前符合 {{ payload.matching_count || 0 }} 个，仅展示前 10 个。{{ chain === 'all' ? '全库' : chain + ' 链' }}明确拦截 {{ payload.inventory_counts?.blocked || 0 }} 个；证据不足者不当作安全通过。</p>
-    <p class="count">{{ dataReady ? rows.length + ' 个标的' : '正在读取…' }}<template v-if="market !== 'onchain' && focused"> · 同期跑赢 BTC/ETH · 12h 近1h量能≥中位数 · 已有盘口冲击≤0.5% · 合约已有OI变化需为正</template> · 按{{ sortLabels[sortKey] }}{{ sortDirection === 'desc' ? '从高到低' : '从低到高' }}排序 · 历史不足或价格过期不显示</p>
+    <p class="count">{{ dataReady ? rows.length + ' 个标的' : '正在读取…' }}<template v-if="market !== 'onchain' && focused && assetGroup === 'crypto'"> · 同期跑赢 BTC/ETH · 12h 近1h量能≥中位数 · 已有盘口冲击≤0.5% · 合约已有OI变化需为正</template><template v-if="market !== 'onchain' && assetGroup !== 'crypto'"> · 股票/ETF及其他传统资产不套用BTC/ETH强弱门槛</template> · 按{{ sortLabels[sortKey] }}{{ sortDirection === 'desc' ? '从高到低' : '从低到高' }}排序 · 历史不足或价格过期不显示</p>
       <div class="table-scroll"><table><thead><tr><th>#</th><th>标的 / 身份</th><th v-if="market === 'onchain'">项目 / 叙事</th><th><button class="sort-header" @click="sortHeader('price')">现价{{ sortIcon('price') }}</button></th><th><button class="sort-header" @click="sortHeader('period_change')">{{ labels[period] }}涨幅{{ sortIcon('period_change') }}</button></th><th><button class="sort-header" @click="sortHeader('volume_24h')">24h成交额{{ sortIcon('volume_24h') }}</button></th><template v-if="market !== 'onchain'"><th><button class="sort-header" @click="sortHeader('relative_change_percent')">相对强度{{ sortIcon('relative_change_percent') }}</button></th><th><button class="sort-header" @click="sortHeader('hourly_volume_ratio')">近1h放量{{ sortIcon('hourly_volume_ratio') }}</button></th><th><button class="sort-header" @click="sortHeader('depth_impact_percent')">$5k盘口冲击{{ sortIcon('depth_impact_percent') }}</button></th></template><template v-if="market === 'futures'"><th><button class="sort-header" @click="sortHeader('oi_change_percent')">OI数量变化{{ sortIcon('oi_change_percent') }}</button></th><th><button class="sort-header" @click="sortHeader('oi_notional')">OI金额{{ sortIcon('oi_notional') }}</button></th><th><button class="sort-header" @click="sortHeader('funding_rate_percent')">费率{{ sortIcon('funding_rate_percent') }}</button></th></template><template v-if="market === 'onchain'"><th><button class="sort-header" @click="sortHeader('liquidity')">流动性{{ sortIcon('liquidity') }}</button></th><th><button class="sort-header" @click="sortHeader('market_cap')">市值{{ sortIcon('market_cap') }}</button> / <button class="sort-header" @click="sortHeader('fdv')">FDV{{ sortIcon('fdv') }}</button></th><th><button class="sort-header" @click="sortHeader('age_hours')">交易池年龄{{ sortIcon('age_hours') }}</button></th><th>合约筛查</th></template><th><template v-if="market !== 'onchain'">告警 / </template><button class="sort-header" @click="sortHeader('updated')">更新时间{{ sortIcon('updated') }}</button></th></tr></thead>
       <tbody><tr v-for="r in visible" :key="r.id"><td>{{ r.display_rank ?? '—' }}</td><td><a :href="url(r)" target="_blank" rel="noopener noreferrer">{{ r.symbol }} ↗</a><small>{{ r.name }}</small><template v-if="r.address"><small>{{ r.chain }} · {{ r.dex }}</small><code :title="r.address">{{ r.address }}</code><small v-if="r.linked_contracts?.length">同项目 {{ r.linked_contracts.length }} 链／合约（CoinGecko 地址映射）：<span v-for="(member, index) in r.linked_contracts" :key="member.chain + member.address">{{ index ? ' · ' : '' }}{{ member.chain }} {{ risks[member.status] }}</span></small><small class="bad" v-else-if="r.same_name_count > 1">同名 {{ r.same_name_count }} 个合约，身份未证实，请核对 CA</small></template></td><td v-if="market === 'onchain'" class="story"><div>{{ r.narrative || '暂无项目简介' }}</div><small>{{ r.narrative_source || '尚无叙事资料' }} · {{ r.profile_source || '链接未经官方核验' }}</small><div class="story-links"><a v-if="r.website" :href="r.website" target="_blank" rel="noopener noreferrer">网站 ↗</a><a v-if="r.twitter" :href="r.twitter" target="_blank" rel="noopener noreferrer">X ↗</a><span v-if="!r.website && !r.twitter">暂无网站 / X 线索</span></div></td><td>{{ money(r.price) }}<small v-if="r.stale" class="bad">价格已过期</small></td><td :class="r.period_change >= 0 ? 'up' : 'down'">{{ pct(r.period_change) }}<small v-if="!r.history_available">未满周期 / 历史缺失</small><small v-else :title="timeText(r.baseline_at)">{{ r.return_source === 'fixed_hour_history' ? '固定小时快照 · ' + timeText(r.snapshot_at) : r.return_source === 'DexScreener 24h' ? '供应商24h口径' : '小时级历史基准' }}</small></td><td>{{ money(r.volume_24h) }}</td><template v-if="market !== 'onchain'"><td :class="r.relative_change_percent >= 0 ? 'up' : 'down'">{{ pct(r.relative_change_percent) }}<small>同期减 BTC/ETH 等权涨幅</small></td><td>{{ ratio(r.hourly_volume_ratio) }}<small>对比过去14天小时中位数</small></td><td>{{ r.depth_impact_percent == null ? '—' : Number(r.depth_impact_percent).toFixed(2) + '%' }}<small>{{ market === 'spot' ? '现货买入' : '永续卖出' }} · 100档</small></td></template>
       <template v-if="market === 'futures'"><td>{{ pct(r.oi_change_percent) }}<small :title="timeText(r.oi_asof)">数量口径 · 2h采样</small></td><td>{{ money(r.oi_notional) }}</td><td>{{ r.funding_rate_percent == null ? '—' : Number(r.funding_rate_percent).toFixed(4) + '%' }}<small>/ {{ r.funding_interval_hours }}h</small></td></template>

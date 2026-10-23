@@ -44,6 +44,8 @@ GLOBAL_ASSETS = {
     'KWEB': ('中国互联网', '全球区域', 'ETF 代理', 'https://kraneshares.com/etf/kweb/'),
     'XLE': ('美国能源股', '美股板块', 'ETF 代理', 'https://www.ssga.com/us/en/individual/etfs/state-street-energy-select-sector-spdr-etf-xle'),
 }
+from modules.monitor.global_etf_universe import EXTRA_GLOBAL_ASSETS, ASSET_META
+GLOBAL_ASSETS.update(EXTRA_GLOBAL_ASSETS)
 
 
 def calendar_changes(points, windows=(3, 7, 30)):
@@ -57,34 +59,57 @@ def calendar_changes(points, windows=(3, 7, 30)):
     asof, latest = ordered[-1]
     result = {}
     for days in windows:
+        if days == 1:
+            result['1d'] = round((latest / ordered[-2][1] - 1) * 100, 2) if len(ordered) >= 2 else None
+            continue
         target = asof - timedelta(days=days)
         past = next(((day, value) for day, value in reversed(ordered[:-1]) if day <= target), None)
         result[str(days) + 'd'] = round((latest / past[1] - 1) * 100, 2) if past and (target - past[0]).days <= 5 else None
     return result
 
 
-def fetch_global_assets():
+def fetch_global_assets(now=None):
     """Third-party daily closes, not live prices or licensed index feeds."""
     import akshare as ak
+    now = now or datetime.now(ZoneInfo('Asia/Shanghai'))
+    old = {r['id']: r for r in read_snapshot().get('global_assets', [])}
     def one(entry):
         symbol, (name, group, kind, url) = entry
+        meta = ASSET_META.get(symbol, dict(listing_market='US', currency='USD', symbol=symbol))
+        market, code = meta['listing_market'], meta['symbol']
         try:
-            frame = ak.index_us_stock_sina('.SOX') if symbol == 'SOX' else ak.stock_us_daily(symbol)
+            if market == 'CN':
+                frame = ak.fund_etf_hist_sina(('sh' if code.startswith('5') else 'sz') + code)
+            elif market == 'HK':
+                frame = ak.stock_hk_daily(code, adjust='')
+            else:
+                frame = ak.index_us_stock_sina('.SOX') if symbol == 'SOX' else ak.stock_us_daily(code, adjust='')
             if frame is None or frame.empty:
-                return None
+                raise ValueError('empty daily series')
             points = [(value.date() if hasattr(value, 'date') else value, close)
                       for value, close in zip(frame['date'], frame['close'])]
             points = [(value, finite(close)) for value, close in points if value]
             points = [(day, close) for day, close in points if close is not None and close > 0]
+            zone = ZoneInfo('America/New_York') if market == 'US' else ZoneInfo('Asia/Shanghai')
+            local = now.astimezone(zone)
+            cutoff = (16, 20) if market in ('HK', 'US') else (15, 10)
+            points = sorted({day: close for day, close in points
+                             if day < local.date() or (day == local.date() and (local.hour, local.minute) >= cutoff)}.items())
             if len(points) < 20:
-                return None
+                raise ValueError('insufficient daily series')
             day, price = points[-1]
             return {'id': symbol, 'name': name, 'group': group, 'kind': kind,
-                    'value': price, 'asof': day.isoformat(), 'changes': calendar_changes(points),
-                    'source': '新浪美股日线 / AkShare', 'url': url}
+                    'symbol': code, 'listing_market': market, 'currency': meta['currency'],
+                    'value': price, 'asof': day.isoformat(), 'changes': calendar_changes(points, (1, 3, 7, 30)),
+                    'previous_session': points[-2][0].isoformat(), 'day_change_definition': 'previous available completed trading session',
+                    'price_adjustment': 'unadjusted close; excludes dividends',
+                    'collection_quality': 'ok', 'missing_reason': None,
+                    'observation_stale': (local.date() - day).days > 7,
+                    'source': '新浪 ' + market + ' 日线 / AkShare', 'url': url}
         except Exception as exc:
             LOG.warning('Global asset %s unavailable: %s', symbol, exc)
-            return None
+            previous = old.get(symbol)
+            return dict(previous, collection_quality='stale', missing_reason='latest source refresh failed') if previous else None
     with ThreadPoolExecutor(max_workers=5) as pool:
         result = [row for row in pool.map(one, GLOBAL_ASSETS.items()) if row]
     if len(result) < 6:
