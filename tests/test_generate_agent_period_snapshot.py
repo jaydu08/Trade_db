@@ -184,6 +184,17 @@ class PeriodTest(unittest.TestCase):
             self.assertEqual(verified_hk_product(symbol)['leverage_factor'], 2)
             self.assertEqual(verified_hk_product(symbol)['leverage_reset_period'], 'daily')
 
+    def test_inverse_etfs_do_not_rank_as_ordinary_stocks(self):
+        for symbol in ('07552', '07500', '00700'):
+            self._bar('HK', symbol, '2026-10-09', 100)
+            self._bar('HK', symbol, '2026-10-16', 110)
+        rows, health = period.stock_period(self.root, 7, self._weekly_now(), {})
+        self.assertEqual({r['symbol'] for r in rows if r['market'] == 'HK'}, {'00700'})
+        excluded = {r['symbol']: r for h in health for r in h['excluded_candidates']}
+        for symbol in ('07552', '07500'):
+            self.assertEqual(excluded[symbol]['asset_type'], 'LEVERAGED_ETF')
+            self.assertEqual(excluded[symbol]['eligibility_status'], 'non_stock_instrument')
+
     def test_hk_multiple_trading_counters(self):
         hk, usd = verified_hk_product('07747'), verified_hk_product('09747')
         self.assertEqual(hk['product_id'], usd['product_id'])

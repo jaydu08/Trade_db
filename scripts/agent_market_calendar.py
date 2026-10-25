@@ -7,6 +7,7 @@ freshness checks instead of being silently treated as a completed session.
 from __future__ import annotations
 
 from datetime import date, timedelta
+from zoneinfo import ZoneInfo
 
 SOURCES = {
     'CN': 'https://www.sse.com.cn/disclosure/dealinstruc/closed/',
@@ -62,3 +63,45 @@ def last_session(market: str, day: date):
     while closed_reason(market, candidate):
         candidate -= timedelta(days=1)
     return candidate
+
+
+def archived_session(market, archive_day):
+    """US EOD archives are dated by next UTC ingestion day, not exchange day."""
+    day = date.fromisoformat(str(archive_day))
+    return day - timedelta(days=1) if market == 'US' else day
+
+
+def market_phase(market, now):
+    """Scheduled cash-equity phase, not a live halt feed or per-symbol status."""
+    if market not in ('CN', 'HK'):
+        return 'latest_complete'
+    local = now.astimezone(ZoneInfo('Asia/Shanghai'))
+    if closed_reason(market, local.date()):
+        return 'closed'
+    minute = local.hour * 60 + local.minute
+    if market == 'CN':
+        if minute < 555:
+            return 'pre_open'
+        if minute < 565:
+            return 'opening_auction'
+        if minute < 570:
+            return 'pre_open'
+        if minute < 690:
+            return 'open'
+        if minute < 780:
+            return 'lunch_break'
+        if minute < 897:
+            return 'open'
+        return 'closing_auction' if minute < 900 else 'post_close'
+    # Exchange-announced 2026 half sessions; no inferred future-year holidays.
+    half_day = local.date() in {date(2026, 2, 16), date(2026, 12, 24), date(2026, 12, 31)}
+    close = 720 if half_day else 960
+    if minute < 540:
+        return 'pre_open'
+    if minute < 570:
+        return 'opening_auction'
+    if minute < 720:
+        return 'open'
+    if half_day or minute >= close:
+        return 'closing_auction' if minute < close + 10 else 'post_close'
+    return 'lunch_break' if minute < 780 else 'open'

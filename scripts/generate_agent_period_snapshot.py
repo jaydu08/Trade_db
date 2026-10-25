@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from agent_research_focus import build_focus
 from agent_market_extensions import build_extensions
+from agent_market_calendar import archived_session
 
 from generate_agent_snapshot import (NEW_YORK, SHANGHAI, classify_stock_asset, verified_hk_product,
                                      epoch_iso, immutably_create, number, read_json,
@@ -26,8 +27,7 @@ def archive_session(market, archive_day):
     preceding New York session. `updated_at` is a write timestamp, not a
     vendor-confirmed exchange timestamp, so it must not define the session.
     """
-    day = date.fromisoformat(str(archive_day))
-    return day - timedelta(days=1) if market == 'US' else day
+    return archived_session(market, archive_day)
 
 
 def amount_measure(value, source, *, verified_zero=False):
@@ -216,6 +216,8 @@ def stock_period(root, days, now, scores):
         else:
             eligibility, exclusion_reason = 'eligible', None
         asset_type, asset_source = classify_stock_asset(symbol, latest['name'], meta['asset_type'])
+        if verified_product and verified_product.get('product_type') == 'INVERSE_ETF':
+            eligibility, exclusion_reason = 'non_stock_instrument', 'inverse ETF excluded from ordinary-stock ranking'
         if market == 'CF':
             asset_type, asset_source = 'COMMODITY_FUTURE', 'Trade_db CF archive'
         amount_latest, amount_status, amount_reason = amount_measure(latest['amount'], latest['source'])

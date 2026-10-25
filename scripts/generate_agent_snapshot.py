@@ -18,7 +18,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from agent_market_calendar import SOURCES as MARKET_CALENDAR_SOURCES, closed_reason, last_session
+from agent_market_calendar import (SOURCES as MARKET_CALENDAR_SOURCES, closed_reason, last_session,
+                                   archived_session, market_phase)
 from agent_research_focus import build_focus
 from agent_market_extensions import build_extensions
 
@@ -129,6 +130,20 @@ def verified_hk_product(symbol):
     09747 is retained as a historical USD counter; HKEX terminated it in Sep 2026.
     The product facts are from HKEX IFP fund pages BWT200 and BVZ635.
     """
+    counter = str(symbol or '').split('.')[-1].zfill(5)
+    inverse = {
+        '07552': ('Hang Seng TECH Index', 'HSTECH',
+                  'https://www.hkexnews.hk/listedco/listconews/sehk/2025/0829/2025082901858_c.pdf'),
+        '07500': ('Hang Seng Index', 'HSI',
+                  'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0430/2025043000857.pdf'),
+    }
+    if counter in inverse:
+        name, underlying, source = inverse[counter]
+        return dict(asset_type='LEVERAGED_ETF', product_type='INVERSE_ETF',
+                    classification_source='HKEX issuer filing ' + source, leverage_factor=-2,
+                    leverage_reset_period='daily', underlying=name, underlying_symbol=underlying,
+                    currency='HKD', primary_counter=counter, trading_counter=counter,
+                    counter_status='unknown', classification_verified_at='2026-10-25')
     products = {
         "07709": ("BWT200", "SK Hynix", "000660.KS", "HKD", "07709"),
         "07747": ("BVZ635", "Samsung Electronics", "005930.KS", "HKD", "07747"),
@@ -294,15 +309,12 @@ def stock_snapshot(root, now):
             board_items = board_items if isinstance(board_items, list) else []
             board_by_symbol = {str(item.get("symbol")): item for item in board_items if isinstance(item, dict)}
             last_asof = max((utc_naive_iso(b["updated_at"]) for b in latest.values()), default=None)
-            if market == "US" and last_asof:
-                # SQLModel updated_at is UTC-naive; date in this archive is Beijing ingestion day.
-                session = datetime.fromisoformat(last_asof).astimezone(NEW_YORK).date().isoformat()
-            else:
-                session = source_date
+            session = archived_session(market, source_date).isoformat()
             old = (now.date() - date.fromisoformat(source_date)).days > 4
             activity_row = next((a for a in activity if a.get("market") == market and a.get("day") == source_date), None)
             markets.append(dict(market=market, session_date=session, archive_date=source_date,
-                                market_status='closed' if closure else 'open' if market in ('CN', 'HK') else 'latest_complete',
+                                market_status=market_phase(market, now),
+                                market_status_basis='scheduled cash-equity session; not a live halt feed',
                                 closure_reason=closure, calendar_source=MARKET_CALENDAR_SOURCES.get(market) if closure else None,
                                 data_asof=last_asof, source="TrendDailyBar; TG daily board when present",
                                 quality="partial", stale=old, missing_reason=None if latest else "no valid close",
@@ -310,7 +322,7 @@ def stock_snapshot(root, now):
                                 turnover_currency=CURRENCY[market], breadth=None, major_index=None,
                                 candidate_universe=len(latest), archive_source_counts=archive_source_counts))
             health.append(dict(domain=f"stocks_{market}", session_date=session, data_asof=last_asof,
-                               market_status='closed' if closure else 'open' if market in ('CN', 'HK') else 'latest_complete',
+                               market_status=market_phase(market, now),
                                closure_reason=closure,
                                source="Trade_db ledger.db", quality="partial", stale=old,
                                missing_reason=None if latest else "no valid close"))
@@ -446,6 +458,9 @@ def stock_anomaly_snapshot(root, now):
                     continue
                 bar = by_symbol.get(symbol)
                 asset_type, type_source = classify_stock_asset(symbol, row.get('name'), catalog.get(symbol))
+                if asset_type in ('ETF', 'LEVERAGED_ETF'):
+                    excluded['non_stock_instrument'] = excluded.get('non_stock_instrument', 0) + 1
+                    continue
                 verified_product = verified_hk_product(symbol)
                 canonical = (symbol.split('.', 1)[1].upper()
                              if market == 'US' and re.fullmatch(r'\d{3}\.[A-Za-z][A-Za-z0-9.\-]*', symbol)
@@ -456,7 +471,9 @@ def stock_anomaly_snapshot(root, now):
                 amount = amount if amount is not None and amount > 0 else None
                 source = row.get('provider') or 'unknown'
                 contributions[source] = contributions.get(source, 0) + 1
-                session = archive
+                session = archived_session(market, archive).isoformat() if archive else None
+                if market in ('CN', 'HK'):
+                    session = scanned.get(market, {}).get('session_date')
                 item = dict(market=market, symbol=symbol, raw_symbol=symbol,
                             canonical_symbol=canonical, asset_id=f'{market}:{symbol}', exchange=None,
                             name=str(row.get('name') or ''), asset_type=asset_type,
@@ -473,7 +490,10 @@ def stock_anomaly_snapshot(root, now):
                             volatility_zscore=None, zscore_missing_reason='20 comparable daily returns not verified',
                             trend_score=None, relative_strength_pct=None,
                             relative_strength_basis='same-market eligible candidate median; not an index',
-                            session_date=session, observed_at=row.get('observed_at'),
+                            session_date=session, archive_date=archive,
+                            session_date_basis=('previous UTC date of existing US EOD ingestion archive'
+                                                if market == 'US' else 'validated current market quote scan'),
+                            observed_at=row.get('observed_at'),
                             source_checked_at=row.get('source_checked_at'),
                             data_asof=row.get('observed_at') or row.get('source_checked_at'),
                             source=source, coverage_pool='independent Agent market scan',
@@ -495,7 +515,9 @@ def stock_anomaly_snapshot(root, now):
             eligible = len(items)
             ratio = round(available / source_count, 3) if source_count else None
             enough = bool(source_count and ratio is not None and ratio >= 0.5 and eligible >= 10)
-            coverage.append(dict(market=market, session_date=items[0]['session_date'] if items else None,
+            coverage.append(dict(market=market, session_date=items[0]['session_date'] if items else
+                                 archived_session(market, archive).isoformat() if market == 'US' and archive else None,
+                                 market_status=market_phase(market, now),
                                  data_asof=max((i['data_asof'] for i in items if i['data_asof']), default=None),
                                  source_universe_count=source_count, available_universe_count=available,
                                  eligible_universe_count=eligible,
@@ -660,12 +682,16 @@ def macro_snapshot(root, now):
     checked = epoch_iso(payload.get("refreshed_at"))
     cache_stale = not payload.get("refreshed_at") or now.timestamp() - payload["refreshed_at"] > 86400
     stale_count = sum(bool(row['stale']) for row in observations)
+    activity_stale = any(row['stale'] for row in crypto_activity.values())
     health = dict(domain="macro", session_date=now.date().isoformat(), data_asof=checked,
                   source_checked_at=checked, source="Trade_db macro_dashboard_snapshot.json",
                   quality="stale" if cache_stale else "partial" if observations else "missing",
-                  stale=cache_stale, stale_indicator_count=stale_count,
+                  stale=cache_stale or bool(stale_count) or activity_stale,
+                  collection_stale=cache_stale, observation_stale=bool(stale_count) or activity_stale,
+                  stale_indicator_count=stale_count,
                   missing_reason="macro cache unavailable" if not observations else
-                  f'{stale_count} macro observations stale' if stale_count else None)
+                  f'{stale_count} macro observations stale' if stale_count else
+                  'crypto activity observations stale or unavailable' if activity_stale else None)
     return observations, crypto_activity, health
 
 
@@ -772,7 +798,9 @@ def ensure_daily_ready(snapshot, now, require_market_scan=True):
         raise ValueError("US archive is not a recent completed New York session")
     health = {h["domain"]: h for h in snapshot["source_health"]}
     for domain in ("crypto_spot", "crypto_futures", "crypto_onchain", "macro"):
-        if health[domain]["stale"] or health[domain]["quality"] == "missing":
+        source_stale = (health[domain].get('collection_stale', health[domain]['stale'])
+                        if domain == 'macro' else health[domain]['stale'])
+        if source_stale or health[domain]["quality"] == "missing":
             raise ValueError(f"{domain} source not ready")
     if require_market_scan:
         for market in ('CN', 'HK', 'US'):

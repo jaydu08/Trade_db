@@ -127,6 +127,15 @@ class SnapshotTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'CN current-day trend pool refresh not ready'):
             MODULE.ensure_daily_ready(snapshot, self.now)
 
+    def test_partial_macro_observations_do_not_block_ready_daily_markets(self):
+        snapshot = MODULE.build_snapshot(self.root, self.crypto, self.now)
+        macro = next(h for h in snapshot['source_health'] if h['domain'] == 'macro')
+        macro.update(stale=True, observation_stale=True, collection_stale=False, quality='partial')
+        MODULE.ensure_daily_ready(snapshot, self.now, require_market_scan=False)
+        macro['collection_stale'] = True
+        with self.assertRaisesRegex(ValueError, 'macro source not ready'):
+            MODULE.ensure_daily_ready(snapshot, self.now, require_market_scan=False)
+
 
 if __name__ == "__main__":
     unittest.main()
