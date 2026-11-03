@@ -1,0 +1,162 @@
+import logging
+import time
+import requests
+import os
+import threading
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+class Notifier:
+    """
+    Handles sending notifications (Telegram).
+    Safe for cross-thread usage.
+    Using direct HTTP API to avoid asyncio complexity in threads.
+    """
+    
+    @staticmethod
+    def send_telegram(chat_id: int, message: str, max_retries: int = 3):
+        """
+        Send a message to a specific chat_id using synchronous requests.
+        Retries up to max_retries times with exponential backoff on failure.
+        """
+        if not chat_id:
+            logger.warning("No chat_id provided for notification.")
+            return
+
+        token = os.getenv("TELEGRAM_BOT_TOKEN")
+        if not token:
+            logger.error("TELEGRAM_BOT_TOKEN not found in environment.")
+            return
+
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        markdown_payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "Markdown"
+        }
+        plain_payload = {
+            "chat_id": chat_id,
+            "text": message,
+        }
+        
+        for attempt in range(max_retries):
+            try:
+                resp = requests.post(url, json=markdown_payload, timeout=10)
+                if resp.status_code == 200:
+                    logger.info(f"Notification sent to {chat_id} (attempt {attempt + 1})")
+                    return
+                # Markdown 语法错误时，降级为纯文本重发，避免整条告警丢失
+                if resp.status_code == 400 and "parse" in resp.text.lower():
+                    fallback = requests.post(url, json=plain_payload, timeout=10)
+                    if fallback.status_code == 200:
+                        logger.info(f"Notification sent to {chat_id} in plain text fallback (attempt {attempt + 1})")
+                        return
+                else:
+                    logger.warning(
+                        f"Telegram API Error (attempt {attempt + 1}/{max_retries}): "
+                        f"{resp.status_code} - {resp.text}"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to send telegram message (attempt {attempt + 1}/{max_retries}): {e}")
+            
+            # Exponential backoff: 2s, 4s, 8s
+            if attempt < max_retries - 1:
+                wait = 2 ** (attempt + 1)
+                logger.info(f"Retrying in {wait}s...")
+                time.sleep(wait)
+        
+        logger.error(f"Failed to send telegram message to {chat_id} after {max_retries} attempts.")
+
+    @staticmethod
+    def broadcast(message: str):
+        """
+        Send to all admin users or last active chat.
+        """
+        # Try to get admin ID
+        admin_id = os.getenv("TELEGRAM_ADMIN_ID")
+        # Also try ALLOWED_USER_IDS
+        if not admin_id:
+            allowed = os.getenv("ALLOWED_USER_IDS")
+            if allowed:
+                admin_id = allowed.split(",")[0]
+        
+        if admin_id:
+            try:
+                Notifier.send_telegram(int(admin_id), message)
+            except ValueError:
+                logger.error(f"Invalid admin ID: {admin_id}")
+        else:
+            # Fallback to last chat id from bot module if available
+            try:
+                from interface.telegram_bot import LAST_CHAT_ID
+                if LAST_CHAT_ID:
+                    Notifier.send_telegram(LAST_CHAT_ID, message)
+                else:
+                    logger.warning("No target found for broadcast.")
+            except ImportError:
+                logger.warning("Could not import LAST_CHAT_ID")
+
+    @staticmethod
+    def send_document(chat_id: int, file_path: str, caption: str = "", max_retries: int = 3):
+        """
+        Send a document file to a specific chat_id.
+        """
+        if not chat_id:
+            logger.warning("No chat_id provided for notification.")
+            return
+
+        token = os.getenv("TELEGRAM_BOT_TOKEN")
+        if not token:
+            logger.error("TELEGRAM_BOT_TOKEN not found in environment.")
+            return
+
+        url = f"https://api.telegram.org/bot{token}/sendDocument"
+        
+        for attempt in range(max_retries):
+            try:
+                with open(file_path, 'rb') as f:
+                    files = {'document': f}
+                    data = {'chat_id': chat_id, 'caption': caption}
+                    resp = requests.post(url, data=data, files=files, timeout=20)
+                if resp.status_code == 200:
+                    logger.info(f"Document sent to {chat_id} (attempt {attempt + 1})")
+                    return
+                logger.warning(
+                    f"Telegram API Error (sendDocument attempt {attempt + 1}/{max_retries}): "
+                    f"{resp.status_code} - {resp.text}"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send telegram document (attempt {attempt + 1}/{max_retries}): {e}")
+            
+            if attempt < max_retries - 1:
+                wait = 2 ** (attempt + 1)
+                time.sleep(wait)
+        
+        logger.error(f"Failed to send telegram document to {chat_id} after {max_retries} attempts.")
+
+    @staticmethod
+    def broadcast_document(file_path: str, caption: str = ""):
+        """
+        Send document to all admin users or last active chat.
+        """
+        admin_id = os.getenv("TELEGRAM_ADMIN_ID")
+        if not admin_id:
+            allowed = os.getenv("ALLOWED_USER_IDS")
+            if allowed:
+                admin_id = allowed.split(",")[0]
+        
+        if admin_id:
+            try:
+                Notifier.send_document(int(admin_id), file_path, caption)
+            except ValueError:
+                logger.error(f"Invalid admin ID: {admin_id}")
+        else:
+            try:
+                from interface.telegram_bot import LAST_CHAT_ID
+                if LAST_CHAT_ID:
+                    Notifier.send_document(LAST_CHAT_ID, file_path, caption)
+                else:
+                    logger.warning("No target found for document broadcast.")
+            except ImportError:
+                logger.warning("Could not import LAST_CHAT_ID")

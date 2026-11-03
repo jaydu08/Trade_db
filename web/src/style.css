@@ -1,0 +1,78 @@
+:root {
+  --bg: #ffffff;
+  --bg-hover: #F7F6F3;
+  --text: #37352F;
+  --text-secondary: #787774;
+  --border: #E9E9E7;
+  --accent: #2F80ED;
+  --green: #0F7B6C;
+  --red: #EB5757;
+  --radius: 6px;
+  --nav-width: 220px;
+  --nav-collapsed: 56px;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'SF Pro Display', 'PingFang SC', sans-serif;
+  color: var(--text);
+  background: var(--bg);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+button {
+  cursor: pointer;
+  border: none;
+  background: none;
+  font-family: inherit;
+}
+
+/* Override Element Plus to match Notion style */
+.el-table {
+  --el-table-border-color: transparent !important;
+  --el-table-row-hover-bg-color: var(--bg-hover) !important;
+  font-size: 13px !important;
+}
+
+.el-table th.el-table__cell {
+  background: var(--bg) !important;
+  color: var(--text-secondary) !important;
+  font-weight: 500 !important;
+  border-bottom: 1px solid var(--border) !important;
+}
+
+.el-table td.el-table__cell {
+  border-bottom: none !important;
+}
+
+.el-button {
+  border-radius: var(--radius) !important;
+}
+
+.el-tag {
+  border-radius: 4px !important;
+}
+
+.el-input__wrapper {
+  border-radius: var(--radius) !important;
+  box-shadow: 0 0 0 1px var(--border) !important;
+}
+
+.el-dialog {
+  border-radius: 12px !important;
+}
+
+.pct-up { color: var(--red); }
+.pct-down { color: var(--green); }

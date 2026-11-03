@@ -1,0 +1,868 @@
+<script setup lang="ts">
+import { ref, watch, computed } from 'vue'
+import { ElMessage } from 'element-plus'
+import api from '../api'
+import HeatmapView from './HeatmapView.vue'
+
+interface CapitalSignalItem {
+  label: string
+  value: string
+  direction?: string
+  score?: number
+  tooltip?: string
+  asof?: string
+}
+
+interface CapitalSignalCoverage {
+  status?: string
+  text?: string
+  reason?: string
+  item_count?: number
+  latest_asof?: string
+}
+
+interface StockNarrative {
+  market: string
+  symbol: string
+  name: string
+  available: boolean
+  industry?: string
+  industry_source?: string
+  main_business?: string
+  company_profile?: string
+  products?: string
+  growth_clue?: string
+  profile_updated?: string
+  profile_stale?: boolean
+  profile_source?: string
+  business_source?: string
+  sec_business?: string
+  sec_filing_date?: string
+  sec_filing_url?: string
+  sec_form?: string
+  market_focus?: string
+  website?: string
+  profile_quality?: string
+}
+
+interface StockEvidenceEvent {
+  title: string
+  date: string
+  source: string
+  url: string
+  kind: string
+  priority: number
+}
+
+interface StockEvidence {
+  market: string
+  symbol: string
+  events: StockEvidenceEvent[]
+  status: string
+  note?: string
+}
+
+interface TrendItem {
+  rank: number
+  symbol: string
+  name: string
+  market: string
+  price: number
+  period_change: number
+  return_20d: number
+  return_60d: number
+  amount: number
+  turnover_rate: number
+  score: number
+  catalyst_tags: string
+  days_on_list: number
+  market_cap: number
+  inst_factor: number
+  inst_label: string
+  inst_change_pp: number
+  inst_delta_abs: number
+  inst_delta_pct: number
+  inst_start_value: number
+  inst_end_value: number
+  inst_start_date: string
+  inst_end_date: string
+  inst_metric_unit: string
+  inst_date: string
+  inst_text: string
+  inst_source: string
+  inst_direction: string
+  capital_signal_items: CapitalSignalItem[]
+  capital_signal_score: number
+  capital_signal_coverage: CapitalSignalCoverage
+  signal_strength: number
+  price_date: string
+}
+
+type TrendMode = 'hot' | 'daily' | 'slow'
+interface TrendCacheEntry {
+  items: TrendItem[]
+  ts: number
+}
+
+const markets = ['CN', 'HK', 'US']
+const daysOptions = [1, 3, 7, 14, 30, 60, 90, 180]
+const activeMode = ref<TrendMode>('hot')
+const activeMarket = ref('CN')
+const activeDays = ref(1)
+const loading = ref(false)
+const loadingKey = ref('')
+const refreshingKey = ref('')
+const trendCache = ref<Record<string, TrendCacheEntry>>({})
+const CACHE_TTL_MS = 5 * 60 * 1000
+const narrativeVisible = ref(false)
+const narrativeLoading = ref(false)
+const narrativeError = ref('')
+type NarrativeTarget = Pick<TrendItem, 'symbol' | 'name' | 'market' | 'catalyst_tags'>
+const narrativeRow = ref<NarrativeTarget | null>(null)
+const narrative = ref<StockNarrative | null>(null)
+const narrativeCache = new Map<string, StockNarrative>()
+const evidenceCache = new Map<string, StockEvidence>()
+const evidence = ref<StockEvidence | null>(null)
+const evidenceLoading = ref(false)
+let narrativeRequestId = 0
+
+async function loadEvidence(row: NarrativeTarget, key: string, requestId: number) {
+  const cached = evidenceCache.get(key)
+  evidence.value = cached || null
+  evidenceLoading.value = !cached
+  if (cached) return
+  try {
+    const res = await api.get('/trend/narrative/evidence', {
+      params: { market: row.market, symbol: row.symbol }, timeout: 25000,
+    })
+    const result = res.data as StockEvidence
+    evidenceCache.set(key, result)
+    if (requestId === narrativeRequestId) evidence.value = result
+  } catch {
+    if (requestId === narrativeRequestId) evidence.value = {
+      market: row.market, symbol: row.symbol, events: [], status: 'unavailable',
+    }
+  } finally {
+    if (requestId === narrativeRequestId) evidenceLoading.value = false
+  }
+}
+
+async function openNarrative(row: NarrativeTarget) {
+  narrativeRow.value = row
+  narrativeVisible.value = true
+  narrativeError.value = ''
+  const key = `${row.market}:${row.symbol}`
+  const requestId = ++narrativeRequestId
+  void loadEvidence(row, key, requestId)
+  const cached = narrativeCache.get(key)
+  narrative.value = cached || null
+  if (cached) {
+    narrativeLoading.value = false
+    return
+  }
+  narrativeLoading.value = true
+  try {
+    const res = await api.get('/trend/narrative', {
+      params: { market: row.market, symbol: row.symbol }, timeout: 45000,
+    })
+    const detail = res.data as StockNarrative
+    narrativeCache.set(key, detail)
+    if (requestId === narrativeRequestId) narrative.value = detail
+  } catch (e: any) {
+    if (requestId === narrativeRequestId) {
+      narrativeError.value = e?.response?.data?.detail || '公司资料暂时无法读取'
+    }
+  } finally {
+    if (requestId === narrativeRequestId) narrativeLoading.value = false
+  }
+}
+
+const pageSize = ref(20)
+const currentPage = ref(1)
+const sortProp = ref<string>('')
+const sortOrder = ref<'ascending' | 'descending' | ''>('')
+
+function makeCacheKey(
+  mode: TrendMode = activeMode.value,
+  market: string = activeMarket.value,
+  days: number = activeDays.value,
+): string {
+  return mode === 'hot' ? `${mode}:${market}:${days}` : `${mode}:${market}`
+}
+
+function resetTableState() {
+  currentPage.value = 1
+  sortProp.value = ''
+  sortOrder.value = ''
+}
+
+function wait(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
+function normalizeTrendItems(mkt: string, items: any[], mode: TrendMode): TrendItem[] {
+  return (items || []).map((item: any, idx: number) => ({
+    rank: idx + 1,
+    symbol: item.symbol || '',
+    name: item.name || '',
+    market: mkt,
+    price: item.price ?? 0,
+    period_change: mode === 'slow' ? (item.return_60d ?? item.return_pct ?? 0) : (item.return_pct ?? 0),
+    return_20d: item.return_20d ?? 0,
+    return_60d: item.return_60d ?? item.return_pct ?? 0,
+    amount: item.amount ?? 0,
+    turnover_rate: item.turnover_rate ?? 0,
+    score: item.trend_score ?? 0,
+    catalyst_tags: item.catalyst_tags || '',
+    days_on_list: item.days_on_list ?? 0,
+    market_cap: item.market_cap ?? 0,
+    inst_factor: item.inst_factor ?? 0,
+    inst_label: item.inst_label || '',
+    inst_change_pp: item.inst_change_pp ?? 0,
+    inst_delta_abs: item.inst_delta_abs ?? item.inst_change_pp ?? 0,
+    inst_delta_pct: item.inst_delta_pct ?? 0,
+    inst_start_value: item.inst_start_value ?? 0,
+    inst_end_value: item.inst_end_value ?? 0,
+    inst_start_date: item.inst_start_date || '',
+    inst_end_date: item.inst_end_date || item.inst_date || '',
+    inst_metric_unit: item.inst_metric_unit || 'percentage_point',
+    inst_date: item.inst_date || '',
+    inst_text: item.inst_text || '',
+    inst_source: item.inst_source || '',
+    inst_direction: item.inst_direction || '',
+    capital_signal_items: Array.isArray(item.capital_signal_items) ? item.capital_signal_items : [],
+    capital_signal_score: item.capital_signal_score ?? 0,
+    capital_signal_coverage: item.capital_signal_coverage || {},
+    signal_strength: item.signal_strength ?? 0,
+    price_date: item.price_date || '',
+  }))
+}
+
+async function fetchTrend(force = false) {
+  const mode = activeMode.value
+  const market = activeMarket.value
+  const days = activeDays.value
+  if (mode === 'hot' && days === 1) return
+  const key = makeCacheKey(mode, market, days)
+  const cached = trendCache.value[key]
+  const isFresh = cached && (Date.now() - cached.ts < CACHE_TTL_MS)
+
+  if (!force && isFresh) {
+    if (loadingKey.value !== key) loading.value = false
+    return
+  }
+
+  const hasCachedRows = Boolean(cached?.items?.length)
+  if (hasCachedRows) {
+    refreshingKey.value = key
+    if (loadingKey.value !== key) loading.value = false
+  } else {
+    loadingKey.value = key
+    loading.value = true
+  }
+  try {
+    let endpoint = '/trend'
+    const params: Record<string, number | string> = { limit: 100, market, refresh_prices: 1, force_refresh: force ? 1 : 0 }
+    if (mode === 'hot') {
+      params.days = days
+    } else if (mode === 'daily') {
+      endpoint = '/trend/daily'
+    } else if (mode === 'slow') {
+      endpoint = '/trend/slow'
+    }
+
+    const maxAttempts = mode === 'daily' || mode === 'slow' ? 2 : 1
+    const requestTimeout = mode === 'slow' ? 90000 : mode === 'daily' ? 60000 : 30000
+    let res: any = null
+    let lastError: any = null
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        res = await api.get(endpoint, { params, timeout: requestTimeout })
+        break
+      } catch (err: any) {
+        lastError = err
+        if (attempt < maxAttempts) await wait(800)
+      }
+    }
+    if (!res) throw lastError
+
+    const raw = res.data.markets || {}
+    const sourceItems = Array.isArray(raw[market]) ? raw[market] : []
+    const nextItems = normalizeTrendItems(market, sourceItems, mode)
+    trendCache.value = { ...trendCache.value, [key]: { items: nextItems, ts: Date.now() } }
+  } catch (e: any) {
+    if (!hasCachedRows || force) {
+      ElMessage.error(e?.response?.data?.detail || '加载趋势数据失败')
+    } else {
+      console.warn('Trend background refresh failed:', e)
+    }
+  } finally {
+    if (loadingKey.value === key) {
+      loading.value = false
+      loadingKey.value = ''
+    }
+    if (refreshingKey.value === key) {
+      refreshingKey.value = ''
+    }
+  }
+}
+
+const currentCache = computed<TrendCacheEntry | undefined>(() => trendCache.value[makeCacheKey()])
+const currentItems = computed<TrendItem[]>(() => currentCache.value?.items || [])
+const isRefreshingCurrent = computed(() => refreshingKey.value === makeCacheKey())
+const currentCacheAgeText = computed(() => {
+  const ts = currentCache.value?.ts || 0
+  if (!ts) return ''
+  const ageMs = Date.now() - ts
+  if (ageMs < 60_000) return '刚刚更新'
+  const mins = Math.max(1, Math.round(ageMs / 60_000))
+  if (mins < 60) return `${mins}分钟前更新`
+  const hours = Math.round(mins / 60)
+  return `${hours}小时前更新`
+})
+
+const sortedItems = computed<TrendItem[]>(() => {
+  const list = [...currentItems.value]
+  if (!sortProp.value || !sortOrder.value) return list
+
+  const factor = sortOrder.value === 'ascending' ? 1 : -1
+  const prop = sortProp.value as keyof TrendItem
+  list.sort((a, b) => {
+    const va = Number((a as any)[prop] ?? 0)
+    const vb = Number((b as any)[prop] ?? 0)
+    if (va === vb) return 0
+    return va > vb ? factor : -factor
+  })
+  return list
+})
+
+const totalItems = computed(() => sortedItems.value.length)
+
+const pagedItems = computed<TrendItem[]>(() => {
+  const start = (currentPage.value - 1) * pageSize.value
+  const end = start + pageSize.value
+  return sortedItems.value.slice(start, end)
+})
+
+watch(activeMarket, () => {
+  resetTableState()
+  fetchTrend()
+})
+
+watch(activeDays, () => {
+  if (activeMode.value !== 'hot') return
+  resetTableState()
+  fetchTrend()
+})
+
+watch(activeMode, () => {
+  resetTableState()
+  fetchTrend()
+})
+
+watch(pageSize, () => {
+  currentPage.value = 1
+})
+
+function pctClass(v: number) {
+  return v > 0 ? 'pct-up' : v < 0 ? 'pct-down' : ''
+}
+
+function scoreStars(score: number): number {
+  if (score >= 50) return 5
+  if (score >= 30) return 4
+  if (score >= 15) return 3
+  if (score >= 5) return 2
+  if (score > 0) return 1
+  return 0
+}
+
+function formatCap(v: number, market: string): string {
+  if (!v) return '-'
+  if (market === 'US') {
+    if (v >= 10000) return (v / 10000).toFixed(2) + '万亿美元'
+    if (v >= 1000) return v.toFixed(0) + '亿美元'
+    if (v >= 100) return v.toFixed(1) + '亿美元'
+    return v.toFixed(2) + '亿美元'
+  }
+  if (v >= 10000) return (v / 10000).toFixed(2) + '万亿'
+  if (v >= 1000) return v.toFixed(0) + '亿'
+  if (v >= 100) return v.toFixed(1) + '亿'
+  return v.toFixed(2) + '亿'
+}
+
+
+function formatAmount(v: number, market: string): string {
+  if (!v) return '-'
+  const unit = market === 'US' ? '美元' : market === 'HK' ? '港币' : '元'
+  if (v >= 1_0000_0000) return (v / 1_0000_0000).toFixed(1) + '亿' + unit
+  if (v >= 1_0000_0000 / 10) return (v / 1_0000_0000).toFixed(2) + '亿' + unit
+  if (v >= 1_0000) return (v / 1_0000).toFixed(0) + '万' + unit
+  return v.toFixed(0) + unit
+}
+
+
+function formatTurnover(v: number): string {
+  if (!v) return '-'
+  return `${Number(v).toFixed(2)}%`
+}
+
+function changeLabel(): string {
+  if (activeMode.value === 'daily') return '当日涨幅'
+  if (activeMode.value === 'slow') return '60日涨幅'
+  return 'N日涨幅'
+}
+
+function metaPrefix(): string {
+  if (activeMode.value === 'daily') return '当日强势候选'
+  if (activeMode.value === 'slow') return '慢趋势候选'
+  return '共'
+}
+
+function formatDate(v: string): string {
+  if (!v) return '-'
+  return String(v).slice(0, 10)
+}
+
+function chipItems(row: TrendItem): CapitalSignalItem[] {
+  const items = Array.isArray(row.capital_signal_items) ? row.capital_signal_items : []
+  if (items.length) return items
+  if (row.inst_text) {
+    const label = row.inst_label || (row.market === "US" ? "内部人" : row.market === "HK" ? "南向" : "北向")
+    const delta = Number(row.inst_delta_abs || row.inst_change_pp || 0)
+    const value = Math.abs(delta) >= 0.005 ? formatSigned(delta, row.inst_metric_unit === "percent" ? 3 : 2) + "%" : "持平"
+    return [{ label, value, direction: row.inst_direction, tooltip: row.inst_text }]
+  }
+  return []
+}
+
+function visibleChipItems(row: TrendItem): CapitalSignalItem[] {
+  return chipItems(row).slice(0, 2)
+}
+
+function hiddenChipCount(row: TrendItem): number {
+  return Math.max(0, chipItems(row).length - visibleChipItems(row).length)
+}
+
+function coverageClass(row: TrendItem): string {
+  const status = String(row.capital_signal_coverage?.status || '')
+  if (status === 'complete') return 'coverage-complete'
+  if (status === 'partial') return 'coverage-partial'
+  if (status === 'missing') return 'coverage-missing'
+  return 'coverage-unknown'
+}
+
+function coverageText(row: TrendItem): string {
+  return row.capital_signal_coverage?.text || (chipItems(row).length ? '部分' : '缺失')
+}
+
+function coverageTooltip(row: TrendItem): string {
+  const reason = row.capital_signal_coverage?.reason || ''
+  const latest = row.capital_signal_coverage?.latest_asof || ''
+  const chip = chipTooltip(row)
+  return [chip, reason, latest ? `最新披露: ${latest}` : ''].filter(Boolean).join(' / ')
+}
+
+function formatSigned(v: number, digits = 2): string {
+  const n = Number(v || 0)
+  return `${n > 0 ? "+" : ""}${n.toFixed(digits)}`
+}
+
+function chipClass(item: CapitalSignalItem): string {
+  const dir = String(item.direction || "")
+  const score = Number(item.score || 0)
+  if (dir.includes("增") || dir.includes("流入") || dir.includes("集中") || score > 0) return "chip-up"
+  if (dir.includes("减") || dir.includes("流出") || dir.includes("分散") || score < 0) return "chip-down"
+  return "chip-flat"
+}
+
+function chipTooltip(row: TrendItem): string {
+  const parts = chipItems(row)
+    .map((item) => item.tooltip || `${item.label}${item.value}${item.asof ? ` (${item.asof})` : ""}`)
+    .filter(Boolean)
+  if (!parts.length && row.inst_text) parts.push(row.inst_text)
+  return parts.join(" / ")
+}
+
+function handleSortChange(payload: any) {
+  const prop = payload?.prop
+  const order = payload?.order
+  sortProp.value = (prop as string) || ''
+  sortOrder.value = (order as any) || ''
+  currentPage.value = 1
+}
+
+</script>
+
+<template>
+  <div class="trend-view">
+    <div style="margin-bottom: 16px"><router-link to="/trend/crypto">◈ 加密 Trend · 现货 / 合约 / 链上 →</router-link></div>
+    <div class="toolbar">
+      <div class="mode-group">
+        <button class="mode-btn" :class="{ active: activeMode === 'hot' }" @click="activeMode = 'hot'">热门趋势</button>
+        <button class="mode-btn" :class="{ active: activeMode === 'slow' }" @click="activeMode = 'slow'">慢趋势机构票</button>
+      </div>
+      <div class="tab-group">
+        <button
+          v-for="m in markets" :key="m"
+          class="tab-btn" :class="{ active: activeMarket === m }"
+          @click="activeMarket = m"
+        >{{ m }}</button>
+      </div>
+      <div v-if="activeMode === 'hot'" class="days-group">
+        <button
+          v-for="d in daysOptions" :key="d"
+          class="days-btn" :class="{ active: activeDays === d }"
+          @click="activeDays = d"
+        >{{ d }}天</button>
+      </div>
+      <div v-else class="mode-criteria slow-criteria">20日≥12% · 60日≥30% · 高市值/高成交额</div>
+      <div v-if="!(activeMode === 'hot' && activeDays === 1)" class="meta-text">
+        {{ metaPrefix() }} {{ totalItems }} 个标的
+        <span v-if="currentCacheAgeText"> · {{ currentCacheAgeText }}</span>
+        <span v-if="isRefreshingCurrent"> · 后台刷新中</span>
+      </div>
+      <button v-if="!(activeMode === 'hot' && activeDays === 1)" class="refresh-btn" :class="{ refreshing: isRefreshingCurrent }" :disabled="isRefreshingCurrent" @click="fetchTrend(true)">
+        {{ isRefreshingCurrent ? '更新中' : '刷新' }}
+      </button>
+    </div>
+
+    <HeatmapView v-if="activeMode === 'hot' && activeDays === 1" :initial-market="activeMarket" @select-stock="openNarrative" />
+    <template v-else>
+    <el-table :data="pagedItems" v-loading="loading" size="small" @sort-change="handleSortChange">
+      <el-table-column prop="rank" label="#" width="46" />
+      <el-table-column prop="symbol" label="代码" width="98" />
+      <el-table-column prop="name" label="名称" width="110" />
+      <el-table-column label="公司" width="74">
+        <template #default="{ row }">
+          <button class="profile-link" @click="openNarrative(row)">了解 ↗</button>
+        </template>
+      </el-table-column>
+      <el-table-column label="现价" width="78">
+        <template #default="{ row }">{{ row.price ? row.price.toFixed(2) : '-' }}</template>
+      </el-table-column>
+      <el-table-column prop="period_change" :label="changeLabel()" width="96" sortable="custom">
+        <template #default="{ row }">
+          <span :class="pctClass(row.period_change)">
+            {{ row.period_change > 0 ? '+' : '' }}{{ row.period_change.toFixed(1) }}%
+          </span>
+        </template>
+      </el-table-column>
+      <el-table-column v-if="activeMode === 'slow'" prop="return_20d" label="20日涨幅" width="96" sortable="custom">
+        <template #default="{ row }">
+          <span :class="pctClass(row.return_20d)">
+            {{ row.return_20d > 0 ? '+' : '' }}{{ row.return_20d.toFixed(1) }}%
+          </span>
+        </template>
+      </el-table-column>
+      <el-table-column prop="market_cap" label="市值" width="118" sortable="custom">
+        <template #default="{ row }">{{ formatCap(row.market_cap, row.market) }}</template>
+      </el-table-column>
+      <el-table-column v-if="activeMode !== 'hot'" prop="amount" label="成交额" width="116" sortable="custom">
+        <template #default="{ row }">{{ formatAmount(row.amount, row.market) }}</template>
+      </el-table-column>
+      <el-table-column v-if="activeMode === 'daily'" prop="turnover_rate" label="换手率" width="88" sortable="custom">
+        <template #default="{ row }">{{ formatTurnover(row.turnover_rate) }}</template>
+      </el-table-column>
+      <el-table-column v-if="activeMode !== 'daily'" prop="capital_signal_score" label="筹码" width="236" sortable="custom">
+        <template #default="{ row }">
+          <el-tooltip :content="coverageTooltip(row)" placement="top" :disabled="!coverageTooltip(row)">
+            <div v-if="chipItems(row).length" class="chip-wrap">
+              <span v-for="item in visibleChipItems(row)" :key="`${item.label}-${item.value}`" class="capital-chip" :class="chipClass(item)">
+                <span class="chip-label">{{ item.label }}</span><span>{{ item.value }}</span>
+              </span>
+              <span v-if="hiddenChipCount(row)" class="chip-more">+{{ hiddenChipCount(row) }}</span>
+              <span class="coverage-dot" :class="coverageClass(row)">{{ coverageText(row) }}</span>
+            </div>
+            <span v-else class="coverage-empty" :class="coverageClass(row)">{{ coverageText(row) }}</span>
+          </el-tooltip>
+        </template>
+      </el-table-column>
+      <el-table-column label="催化标签" min-width="168">
+        <template #default="{ row }">
+          <span class="catalyst-text">{{ row.catalyst_tags || "-" }}</span>
+        </template>
+      </el-table-column>
+      <el-table-column v-if="activeMode !== 'daily'" prop="days_on_list" label="上榜天数" width="88" sortable="custom">
+        <template #default="{ row }">{{ row.days_on_list }}d</template>
+      </el-table-column>
+      <el-table-column prop="score" label="评分" width="110" sortable="custom">
+        <template #default="{ row }">
+          <div class="score-wrap">
+            <span class="stars">{{ "★".repeat(scoreStars(row.score)) }}{{ "☆".repeat(5 - scoreStars(row.score)) }}</span>
+            <span class="score-num">{{ row.score.toFixed(1) }}</span>
+          </div>
+        </template>
+      </el-table-column>
+      <el-table-column label="价格日期" width="112">
+        <template #default="{ row }">{{ formatDate(row.price_date) }}</template>
+      </el-table-column>
+    </el-table>
+
+    <div class="pager-wrap">
+      <el-pagination
+        v-model:current-page="currentPage"
+        v-model:page-size="pageSize"
+        :page-sizes="[20, 50, 100]"
+        layout="total, sizes, prev, pager, next"
+        :total="totalItems"
+        background
+      />
+    </div>
+
+    </template>
+    <el-drawer v-model="narrativeVisible" :title="`${narrativeRow?.name || narrativeRow?.symbol || '公司'} · 公司脉络`" size="min(520px, 100vw)">
+      <div v-loading="narrativeLoading" class="narrative-panel">
+        <p class="narrative-note">公司资料与行情榜分开更新；行业可能为规则推断。以下不是投资建议，也不把涨幅当作新闻催化。</p>
+        <p v-if="narrativeError" class="narrative-error">{{ narrativeError }}</p>
+        <template v-if="narrative && narrative.available">
+          <div class="narrative-meta">
+            <span>{{ narrative.market }} · {{ narrative.symbol }}</span>
+            <span v-if="narrative.profile_updated">资料同步 {{ narrative.profile_updated }}</span>
+            <span v-if="narrative.profile_stale" class="narrative-stale">资料超过 180 天</span>
+            <span v-if="narrative.profile_quality === 'partial'" class="narrative-stale">资料待补齐</span>
+          </div>
+          <section class="narrative-section">
+            <h3>所属行业</h3>
+            <p>{{ narrative.industry || '暂无可核实分类' }}</p>
+            <small v-if="narrative.industry_source">{{ narrative.industry_source }}</small>
+            <small v-if="narrative.website"><a :href="narrative.website" target="_blank" rel="noopener noreferrer">公司网站 ↗</a>（Finnhub 收录，链接需自行核对）</small>
+          </section>
+          <section class="narrative-section">
+            <h3>主营业务<span v-if="narrative.business_source"> · {{ narrative.business_source }}</span></h3>
+            <p>{{ narrative.main_business || narrative.company_profile || '暂无可靠的主营业务描述，不能仅凭行业分类推断。' }}</p>
+            <small v-if="narrative.products">产品线：{{ narrative.products }}</small>
+          </section>
+          <section v-if="narrative.sec_business && narrative.sec_business !== narrative.main_business" class="narrative-section">
+            <h3>SEC {{ narrative.sec_form || '年报' }} 业务说明 · 英文原文</h3>
+            <p>{{ narrative.sec_business }}</p>
+            <small>摘自 {{ narrative.sec_form === '20-F' ? '20-F Item 4.B' : '10-K Item 1' }}；原文不是自动翻译，也不代表最新经营变化。</small>
+          </section>
+          <p v-if="narrative.sec_filing_url" class="narrative-source">SEC {{ narrative.sec_form }} 申报于 {{ narrative.sec_filing_date || '日期待核' }} · <a :href="narrative.sec_filing_url" target="_blank" rel="noopener noreferrer">核对原始申报 ↗</a></p>
+          <section v-if="narrative.main_business && narrative.company_profile" class="narrative-section">
+            <h3>公司简介补充</h3>
+            <p>{{ narrative.company_profile }}</p>
+          </section>
+          <section class="narrative-section">
+            <h3>资料中的增长方向</h3>
+            <p>{{ narrative.growth_clue || '现有公司简介没有明确的扩张或研发方向描述；需以较新财报、公告核验。' }}</p>
+            <small>摘自公司资料中的明确表述，不是业绩预测。</small>
+          </section>
+          <section class="narrative-section">
+            <h3>市场在交易什么？</h3>
+            <p>{{ evidence?.events?.length ? '以下是近期公司相关公告/新闻线索，尚不能据此确认价格变动原因。' : narrative.market_focus }}</p>
+            <p v-if="evidenceLoading" class="evidence-state">近期公告与新闻检索中…</p>
+            <template v-else-if="evidence?.events?.length">
+              <div class="evidence-list">
+                <a v-for="event in evidence.events" :key="event.url" class="evidence-item"
+                   :href="event.url" target="_blank" rel="noopener noreferrer">
+                  <span class="evidence-date">{{ event.date }} · {{ event.source }} · {{ event.kind }}</span>
+                  <span class="evidence-title">{{ event.title }} ↗</span>
+                </a>
+              </div>
+              <small>{{ evidence.note || '仅为近期公司相关线索，不代表价格变动原因。' }}</small>
+              <small v-if="narrative.market === 'US'">美股标题保留来源原文；请点击原文核实具体内容。</small>
+            </template>
+            <p v-else-if="evidence" class="evidence-state">{{ evidence.status === 'unavailable' ? '来源暂时不可用，稍后再试。' : evidence.status === 'routine_only' ? '近期仅检索到例行披露，未见值得单列的事项标题。' : '本次未取得可核实的近期公告或新闻。' }}</p>
+            <small v-if="narrativeRow?.catalyst_tags">榜单规则线索（未经新闻核实）：{{ narrativeRow.catalyst_tags }}</small>
+          </section>
+          <p class="narrative-source">{{ narrative.profile_source || 'Finnhub 公司身份资料' }}<span v-if="narrative.profile_updated"> · {{ narrative.profile_updated }}</span>。同步日期不等于财报发布日期；主营描述仅使用已有公司资料原文。</p>
+        </template>
+        <p v-else-if="narrative && !narrative.available" class="narrative-empty">该股票暂无本地公司档案；不会按同名公司拼接资料。</p>
+      </div>
+    </el-drawer>
+  </div>
+</template>
+
+<style scoped>
+.trend-view { max-width: 1440px; }
+.market-subnav { display: flex; gap: 8px; margin-bottom: 16px; }
+.market-subnav button { border: 1px solid var(--border); background: white; border-radius: 6px; padding: 7px 12px; cursor: pointer; }
+.market-subnav button.active { color: white; background: #222b25; }
+.toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  margin-bottom: 16px;
+}
+.mode-group, .tab-group, .days-group {
+  display: flex;
+  gap: 2px;
+  background: var(--bg-hover);
+  border-radius: var(--radius);
+  padding: 2px;
+}
+.mode-btn, .tab-btn, .days-btn {
+  padding: 5px 12px;
+  font-size: 13px;
+  border-radius: 4px;
+  color: var(--text-secondary);
+  transition: all 0.15s;
+}
+.mode-btn.active, .tab-btn.active, .days-btn.active {
+  background: white;
+  color: var(--text);
+  font-weight: 500;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+}
+.meta-text {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.refresh-btn {
+  padding: 5px 11px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  background: white;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  transition: all 0.15s ease;
+}
+.refresh-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 3px 10px rgba(15, 23, 42, 0.08);
+}
+.refresh-btn.refreshing,
+.refresh-btn:disabled {
+  color: var(--text-secondary);
+  cursor: default;
+  background: var(--bg-hover);
+  box-shadow: none;
+}
+.mode-criteria {
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.slow-criteria {
+  color: #8a4b00;
+  background: rgba(245, 158, 11, 0.12);
+}
+.daily-criteria {
+  color: #155eef;
+  background: rgba(21, 94, 239, 0.09);
+}
+.catalyst-text {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.chip-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.capital-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  max-width: 104px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.25;
+  white-space: nowrap;
+}
+.chip-label {
+  opacity: 0.82;
+}
+.chip-up {
+  color: #b42318;
+  background: rgba(180, 35, 24, 0.08);
+}
+.chip-down {
+  color: #027a48;
+  background: rgba(2, 122, 72, 0.08);
+}
+.chip-flat {
+  color: var(--text-secondary);
+  background: var(--bg-hover);
+}
+.chip-more {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 5px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: rgba(120, 119, 116, 0.12);
+}
+.inst-empty {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.coverage-dot {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 5px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.coverage-empty {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+}
+.coverage-complete {
+  color: #155eef;
+  background: rgba(21, 94, 239, 0.08);
+}
+.coverage-partial {
+  color: #b54708;
+  background: rgba(181, 71, 8, 0.10);
+}
+.coverage-missing, .coverage-unknown {
+  color: var(--text-secondary);
+  background: rgba(120, 119, 116, 0.12);
+}
+.score-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.stars {
+  font-size: 13px;
+  color: #F2C94C;
+  letter-spacing: 0;
+}
+.score-num {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.pager-wrap {
+  margin-top: 12px;
+  display: flex;
+  justify-content: flex-end;
+}
+.profile-link { color: #155eef; font-size: 12px; white-space: nowrap; }
+.profile-link:hover { text-decoration: underline; }
+.narrative-panel { min-height: 120px; padding: 0 4px 20px; }
+.narrative-note, .narrative-source { color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
+.narrative-error { color: #b42318; }
+.narrative-empty { color: var(--text-secondary); line-height: 1.7; }
+.narrative-meta { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 18px 0; color: var(--text-secondary); font-size: 12px; }
+.narrative-stale { color: #b54708; }
+.narrative-section { padding: 15px 0; border-top: 1px solid rgba(15, 23, 42, 0.08); }
+.narrative-section h3 { margin: 0 0 8px; font-size: 14px; }
+.narrative-section p { margin: 0; line-height: 1.75; font-size: 13px; white-space: pre-wrap; }
+.narrative-section small { display: block; margin-top: 7px; line-height: 1.6; color: var(--text-secondary); }
+.evidence-state { margin-top: 10px !important; color: var(--text-secondary); font-size: 12px !important; }
+.evidence-list { display: grid; gap: 7px; margin-top: 12px; }
+.evidence-item { display: grid; gap: 3px; padding: 9px 10px; border-radius: 7px; background: var(--bg-hover); text-decoration: none; }
+.evidence-item:hover .evidence-title { text-decoration: underline; }
+.evidence-date { color: var(--text-secondary); font-size: 11px; }
+.evidence-title { color: #155eef; font-size: 12px; line-height: 1.5; }
+</style>

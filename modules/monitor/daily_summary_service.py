@@ -1,0 +1,473 @@
+"""
+Daily Summary Service - 每日推送标的汇总服务
+每工作日北京时间 20:00 把当日所有推送过的标的（热榜股票 + 大宗商品）
+汇总写入 logs/daily_summary_YYYYMMDD.txt
+"""
+import logging
+import datetime
+import os
+from typing import List, Dict
+
+from sqlmodel import select, Session
+
+from core.db import db_manager
+from domain.ledger.analytics import TrendDailyBar
+from modules.monitor.notifier import Notifier
+from modules.ingestion.market_cap import (
+    get_cn_market_metrics,
+    get_hk_market_metrics,
+    format_mv_cn,
+    format_mv_hk,
+)
+from modules.ingestion.us_market_cap import get_us_market_metrics
+
+
+logger = logging.getLogger(__name__)
+
+# 输出目录（与 system_run.log 同级）
+SUMMARY_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)
+))), "logs")
+
+
+class DailySummaryService:
+    """
+    汇总当日所有推送标的并写入 TXT 文件。
+
+    数据来源：
+    ─ TrendDailyBar (source='heatmap')        → A股 / 港股 / 美股热榜
+    ─ TrendDailyBar (source='commodity')      → 大宗商品战报
+    """
+
+    @staticmethod
+    def generate_all_and_save(target_date: datetime.date = None) -> Dict[str, str]:
+        """Generate the single blended daily summary file used by the 19:00 job."""
+        paths = {"daily_summary": "", "trend_summary": ""}
+        try:
+            paths["daily_summary"] = DailySummaryService.generate_and_save(target_date)
+        except Exception as e:
+            logger.error("每日综合汇总生成失败: %s", e, exc_info=True)
+        return paths
+
+    @staticmethod
+    def generate_and_save(target_date: datetime.date = None) -> str:
+        """
+        生成并保存当日综合汇总。
+
+        股票口径：
+        - A股：Heatmap 页面 Trend算法榜(days=1)，默认 12 支（4 large + 4 mid + 4 small）
+        - 港股：Heatmap 日榜，默认 7 支
+        - 美股：Heatmap 日榜，默认 12 支
+        - 大宗商品：保留原战报标的
+        """
+        if target_date is None:
+            from zoneinfo import ZoneInfo
+            target_date = datetime.datetime.now(ZoneInfo("Asia/Shanghai")).date()
+
+        logger.info("生成每日综合汇总: %s", target_date)
+
+        cn_mv_cache = {}
+        hk_mv_cache = {}
+        us_mv_cache = {}
+
+        def _env_int(name: str, default: int) -> int:
+            try:
+                val = int(os.getenv(name, str(default)) or default)
+                return val if val > 0 else default
+            except Exception:
+                return default
+
+        cn_limit = _env_int("DAILY_SUMMARY_CN_TREND_TOP_N", _env_int("HEATMAP_TREND_CN_TOP_N", 12))
+        hk_limit = _env_int("DAILY_SUMMARY_HK_HEATMAP_TOP_N", _env_int("HEATMAP_PUSH_TOP_N_HK", 7))
+        us_limit = _env_int("DAILY_SUMMARY_US_HEATMAP_TOP_N", _env_int("HEATMAP_PUSH_TOP_N_US", 12))
+
+        def _safe_float(value) -> float:
+            try:
+                return float(value or 0)
+            except Exception:
+                return 0.0
+
+        def _format_amount(value: float, market: str) -> str:
+            amount = _safe_float(value)
+            if amount <= 0:
+                return "成交额:N/A"
+            unit = "美元" if market == "US" else "港币" if market == "HK" else "元"
+            if amount >= 100_000_000:
+                return f"成交额:{amount / 100_000_000:.1f}亿{unit}"
+            if amount >= 10_000:
+                return f"成交额:{amount / 10_000:.0f}万{unit}"
+            return f"成交额:{amount:.0f}{unit}"
+
+        def _format_market_cap_value(value: float, market: str) -> str:
+            cap = _safe_float(value)
+            if cap <= 0:
+                return "市值:N/A"
+            unit = "亿美元" if market == "US" else "亿港币" if market == "HK" else "亿元"
+            if cap >= 10000:
+                return f"市值:{cap / 10000:.2f}万{unit}"
+            if cap >= 1000:
+                return f"市值:{cap:.0f}{unit}"
+            if cap >= 100:
+                return f"市值:{cap:.1f}{unit}"
+            return f"市值:{cap:.2f}{unit}"
+
+        def _format_market_cap(market: str, symbol: str) -> str:
+            symbol = str(symbol or "").strip()
+            if not symbol:
+                return "市值:N/A"
+
+            if market == "CN":
+                if symbol not in cn_mv_cache:
+                    try:
+                        metrics = get_cn_market_metrics(symbol)
+                        total_mv = float((metrics or {}).get("total_mv_100m", 0) or 0)
+                        circ_mv = float((metrics or {}).get("circ_mv_100m", 0) or 0)
+                        mv_txt = format_mv_cn(total_mv, circ_mv)
+                        cn_mv_cache[symbol] = f"市值:{mv_txt}" if mv_txt else "市值:N/A"
+                    except Exception:
+                        cn_mv_cache[symbol] = "市值:N/A"
+                return cn_mv_cache[symbol]
+
+            if market == "HK":
+                if symbol not in hk_mv_cache:
+                    hk_mv_cache[symbol] = "市值:N/A"
+                    try:
+                        metrics = get_hk_market_metrics(symbol)
+                        cap_hkd = float((metrics or {}).get("market_cap_100m_hkd", 0) or 0)
+                        cap_usd = float((metrics or {}).get("market_cap_100m_usd", 0) or 0)
+                        mv_txt = format_mv_hk(cap_hkd, cap_usd)
+                        if mv_txt:
+                            hk_mv_cache[symbol] = mv_txt
+                    except Exception:
+                        pass
+                return hk_mv_cache[symbol]
+
+            if market == "US":
+                clean_symbol = symbol.split(".")[-1]
+                if clean_symbol not in us_mv_cache:
+                    us_mv_cache[clean_symbol] = "市值:N/A"
+                    try:
+                        metrics = get_us_market_metrics(clean_symbol)
+                        cap_100m = float((metrics or {}).get("market_cap_100m_usd", 0) or 0)
+                        if cap_100m > 0:
+                            us_mv_cache[clean_symbol] = f"市值:{cap_100m:.2f}亿美元"
+                    except Exception:
+                        pass
+                return us_mv_cache[clean_symbol]
+
+            return "市值:N/A"
+
+        # 涨幅统一从 open/close 反算
+        def _bar_pct(b: TrendDailyBar) -> float:
+            if b.open and b.open > 0 and b.close and b.close > 0:
+                return round((b.close - b.open) / b.open * 100, 2)
+            return 0.0
+
+        cn_trend_items: List[Dict] = []
+        try:
+            from interface.api import get_heatmap_trend_push
+            payload = get_heatmap_trend_push(
+                days=1,
+                market="CN",
+                date=target_date.isoformat(),
+                user=None,
+            )
+            cn_trend_items = list((payload or {}).get("items") or [])[:cn_limit]
+        except Exception as e:
+            logger.error("A股Trend日榜生成失败，daily汇总继续使用港美/商品: %s", e)
+
+        engine = db_manager.ledger_engine
+        with Session(engine) as session:
+            # 港/美股票热榜（TrendDailyBar，source='heatmap'）
+            stock_bars: List[TrendDailyBar] = session.exec(
+                select(TrendDailyBar).where(
+                    TrendDailyBar.date == target_date,
+                    TrendDailyBar.source == "heatmap",
+                )
+            ).all()
+
+            # 大宗商品（TrendDailyBar，source='commodity'）
+            cf_bars: List[TrendDailyBar] = session.exec(
+                select(TrendDailyBar).where(
+                    TrendDailyBar.date == target_date,
+                    TrendDailyBar.source == "commodity",
+                )
+            ).all()
+
+        # 港/美按市场分组并去重，同 symbol 保留最高涨幅记录
+        market_map: Dict[str, List[TrendDailyBar]] = {"HK": [], "US": []}
+        seen = {}
+        for r in stock_bars:
+            if r.market not in market_map:
+                continue
+            key = (r.market, r.symbol)
+            pct = _bar_pct(r)
+            prev = seen.get(key)
+            if prev is None or pct > _bar_pct(prev):
+                seen[key] = r
+
+        for r in seen.values():
+            market_map[r.market].append(r)
+
+        market_map["HK"].sort(key=_bar_pct, reverse=True)
+        market_map["US"].sort(key=_bar_pct, reverse=True)
+        market_map["HK"] = market_map["HK"][:hk_limit]
+        market_map["US"] = market_map["US"][:us_limit]
+
+        # 大宗商品去重（同 symbol 保留一条）
+        cf_seen = {}
+        for b in cf_bars:
+            pct = _bar_pct(b)
+            prev = cf_seen.get(b.symbol)
+            if prev is None or pct > _bar_pct(prev):
+                cf_seen[b.symbol] = b
+        cf_list = sorted(cf_seen.values(), key=_bar_pct, reverse=True)
+
+        total = len(cn_trend_items) + sum(len(v) for v in market_map.values()) + len(cf_list)
+        if total == 0:
+            logger.info("当日暂无综合汇总标的，跳过写入。")
+            return ""
+
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines = [
+            "=" * 48,
+            "   TradeDB 每日综合汇总",
+            "=" * 48,
+            f"生成时间: {now_str}",
+            f"统计日期: {target_date}",
+            "股票口径: A股Trend日榜 + 港股/美股Heatmap日榜",
+            "=" * 48,
+            "",
+        ]
+
+        if cn_trend_items:
+            lines.append("【🇨🇳 A股 - 当日Trend算法榜】")
+            for idx, item in enumerate(cn_trend_items, 1):
+                symbol = str(item.get("symbol", "") or "").strip()
+                name = str(item.get("name", "") or "").strip() or symbol
+                price = _safe_float(item.get("close"))
+                pct = _safe_float(item.get("change_pct"))
+                score = _safe_float(item.get("trend_score"))
+                industry = str(item.get("industry_label", "") or "").strip()
+                catalyst = str(item.get("catalyst_tags", "") or "").strip()
+                pct_str = f"+{pct:.2f}%" if pct >= 0 else f"{pct:.2f}%"
+                industry_str = f" | 行业:{industry}" if industry else ""
+                catalyst_str = f" | 催化:[{catalyst}]" if catalyst else ""
+                lines.append(
+                    f"  {idx:>2}. {name} ({symbol})"
+                    f" | 现价:{price:.2f}"
+                    f" | 涨幅:{pct_str}"
+                    f" | {_format_market_cap_value(item.get('market_cap'), 'CN')}"
+                    f" | {_format_amount(item.get('amount'), 'CN')}"
+                    f" | 评分:{score:.2f}"
+                    f"{industry_str}"
+                    f"{catalyst_str}"
+                )
+            lines.append("")
+
+        market_labels = {
+            "HK": "🇭🇰 港股 - Heatmap热榜",
+            "US": "🇺🇸 美股 - Heatmap热榜",
+        }
+        for mkt in ["HK", "US"]:
+            items = market_map[mkt]
+            if not items:
+                continue
+            lines.append(f"【{market_labels[mkt]}】")
+            for i, r in enumerate(items, 1):
+                price_str = f"{r.close:.2f}" if r.close else "N/A"
+                pct = _bar_pct(r)
+                pct_str = f"+{pct:.2f}%" if pct >= 0 else f"{pct:.2f}%"
+                mv_str = _format_market_cap(mkt, r.symbol)
+                catalyst = str(getattr(r, 'catalyst_tags', '') or '').strip()
+                catalyst_str = f" | 催化:[{catalyst}]" if catalyst else ""
+                lines.append(
+                    f"  {i:>2}. {r.name} ({r.symbol})"
+                    f" | 现价:{price_str}"
+                    f" | 涨幅:{pct_str}"
+                    f" | {mv_str}"
+                    f"{catalyst_str}"
+                )
+            lines.append("")
+
+        if cf_list:
+            lines.append("【🛢️ 大宗商品 - 战报标的】")
+            for i, b in enumerate(cf_list, 1):
+                price_str = f"{b.close:.2f}" if b.close else "N/A"
+                pct = _bar_pct(b)
+                pct_str = f"+{pct:.2f}%" if pct >= 0 else f"{pct:.2f}%"
+                lines.append(
+                    f"  {i:>2}. {b.name} ({b.symbol})"
+                    f" | 现价:{price_str}"
+                    f" | 涨幅:{pct_str}"
+                )
+            lines.append("")
+
+        lines += [
+            "=" * 48,
+            f"合计标的数: {total}",
+            "=" * 48,
+        ]
+
+        content = "\n".join(lines)
+        os.makedirs(SUMMARY_DIR, exist_ok=True)
+        filename = f"daily_summary_{target_date.strftime('%Y%m%d')}.txt"
+        filepath = os.path.join(SUMMARY_DIR, filename)
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        logger.info("每日综合汇总已写入: %s  (共 %d 条标的)", filepath, total)
+
+        caption = f"📊 TradeDB 每日综合汇总 ({target_date})\n合计标的数: {total}"
+        try:
+            Notifier.broadcast_document(filepath, caption=caption)
+            logger.info("每日综合汇总已成功通过 Telegram 广播。")
+        except Exception as e:
+            logger.error("每日综合汇总推送到 Telegram 失败: %s", e)
+
+        return filepath
+
+    @staticmethod
+    def generate_trend_summary_and_save(target_date: datetime.date = None) -> str:
+        """
+        生成并推送当日 Trend 算法榜 TXT。
+        数据口径复用 Heatmap 页面里的 Trend算法榜(days=1)，避免 UI 与 TXT 分叉。
+        """
+        if target_date is None:
+            from zoneinfo import ZoneInfo
+            target_date = datetime.datetime.now(ZoneInfo("Asia/Shanghai")).date()
+
+        logger.info("生成当日Trend算法榜汇总: %s", target_date)
+
+        try:
+            from interface.api import get_heatmap_trend_push
+        except Exception as e:
+            logger.error("无法加载 Heatmap Trend 算法榜接口: %s", e)
+            return ""
+
+        def _safe_float(value) -> float:
+            try:
+                return float(value or 0)
+            except Exception:
+                return 0.0
+
+        def _format_amount(value: float, market: str) -> str:
+            amount = _safe_float(value)
+            if amount <= 0:
+                return "成交额:N/A"
+            unit = "美元" if market == "US" else "港币" if market == "HK" else "元"
+            if amount >= 100_000_000:
+                return f"成交额:{amount / 100_000_000:.1f}亿{unit}"
+            if amount >= 10_000:
+                return f"成交额:{amount / 10_000:.0f}万{unit}"
+            return f"成交额:{amount:.0f}{unit}"
+
+        def _format_market_cap(value: float, market: str) -> str:
+            cap = _safe_float(value)
+            if cap <= 0:
+                return "市值:N/A"
+            unit = "亿美元" if market == "US" else "亿港币" if market == "HK" else "亿元"
+            if cap >= 10000:
+                return f"市值:{cap / 10000:.2f}万{unit}"
+            if cap >= 1000:
+                return f"市值:{cap:.0f}{unit}"
+            if cap >= 100:
+                return f"市值:{cap:.1f}{unit}"
+            return f"市值:{cap:.2f}{unit}"
+
+        market_labels = {
+            "CN": "🇨🇳 A股 - 当日Trend算法榜",
+            "HK": "🇭🇰 港股 - 当日Trend算法榜",
+            "US": "🇺🇸 美股 - 当日Trend算法榜",
+        }
+
+        payloads = {}
+        total = 0
+        for market in ["CN", "HK", "US"]:
+            try:
+                payload = get_heatmap_trend_push(
+                    days=1,
+                    market=market,
+                    date=target_date.isoformat(),
+                    user=None,
+                )
+                items = list((payload or {}).get("items") or [])
+                payloads[market] = items
+                total += len(items)
+            except Exception as e:
+                logger.error("当日Trend算法榜生成失败: market=%s err=%s", market, e)
+                payloads[market] = []
+
+        if total == 0:
+            logger.info("当日暂无Trend算法榜标的，跳过汇总写入。")
+            return ""
+
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines = [
+            "=" * 48,
+            "   TradeDB 当日Trend算法榜汇总",
+            "=" * 48,
+            f"生成时间: {now_str}",
+            f"统计日期: {target_date}",
+            "数据口径: Heatmap页面 Trend算法榜(days=1)",
+            "=" * 48,
+            "",
+        ]
+
+        for market in ["CN", "HK", "US"]:
+            items = payloads.get(market) or []
+            if not items:
+                continue
+            lines.append(f"【{market_labels[market]}】")
+            for idx, item in enumerate(items, 1):
+                symbol = str(item.get("symbol", "") or "").strip()
+                name = str(item.get("name", "") or "").strip() or symbol
+                price = _safe_float(item.get("close"))
+                pct = _safe_float(item.get("change_pct"))
+                score = _safe_float(item.get("trend_score"))
+                industry = str(item.get("industry_label", "") or "").strip()
+                catalyst = str(item.get("catalyst_tags", "") or "").strip()
+                pct_str = f"+{pct:.2f}%" if pct >= 0 else f"{pct:.2f}%"
+                industry_str = f" | 行业:{industry}" if industry else ""
+                catalyst_str = f" | 催化:[{catalyst}]" if catalyst else ""
+                lines.append(
+                    f"  {idx:>2}. {name} ({symbol})"
+                    f" | 现价:{price:.2f}"
+                    f" | 涨幅:{pct_str}"
+                    f" | {_format_market_cap(item.get('market_cap'), market)}"
+                    f" | {_format_amount(item.get('amount'), market)}"
+                    f" | 评分:{score:.2f}"
+                    f"{industry_str}"
+                    f"{catalyst_str}"
+                )
+            lines.append("")
+
+        lines += [
+            "=" * 48,
+            f"合计Trend标的数: {total}",
+            "=" * 48,
+        ]
+
+        content = "\n".join(lines)
+        os.makedirs(SUMMARY_DIR, exist_ok=True)
+        filename = f"trend_summary_{target_date.strftime('%Y%m%d')}.txt"
+        filepath = os.path.join(SUMMARY_DIR, filename)
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        logger.info("当日Trend算法榜汇总已写入: %s  (共 %d 条标的)", filepath, total)
+
+        caption = f"📈 TradeDB 当日Trend算法榜汇总 ({target_date})\n合计标的数: {total}"
+        try:
+            Notifier.broadcast_document(filepath, caption=caption)
+            logger.info("当日Trend算法榜汇总已成功通过 Telegram 广播。")
+        except Exception as e:
+            logger.error("当日Trend算法榜汇总推送到 Telegram 失败: %s", e)
+
+        return filepath
+
+
+# 全局单例
+daily_summary_service = DailySummaryService()

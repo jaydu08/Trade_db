@@ -1,0 +1,916 @@
+{
+  "source_head": "a2be08a1837d8c208666c71d34894e250436c5a9",
+  "files": [
+    {
+      "path": ".env.example",
+      "sha256": "0a6061a673e3c44a3a2a1f95697b8189b2161e61aa07553b0c033c050f7285f0",
+      "bytes": 2518
+    },
+    {
+      "path": ".gitignore",
+      "sha256": "7450fee69c069559493b20877effda6dee39136a1be574a2c19c8a9f001aaf01",
+      "bytes": 816
+    },
+    {
+      "path": "README.md",
+      "sha256": "897c962965dcdfab6f0295f6dff75af7c83f702d1edf02d4561c0bbed9c0720c",
+      "bytes": 24372
+    },
+    {
+      "path": "config/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "config/agent_focus.example.json",
+      "sha256": "40b19cd08a1d720c7cad963ae07644c8df889e6a997cca1d92e4b428c2937db0",
+      "bytes": 48
+    },
+    {
+      "path": "config/settings.py",
+      "sha256": "5060515bc17ca2aa4b3bb748fdb0ef7fa3ba827e6e8d90fd61fb6905f90b1380",
+      "bytes": 4010
+    },
+    {
+      "path": "core/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "core/agent.py",
+      "sha256": "f227d4e8dc7742efc0aff37d33f6b92fb727e39727cdae26316e5e318356dc15",
+      "bytes": 8190
+    },
+    {
+      "path": "core/cache.py",
+      "sha256": "e504ef30ca83e9cdeaa0d3126e7b2a94ec7905bbba166fb18faf63fef6fb869a",
+      "bytes": 5026
+    },
+    {
+      "path": "core/db.py",
+      "sha256": "a2b1b5f46dbdbaea1fc1d7f4172c25f02dabad6005aaed75f8ada7e94725d6ea",
+      "bytes": 9945
+    },
+    {
+      "path": "core/llm.py",
+      "sha256": "afce7553e7f599ef23847d319c769c0c159d87ccc635b2510cca388216261d6b",
+      "bytes": 6406
+    },
+    {
+      "path": "core/repository/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "core/scheduler.py",
+      "sha256": "c2a4a6ba0f74794bec225a3d40dc80e8189b1db810f63fe11651b8bd05fcc316",
+      "bytes": 24664
+    },
+    {
+      "path": "deploy/trade_db.service",
+      "sha256": "922e5b30a65a11dbdc6c50c78e676c5940c21112198dd3a993b7c66ca95613e4",
+      "bytes": 491
+    },
+    {
+      "path": "deploy/trend-agent-period-snapshot.service",
+      "sha256": "d3adddb329f62e088ebf0d92b3baf7d7b12a7dec654baad59f62b0b6ebf25d73",
+      "bytes": 454
+    },
+    {
+      "path": "deploy/trend-agent-period-snapshot.timer",
+      "sha256": "c1c3e42199980cb66193de48c3e5d771bedfca743ed3d3ad1b782b1fe32ef515",
+      "bytes": 274
+    },
+    {
+      "path": "deploy/trend-agent-snapshot.service",
+      "sha256": "d44e839fc1ff1c9b4f89276e144f97b1e4699e6c4af10eba8d86d4fb3e044014",
+      "bytes": 447
+    },
+    {
+      "path": "deploy/trend-agent-snapshot.timer",
+      "sha256": "6e59caac5d3419ee01d58d6b5c2e939de77521917123ab069b2f9724f3329e26",
+      "bytes": 289
+    },
+    {
+      "path": "docs/agent-market-extensions.md",
+      "sha256": "86211ccd89d3c1affabdff2497e567c3cc37ea900a842fec26a7f7fdd72ef4bc",
+      "bytes": 1513
+    },
+    {
+      "path": "docs/agent-quality-fixes-2026-10-25.md",
+      "sha256": "fc79bae3e67ff2d94839a7106504441fc92cf627f9d161ed155e3375f1b051fa",
+      "bytes": 2132
+    },
+    {
+      "path": "docs/crypto-securities-global-etfs.md",
+      "sha256": "05f0cb65e2a79d434e3582cfce2f22ac0e40b907b7fd3e504e3ae88ae9db5ea3",
+      "bytes": 2299
+    },
+    {
+      "path": "docs/stock-daily-relative-strength.md",
+      "sha256": "56952f332e0a65d8022aba0445b5aa3152be3eaa451f89ecfef140d08005ef28",
+      "bytes": 2268
+    },
+    {
+      "path": "docs/trend-agent-data-quality-v2.md",
+      "sha256": "bfb61f3ea0c57a8344aec500f654c32ce69186380a8c7d7520ff36006cb5cca7",
+      "bytes": 10870
+    },
+    {
+      "path": "docs/trend-agent-multiperiod.md",
+      "sha256": "754af6d360f2d71812282148ff941cae71a395ae9bd7fffb1882f8098e0045b2",
+      "bytes": 4126
+    },
+    {
+      "path": "docs/trend-agent-poc.md",
+      "sha256": "91797ff50c62bcd82f7b8da32bc8fec0cf6bb57ff8721158c3d0e7b38830d189",
+      "bytes": 8397
+    },
+    {
+      "path": "docs/trend-agent-research-focus.md",
+      "sha256": "b3f80e4eb0954f98ac4a41ff02191815fe8c06feea68a7f84f2c961d713b4f67",
+      "bytes": 2738
+    },
+    {
+      "path": "docs/trend-agent-weekly-quality-audit-2026-10-18.md",
+      "sha256": "57280540f9c374135d06953b236e12ae90da85d0e4670a3bc772731f976a23e8",
+      "bytes": 12990
+    },
+    {
+      "path": "domain/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "domain/base.py",
+      "sha256": "13839c54f1745039eaa70887e344eaf8022e09948414dbd6471ae012836c61ba",
+      "bytes": 6318
+    },
+    {
+      "path": "domain/ledger/__init__.py",
+      "sha256": "2926c427eb52683ce2ee8ee3b26bfbc924fcd6bc9c9df7ad66d3265b5e154506",
+      "bytes": 596
+    },
+    {
+      "path": "domain/ledger/analytics.py",
+      "sha256": "0ce13916708b6aec372e0a6d48cacdf254783bdecfa09576c4636a154c4b6416",
+      "bytes": 3465
+    },
+    {
+      "path": "domain/ledger/order.py",
+      "sha256": "7c93c8e3d954b973f0dce83fc03d99f805c7f858a892af92fbb42a72c4a81cdf",
+      "bytes": 2513
+    },
+    {
+      "path": "domain/ledger/paper_trade.py",
+      "sha256": "aa166b96e823ba5cf2a3c59f9e7167f804027b9ade81458d440396b1cfb7b46e",
+      "bytes": 3998
+    },
+    {
+      "path": "domain/ledger/position.py",
+      "sha256": "55dce440e1cdf41bf47200683222a757fbd34c604d2def2364d5895754736e4e",
+      "bytes": 1481
+    },
+    {
+      "path": "domain/ledger/signal.py",
+      "sha256": "350308fdbf00a94403489ea320ad5e3f55598d5a01a9163f3068110d531f9f72",
+      "bytes": 3051
+    },
+    {
+      "path": "domain/ledger/strategy.py",
+      "sha256": "69549a3eb26d6ec1808e07e3faa5260876fc2aad29793e82dc5c09aa31354f07",
+      "bytes": 3523
+    },
+    {
+      "path": "domain/meta/__init__.py",
+      "sha256": "e98205841181b247e8ea1a7e2a3ce0af322c2ad3b51e7e5a29c575ca8323b2cc",
+      "bytes": 1077
+    },
+    {
+      "path": "domain/meta/asset.py",
+      "sha256": "ab816b256802433a86e2761bba0459614de376909ae0b2a83c75d5df145a6c86",
+      "bytes": 4502
+    },
+    {
+      "path": "domain/meta/concept.py",
+      "sha256": "1b8e4c5acbe57ac313011d32df6753c73aef3f26d880ae9e1afc06b8f023d2b2",
+      "bytes": 2843
+    },
+    {
+      "path": "domain/meta/field_mapping.py",
+      "sha256": "3b54130c9e7a245d4b5559ae66c3dbe8f7320c64ded1737e7673bee86c506d2b",
+      "bytes": 1768
+    },
+    {
+      "path": "domain/meta/financial.py",
+      "sha256": "f25c585ee89592e575edea46853bb3c28a6c309ced1c7fdb6fc30b5e00581fbf",
+      "bytes": 1529
+    },
+    {
+      "path": "domain/meta/industry.py",
+      "sha256": "22164e6c8096d14787b9128a3cff46f9168d5d9f351501c303a13aa5a218c93d",
+      "bytes": 2752
+    },
+    {
+      "path": "domain/meta/peer_group.py",
+      "sha256": "91546926c3f779ccb55855bdfaee56307c36a1465cc928c455b7f4a5d6509421",
+      "bytes": 2353
+    },
+    {
+      "path": "domain/meta/profile.py",
+      "sha256": "8eed5ca12349b41667e22615dc57cc1340962183cdc7bf8a458f2fadb9a91c84",
+      "bytes": 140
+    },
+    {
+      "path": "domain/meta/sync_log.py",
+      "sha256": "a6b58647be1f27660cebc152abfbd6f5499a93aad64bbc91ef4a9080d4023d82",
+      "bytes": 2216
+    },
+    {
+      "path": "domain/monitor.py",
+      "sha256": "3b513336a974ec0c2bfd1cd50eadf4c0d777c3ad2549ad176bf4bb679d174705",
+      "bytes": 762
+    },
+    {
+      "path": "domain/vector.py",
+      "sha256": "2898912bd270f9c6225823e553871deef63d0f4b4bda6132776d5f69d24f3c96",
+      "bytes": 8061
+    },
+    {
+      "path": "heatmap_trend_filtering_logic.md",
+      "sha256": "073966bb3cac6dd50d60ff80ed7a108bdcb9f2333718fc9e4db23be5fb6632d2",
+      "bytes": 9730
+    },
+    {
+      "path": "interface/api.py",
+      "sha256": "6aeea2bdc1cdf5a642890780ac74b945dd4b1d2d3f4b78e960a1d6df19ce0be2",
+      "bytes": 131322
+    },
+    {
+      "path": "interface/telegram_bot.py",
+      "sha256": "c4d6cee87e9c5893b3572bd651e392dac689825b6dd6342289760731fe2c6add",
+      "bytes": 25924
+    },
+    {
+      "path": "main.py",
+      "sha256": "f4e7f720b0f452bf78274b96ca3e1f7a15bd1076c1178a3034762750bd00ca3e",
+      "bytes": 4417
+    },
+    {
+      "path": "modules/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "modules/analysis/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "modules/analysis/build_knowledge.py",
+      "sha256": "927e39d0256098ac2a430458f65192571687901d22fe7075b55a939991b13d19",
+      "bytes": 8408
+    },
+    {
+      "path": "modules/analysis/heatmap.py",
+      "sha256": "2144a6bdfd4eaeae7b78224788fc27742fa8f7948c94a36cb418cda3afdf7ca1",
+      "bytes": 75320
+    },
+    {
+      "path": "modules/analysis/market_relative_strength.py",
+      "sha256": "e6aa7af3f3f72bc652c5f53428373b7c5f130840af16fe6c3f02df8402414378",
+      "bytes": 4992
+    },
+    {
+      "path": "modules/analysis/test_tg_daily_board.py",
+      "sha256": "b3ff963bb5b77e4b05b84099aa96847cd9dcbacafc8e9fff96d6709bda2de8b2",
+      "bytes": 729
+    },
+    {
+      "path": "modules/analysis/tg_daily_board.py",
+      "sha256": "6b7ef5fbb085c21758d12669f6e0c87a8490d9eaa0494c251d2e64d59f38ba15",
+      "bytes": 1340
+    },
+    {
+      "path": "modules/ingestion/__init__.py",
+      "sha256": "617cec87eec2140c1f012ae8fa3feec59c77d2d82bc77645f9dbd0d94b00bf05",
+      "bytes": 1068
+    },
+    {
+      "path": "modules/ingestion/akshare_client.py",
+      "sha256": "3436609a9d6692d50e643f612a36286999ff0b3668f67305091aa50acc4e8033",
+      "bytes": 35737
+    },
+    {
+      "path": "modules/ingestion/caixin_client.py",
+      "sha256": "3782e3fccde935a580d1373bd211dc99b6a59422d3be579f1fac67ff86450ae9",
+      "bytes": 5487
+    },
+    {
+      "path": "modules/ingestion/data_factory.py",
+      "sha256": "18ecf043d1be21e4fbf2827204648fcde8bf1a2638aa1747bce8cb7097e36c52",
+      "bytes": 6584
+    },
+    {
+      "path": "modules/ingestion/institutional_factor.py",
+      "sha256": "cb2e5f4205b4072d65b0dc9138559aa5fb110a26d3dd37e4d2a1ccd864b123c3",
+      "bytes": 59676
+    },
+    {
+      "path": "modules/ingestion/market_cap.py",
+      "sha256": "7177fc4333308ddf63decc1acd465de4de0cb09a03939e41cb3c2391665781ce",
+      "bytes": 14811
+    },
+    {
+      "path": "modules/ingestion/providers/__init__.py",
+      "sha256": "afde866014b55eed6dc9b955d896da31e13bc9dc77ca1a4e1a7b19ca0b7eb37b",
+      "bytes": 201
+    },
+    {
+      "path": "modules/ingestion/providers/base.py",
+      "sha256": "ebec9e4ef99bb84df0e6c1bfa78af240c6877b55185fd1221301698a730e0e2a",
+      "bytes": 1711
+    },
+    {
+      "path": "modules/ingestion/providers/market_providers.py",
+      "sha256": "11b2d234f7bda84a206d9ad20b61feddc3d08a12aab243459ea384eb1c2afa45",
+      "bytes": 3428
+    },
+    {
+      "path": "modules/ingestion/providers/search_providers.py",
+      "sha256": "492009c93b0df212dafd17a6f383e7a538c78ca132916970d62a6b53056ea38d",
+      "bytes": 12059
+    },
+    {
+      "path": "modules/ingestion/sync_asset.py",
+      "sha256": "6ae7eaea57c8ccb7a96924f50e5612f6ee08358dcd051d260faddb3376f95e3d",
+      "bytes": 8673
+    },
+    {
+      "path": "modules/ingestion/sync_concept.py",
+      "sha256": "b6c663f0d14e4d36983297bee60b23a7f90f80ec3154c2682c3423d08b5e6978",
+      "bytes": 9567
+    },
+    {
+      "path": "modules/ingestion/sync_financial.py",
+      "sha256": "951def740dd524310225ab869aec9d581ed847f1bf23591dfe76c9c358702b10",
+      "bytes": 7734
+    },
+    {
+      "path": "modules/ingestion/sync_industry.py",
+      "sha256": "4cb706a7b06f54de339d61205fad3964e651e1edf2723ba61cc068317177139e",
+      "bytes": 9738
+    },
+    {
+      "path": "modules/ingestion/sync_news.py",
+      "sha256": "f5a6e303b9672907008a50335495ab2fdca763b8ccc39b115eee2b7e83035d94",
+      "bytes": 10162
+    },
+    {
+      "path": "modules/ingestion/sync_profile.py",
+      "sha256": "2a91af0965b5a91686a01c7803eac45be5e99361811897921a4f3d6e12b853e3",
+      "bytes": 17626
+    },
+    {
+      "path": "modules/ingestion/sync_relations.py",
+      "sha256": "31d52fb3da2bca1ca3cb1feebe6005502c60e50258a2785fc19eb597659389ee",
+      "bytes": 5856
+    },
+    {
+      "path": "modules/ingestion/sync_reports.py",
+      "sha256": "3b0153bd788600095085770d4d0322990d35d85d31d4ed3c2bf29b572210c3a8",
+      "bytes": 6106
+    },
+    {
+      "path": "modules/ingestion/us_market_cap.py",
+      "sha256": "52054da9d72ee316455c04e891608195d3d7425641bc18c08bea89198d099152",
+      "bytes": 5344
+    },
+    {
+      "path": "modules/ingestion/yfinance_client.py",
+      "sha256": "88a8e4dc6ee3debd69320d5548673176e1b02867898bfee87b62b56c1251e284",
+      "bytes": 2658
+    },
+    {
+      "path": "modules/monitor/catalyst_service.py",
+      "sha256": "dd4d5b1355a0618ae9de5d29a165afc82860b6f4c1f0d399a2a17c8d5e35eb20",
+      "bytes": 13976
+    },
+    {
+      "path": "modules/monitor/commodity_scanner.py",
+      "sha256": "5edcec5d4b8c279b1e06e64592812a3a33922646501ef360ffbd097a666036ce",
+      "bytes": 13287
+    },
+    {
+      "path": "modules/monitor/crypto_trend.py",
+      "sha256": "3e5617c95a15b5d418ee2faf87cbf02a872e8ef11940cfe5df35fb10f63beaa3",
+      "bytes": 17390
+    },
+    {
+      "path": "modules/monitor/daily_rank_service.py",
+      "sha256": "2256c815c45f6831a504280013af2444cfb42f66b7a0c0bf3bdd7f9538112d8b",
+      "bytes": 9445
+    },
+    {
+      "path": "modules/monitor/daily_summary_service.py",
+      "sha256": "8fd9f4215ead86428559a01ad4ad20fc8565df3c7d9f9910d4a4f4be1ff19b55",
+      "bytes": 19000
+    },
+    {
+      "path": "modules/monitor/global_etf_universe.py",
+      "sha256": "1fbf8fd63a81ff23e9beeeb707bdad0accb8613613068da500eaca8ee51fb492",
+      "bytes": 3317
+    },
+    {
+      "path": "modules/monitor/industry_intel.py",
+      "sha256": "f53b7d831de1bfd05f78355dabb8e6984e8c2de0fd68f3e32843e1d5e1a082dc",
+      "bytes": 18222
+    },
+    {
+      "path": "modules/monitor/ipo_calendar_service.py",
+      "sha256": "bd666215ff81fecce4e642bce59325b35ed95e46915ddb60abb18918dbd6fb2e",
+      "bytes": 17202
+    },
+    {
+      "path": "modules/monitor/macro_dashboard.py",
+      "sha256": "1a8b523bb73053bc4c214514b07f853068793150654688a0b1ebaf0086c03782",
+      "bytes": 17682
+    },
+    {
+      "path": "modules/monitor/manager.py",
+      "sha256": "79ad5bc1350e8694606e7ff7fd4be4b11e36f7f7165f801bdb3c99e382cafbd2",
+      "bytes": 3216
+    },
+    {
+      "path": "modules/monitor/market_activity.py",
+      "sha256": "a2d076b01b2d7c308631313de34576fd37c07b9117c1f45ae7bde60066051a02",
+      "bytes": 8935
+    },
+    {
+      "path": "modules/monitor/news_intel.py",
+      "sha256": "b791eabbbfcafc69700582aa94ccfc570d477b04df537c1e4c490a80104e1b32",
+      "bytes": 6388
+    },
+    {
+      "path": "modules/monitor/notifier.py",
+      "sha256": "d42ca27ccb39518b1e0f4b9f55fa607a35b2103d61e88cca0d46923263755507",
+      "bytes": 6251
+    },
+    {
+      "path": "modules/monitor/pattern_tagger.py",
+      "sha256": "225cb05d2a0e8bd62230fe08dc707e0ba1362d02b59c53127428b3375ac6b886",
+      "bytes": 5696
+    },
+    {
+      "path": "modules/monitor/performance_report.py",
+      "sha256": "0db3161d8cc287fd11b241a203fb48798290f66d7b7e7c041a39096e8d0e8bfe",
+      "bytes": 8163
+    },
+    {
+      "path": "modules/monitor/repository.py",
+      "sha256": "ee2c19559376845eb3fb049d7d04e3db28027f888fdba9ba9892c0b72932cf48",
+      "bytes": 13204
+    },
+    {
+      "path": "modules/monitor/resolver.py",
+      "sha256": "17fe1b6aa9a3bfc3f4f81f7c71ea520da3f5ed159e25499ddf2a81a97bda57c3",
+      "bytes": 3892
+    },
+    {
+      "path": "modules/monitor/scanner.py",
+      "sha256": "0e98a9aa2ce7565032a29155c0ab1e7bfe2723de4963b6a6ba9807b197ead1f6",
+      "bytes": 18055
+    },
+    {
+      "path": "modules/monitor/stock_evidence.py",
+      "sha256": "cd7664e322432b2168ba9ec8611ddbce39ec5779b92de7e1b0f836e3656c0991",
+      "bytes": 7143
+    },
+    {
+      "path": "modules/monitor/stock_narrative.py",
+      "sha256": "6223a3927a2ba94d0144e9307a89b028fbd0b10cb5c6f666e789d065cda9fd32",
+      "bytes": 15282
+    },
+    {
+      "path": "modules/monitor/test_crypto_trend.py",
+      "sha256": "c0ec4afc9797072341fe6d04feb2b494c4414305a710a362cc77875fe4b369f1",
+      "bytes": 10167
+    },
+    {
+      "path": "modules/monitor/test_macro_dashboard.py",
+      "sha256": "f405b0fa29dcd7041c866299c6eec38a8c9b5221730d10beb039743257b6525d",
+      "bytes": 5550
+    },
+    {
+      "path": "modules/monitor/test_market_activity.py",
+      "sha256": "1a85ba115ba1e61e208569b43654e3f0ad260a7cba97b7db0da2eb8a0d4b88f5",
+      "bytes": 2019
+    },
+    {
+      "path": "modules/monitor/test_stock_evidence.py",
+      "sha256": "b37bd0f79d8c639b7a3eefd737531fbb8d18aeecbe320faf49f349c2c27f9a3c",
+      "bytes": 1463
+    },
+    {
+      "path": "modules/monitor/test_stock_narrative.py",
+      "sha256": "ef8fb60579018c15f2789a6a1f74761dcccd4463c324bafaf2bd98b08c816ff1",
+      "bytes": 4368
+    },
+    {
+      "path": "modules/monitor/trend_report_service.py",
+      "sha256": "4fe58c46b56a3d83736c21e4df8e6dd9dca3e4c5d721862ca45bc04fe8b004ed",
+      "bytes": 17068
+    },
+    {
+      "path": "modules/monitor/trend_service.py",
+      "sha256": "5461e144e64de35e47ac2a9a96e63c092e185796ae1f0a85ab38989bdd47e068",
+      "bytes": 66144
+    },
+    {
+      "path": "modules/monitor/us_premarket_scanner_service.py",
+      "sha256": "7d3bed1b970cdc99303bfedc98d2b2f40732a0f9d837305f329f5da660ec811b",
+      "bytes": 26303
+    },
+    {
+      "path": "modules/paper_trading/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "modules/paper_trading/reviewer.py",
+      "sha256": "899896e5ac9b7f7ad9a0c856f4c5c55147d5986bbf21d9d1ff37da05a8ce38e9",
+      "bytes": 9996
+    },
+    {
+      "path": "modules/paper_trading/service.py",
+      "sha256": "85997eac632282d53b9b9c013e915ef3f6b247f710bf4cd6f99bc45110f3d5fe",
+      "bytes": 14053
+    },
+    {
+      "path": "modules/probing/__init__.py",
+      "sha256": "ab2bc6b600831c2f0b6641afa4ac4755e8b57fbb508bb66fe0f260b442848bbe",
+      "bytes": 340
+    },
+    {
+      "path": "modules/probing/async_prober.py",
+      "sha256": "fb805ec51ec58851cf9a207e04cabc7cd134134f0e1059cdc08f270153215438",
+      "bytes": 6895
+    },
+    {
+      "path": "modules/probing/market.py",
+      "sha256": "ae19aea8b1e7a4cea06490000927cb9460b335eb1e556a100e0bfe1612193550",
+      "bytes": 8577
+    },
+    {
+      "path": "public/agent/v1/smoke.json",
+      "sha256": "d7786b337251ba6cf4c9a5c6864a8d8980248b720d774066a6872639a970919c",
+      "bytes": 216
+    },
+    {
+      "path": "requirements.txt",
+      "sha256": "aaa4140ab6c4b9a8e30df09b62e2df9d4b7c3694a4b1cd11efbf57bddc6dea08",
+      "bytes": 571
+    },
+    {
+      "path": "restart.sh",
+      "sha256": "2cd14b9e0577b08f8084923d8d771bd5d18c84489cd520a7a3cf436a82c2945c",
+      "bytes": 1121
+    },
+    {
+      "path": "run.sh",
+      "sha256": "5df470af7686dec177e3a693ace0ca472dacffddcd00b02cde4de4f04dd1e63e",
+      "bytes": 2758
+    },
+    {
+      "path": "scripts/agent_market_calendar.py",
+      "sha256": "e05be9eee8fd05eeaa744e667a7d61ea9cb961209fb2fbc4a3f78a701ca9922f",
+      "bytes": 3978
+    },
+    {
+      "path": "scripts/agent_market_extensions.py",
+      "sha256": "4d4a35f28467d6078a398a13b12141442ac452c244818cf8e98e65a631483c2c",
+      "bytes": 8918
+    },
+    {
+      "path": "scripts/agent_market_scan.py",
+      "sha256": "147a9169dc5312ad7f2c0fb2ffa2b58b916dd8f5d28cd9d0e05c08161952a63d",
+      "bytes": 6205
+    },
+    {
+      "path": "scripts/agent_research_focus.py",
+      "sha256": "7c52031bac154111641aeb17decc9915695751325e80a21e7cdcd49e08936404",
+      "bytes": 9973
+    },
+    {
+      "path": "scripts/agent_snapshot_health.py",
+      "sha256": "6e5c8f902a30de6b5accc616730afe4a09fd1bd07203147416d0ac24601765a9",
+      "bytes": 5535
+    },
+    {
+      "path": "scripts/generate_agent_period_snapshot.py",
+      "sha256": "eda566fb203adc8f83d5cb2efde27577a641e99712d5c4d9f62ccf344ec9e244",
+      "bytes": 35072
+    },
+    {
+      "path": "scripts/generate_agent_smoke.py",
+      "sha256": "68170bf1b8ed6a6f6b633fee4e72e7de57af7f6af3bd4f1e4d4ebfb8c59deb0c",
+      "bytes": 1981
+    },
+    {
+      "path": "scripts/generate_agent_snapshot.py",
+      "sha256": "ae7f65023ab91ff7e8dbf02970c8e969eb916b6e20c840abbbce82521b17995d",
+      "bytes": 54239
+    },
+    {
+      "path": "scripts/migrate_watchlist_keys.py",
+      "sha256": "a86f7808dea1ceab1c3efdb9a202f99db3960a3dade960fe708fd2f923c10c01",
+      "bytes": 612
+    },
+    {
+      "path": "scripts/publish_agent_snapshot.py",
+      "sha256": "38d1681931c2697ab9188db5ee121e8527a9db058a614b833bdf6ec15dfeadb0",
+      "bytes": 5944
+    },
+    {
+      "path": "scripts/replay_agent_weekly_quality.py",
+      "sha256": "6c15e6b9e1d21e8bbb81c177751c3638e515aaf4ba8c97ce2eceb5c02b5a0173",
+      "bytes": 3392
+    },
+    {
+      "path": "scripts/sync_all.sh",
+      "sha256": "3365ca53a0fd26190828897158079c7792a4b398ea3abff79dd93b20b6cda89b",
+      "bytes": 467
+    },
+    {
+      "path": "scripts/sync_profiles_fast.py",
+      "sha256": "82f7d3c46476a5524fa2ac029c1e1ef1aca99b106d55628a8a4e80f166a3c7ff",
+      "bytes": 4911
+    },
+    {
+      "path": "scripts/validate_agent_period_quality.py",
+      "sha256": "e56d57f476ff02143d0c731b74f02032b6a870e7438063541082b8e934447956",
+      "bytes": 3580
+    },
+    {
+      "path": "scripts/validate_agent_snapshot.py",
+      "sha256": "f1c557351381200add036d6ecd91ebe1d942b70e41713640842b9acb869c7bae",
+      "bytes": 3388
+    },
+    {
+      "path": "stop.sh",
+      "sha256": "c7fb009ca0f5e795302e68956b7792f83053aa3dbb532c9a3afbaad37e07e3b6",
+      "bytes": 2784
+    },
+    {
+      "path": "strategies/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "strategies/chain_mining.py",
+      "sha256": "7861bd4c63a58bfd827aa3d6788ba30b1b569f7325dd16a15bd08db185e080a1",
+      "bytes": 16975
+    },
+    {
+      "path": "test_llm.py",
+      "sha256": "a01f792898bdc64f187e5a3f70e233e51fbe19a207ec86ed9e21f45275d566b1",
+      "bytes": 2039
+    },
+    {
+      "path": "tests/run_all_features.py",
+      "sha256": "f21fad85a14467149ed8985ee0207de3670ff29f303d5325f7f2175c9ce8c09e",
+      "bytes": 6542
+    },
+    {
+      "path": "tests/test_agent_data_quality.py",
+      "sha256": "575baebf8d963e5477890aa54b5823624a03f26359d22bbbd4c60bb28a794191",
+      "bytes": 11456
+    },
+    {
+      "path": "tests/test_agent_market_extensions.py",
+      "sha256": "14492e96d0a86d7bc077c5f7a05e7b8bbc2fde7002202e16087303113fb60b78",
+      "bytes": 4182
+    },
+    {
+      "path": "tests/test_agent_research_focus.py",
+      "sha256": "b5f5c426742bfd946f6c77d5cfc1d685d691bc59362686c6d63c95426d6b3708",
+      "bytes": 7301
+    },
+    {
+      "path": "tests/test_agent_snapshot_regressions.py",
+      "sha256": "385d87d2e223ccd90c71403422e699c90013fd4df0b92f7eac771391ea583e58",
+      "bytes": 5523
+    },
+    {
+      "path": "tests/test_generate_agent_period_snapshot.py",
+      "sha256": "7c41cb10d97bb7828ed239a30e9ca87ed9dc3589e9efcadfa9801fc58023965e",
+      "bytes": 22053
+    },
+    {
+      "path": "tests/test_generate_agent_smoke.py",
+      "sha256": "aeb4e152179f53210f87d7203188630ea1d58328cc59e57c1949bd76ff8175f4",
+      "bytes": 1924
+    },
+    {
+      "path": "tests/test_generate_agent_snapshot.py",
+      "sha256": "4159c004547d5522e92a6db5a2b3168966b5f8bcca0a43d9d716f27669d1eb26",
+      "bytes": 9323
+    },
+    {
+      "path": "tests/test_market_relative_strength.py",
+      "sha256": "c8f02c07961cf2fe0036636fa40cd3535a055d822052ed7b599a449e2143c026",
+      "bytes": 2551
+    },
+    {
+      "path": "tests/test_paper_trading_reviewer.py",
+      "sha256": "7675bd044c0913e1a6e965222c0c6b48c26821e65466837e860d5685d9ade0de",
+      "bytes": 2137
+    },
+    {
+      "path": "tests/test_publish_agent_snapshot.py",
+      "sha256": "f394904da82aa2b1e30f3f032abb25cdc309b5647c2bcc765998db15e53e954e",
+      "bytes": 6281
+    },
+    {
+      "path": "tests/test_trend_return_alignment.py",
+      "sha256": "b3a05cadbf9d3e71ed4ffddf657de8333b7973e93881b1894c73f7aea0324026",
+      "bytes": 3523
+    },
+    {
+      "path": "web/index.html",
+      "sha256": "d51f51482dae83a635ae9482be50d35994d8c48b015a55f777d2136c2c1da826",
+      "bytes": 358
+    },
+    {
+      "path": "web/package-lock.json",
+      "sha256": "e0c9a6ade1a20fb140146939b92d789da7f76343372497054c9fed50c9a1f856",
+      "bytes": 66567
+    },
+    {
+      "path": "web/package.json",
+      "sha256": "58854a8548b221ca32139e96c860c951d22b855abf9efcc35077efd63b0776aa",
+      "bytes": 528
+    },
+    {
+      "path": "web/src/App.vue",
+      "sha256": "77fee39c1d6017ffc55026151fde4913da6db4cf9fe04f97ff63a4d5225d855d",
+      "bytes": 448
+    },
+    {
+      "path": "web/src/api/index.ts",
+      "sha256": "9c547863cab563b35dac99f9874e0bb56d5cb0b6210ae387b0652e2780af92b9",
+      "bytes": 592
+    },
+    {
+      "path": "web/src/components/AppLayout.vue",
+      "sha256": "cf8f93c3fd670ad502377544f443afeac5dff2dd43f66b07f6f6a62f06417ae8",
+      "bytes": 3667
+    },
+    {
+      "path": "web/src/env.d.ts",
+      "sha256": "e4948a0ff1824a8fb7f30cef600e96da86f6803d5755fbac09f43665c15c424c",
+      "bytes": 185
+    },
+    {
+      "path": "web/src/main.ts",
+      "sha256": "a608480f33fc13d0852fd9e9b4bdd221dda91e5cfe5485ba77afe0caefbd34a1",
+      "bytes": 329
+    },
+    {
+      "path": "web/src/router/index.ts",
+      "sha256": "096056ce91152e631fc8a9943e3531e6f781bfdd22c930aa81311b724eea79b5",
+      "bytes": 1460
+    },
+    {
+      "path": "web/src/stores/auth.ts",
+      "sha256": "e19f88a804613e138c1357126e3559f1855621288ab771db7cc7c97550a3fa4a",
+      "bytes": 1122
+    },
+    {
+      "path": "web/src/style.css",
+      "sha256": "8e3e9ad6e48251ff0d378617d48239cb516b0e505ec858d65abc871cd7e3d5e0",
+      "bytes": 1497
+    },
+    {
+      "path": "web/src/views/CryptoTrendView.vue",
+      "sha256": "5b5b349982f00dd79c8c1b7294ff467075946050cba4d7c2e67e166c9ee01ccc",
+      "bytes": 20965
+    },
+    {
+      "path": "web/src/views/HeatmapView.vue",
+      "sha256": "1617c4820fd9c92dbd52c7651749817c799f767fb381cac206131e6c5eb95baa",
+      "bytes": 14187
+    },
+    {
+      "path": "web/src/views/HoldsView.vue",
+      "sha256": "a331bbf510806a4ed4cf604e6a3efa3fcfdfe2c41fafba321aca1a3a112fe473",
+      "bytes": 17356
+    },
+    {
+      "path": "web/src/views/ListView.vue",
+      "sha256": "6e787fea5efb06fd05ffdf510fa69e15e95c593eec1a2d30bac096f6558b78c0",
+      "bytes": 17841
+    },
+    {
+      "path": "web/src/views/LoginView.vue",
+      "sha256": "d8b19de72737204e36aff5d8601741dadf9a2c65b7b35d3b0686e0b3b5373a55",
+      "bytes": 2764
+    },
+    {
+      "path": "web/src/views/MacroDashboardView.vue",
+      "sha256": "bfb04660d90120bce149f2285a42881ee10b777af4ad1d63d09cced6602c2696",
+      "bytes": 18141
+    },
+    {
+      "path": "web/src/views/TrendView.vue",
+      "sha256": "14a069c04ddbfe529e2f3d573e0a5c071900e4ab969338f44752c8fa48dfa496",
+      "bytes": 31739
+    },
+    {
+      "path": "web/tsconfig.json",
+      "sha256": "9fbd5baa47cfd7442ddf9b322b20bf05a4a611bab052a601863f67cbaeeed18f",
+      "bytes": 617
+    },
+    {
+      "path": "web/tsconfig.node.json",
+      "sha256": "3ced5d22ba9e246c839a695526296a8d067fbe9db838d728516d2eac9215b333",
+      "bytes": 336
+    },
+    {
+      "path": "web/vite.config.ts",
+      "sha256": "0031d15da71cd4bc1faa64ab93f2e7c1006763fc85fa1d53dc2af85bb41c3d94",
+      "bytes": 333
+    }
+  ],
+  "excluded_paths": [
+    "data/agent_focus_config.json",
+    "data/agent_market_scan/2026-10-15.json",
+    "data/agent_market_scan/2026-10-16.json",
+    "data/agent_market_scan/2026-10-19.json",
+    "data/agent_market_scan/2026-10-20.json",
+    "data/agent_market_scan/2026-10-21.json",
+    "data/agent_market_scan/2026-10-22.json",
+    "data/agent_market_scan/2026-10-23.json",
+    "data/agent_market_scan/2026-10-26.json",
+    "data/agent_market_scan/2026-10-27.json",
+    "data/agent_market_scan/2026-10-28.json",
+    "data/agent_market_scan/2026-10-29.json",
+    "data/agent_market_scan/2026-10-30.json",
+    "data/agent_market_scan/2026-11-02.json",
+    "data/agent_preview/agent/v1/monthly/2026-10-19.json",
+    "data/agent_preview_final/agent/v1/monthly/2026-10-19.json",
+    "data/agent_replay/agent/v1/replay/weekly-2026-10-18-quality-v2.json",
+    "data/agent_replay/agent/v1/replay/weekly-2026-10-18-quality-v2.pre-cf-fix.json",
+    "data/agent_replay/agent/v1/replay/weekly-2026-10-18-quality-v2.pre-counter-fix.json",
+    "data/market_activity_stock.json",
+    "data/tg_daily_boards/CN_2026-10-13.json",
+    "data/tg_daily_boards/CN_2026-10-14.json",
+    "data/tg_daily_boards/CN_2026-10-15.json",
+    "data/tg_daily_boards/CN_2026-10-16.json",
+    "data/tg_daily_boards/CN_2026-10-19.json",
+    "data/tg_daily_boards/CN_2026-10-20.json",
+    "data/tg_daily_boards/CN_2026-10-21.json",
+    "data/tg_daily_boards/CN_2026-10-22.json",
+    "data/tg_daily_boards/CN_2026-10-23.json",
+    "data/tg_daily_boards/CN_2026-10-26.json",
+    "data/tg_daily_boards/CN_2026-10-27.json",
+    "data/tg_daily_boards/CN_2026-10-28.json",
+    "data/tg_daily_boards/CN_2026-10-29.json",
+    "data/tg_daily_boards/CN_2026-10-30.json",
+    "data/tg_daily_boards/CN_2026-11-02.json",
+    "data/tg_daily_boards/HK_2026-10-13.json",
+    "data/tg_daily_boards/HK_2026-10-14.json",
+    "data/tg_daily_boards/HK_2026-10-15.json",
+    "data/tg_daily_boards/HK_2026-10-16.json",
+    "data/tg_daily_boards/HK_2026-10-19.json",
+    "data/tg_daily_boards/HK_2026-10-20.json",
+    "data/tg_daily_boards/HK_2026-10-21.json",
+    "data/tg_daily_boards/HK_2026-10-22.json",
+    "data/tg_daily_boards/HK_2026-10-23.json",
+    "data/tg_daily_boards/HK_2026-10-26.json",
+    "data/tg_daily_boards/HK_2026-10-27.json",
+    "data/tg_daily_boards/HK_2026-10-28.json",
+    "data/tg_daily_boards/HK_2026-10-29.json",
+    "data/tg_daily_boards/HK_2026-10-30.json",
+    "data/tg_daily_boards/HK_2026-11-02.json",
+    "data/tg_daily_boards/US_2026-10-14.json",
+    "data/tg_daily_boards/US_2026-10-15.json",
+    "data/tg_daily_boards/US_2026-10-16.json",
+    "data/tg_daily_boards/US_2026-10-17.json",
+    "data/tg_daily_boards/US_2026-10-20.json",
+    "data/tg_daily_boards/US_2026-10-21.json",
+    "data/tg_daily_boards/US_2026-10-22.json",
+    "data/tg_daily_boards/US_2026-10-23.json",
+    "data/tg_daily_boards/US_2026-10-24.json",
+    "data/tg_daily_boards/US_2026-10-27.json",
+    "data/tg_daily_boards/US_2026-10-28.json",
+    "data/tg_daily_boards/US_2026-10-29.json",
+    "data/tg_daily_boards/US_2026-10-30.json",
+    "data/tg_daily_boards/US_2026-10-31.json",
+    "data/tg_daily_boards/US_2026-11-03.json",
+    "data/watchlist.json",
+    "data/watchlists/C78000.json",
+    "data/watchlists/Csy203810.json"
+  ],
+  "redacted_files": {}
+}

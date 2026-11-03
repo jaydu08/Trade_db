@@ -1,0 +1,1572 @@
+import logging
+import datetime as dt
+import re
+import os
+import time
+import concurrent.futures
+from difflib import SequenceMatcher
+from sqlmodel import select
+from typing import List, Dict, Tuple, Optional
+
+from core.db import get_ledger_session
+from domain.ledger.analytics import TrendSeedPool, DailyRank, TrendDailyBar
+# ChromaDB 已禁用，新闻查询跳过
+# from modules.monitor.news_intel import summarize_symbol_news
+from modules.ingestion.market_cap import get_cn_market_metrics, get_hk_market_metrics
+from modules.ingestion.us_market_cap import get_us_market_metrics
+
+logger = logging.getLogger(__name__)
+
+class TrendService:
+    EOD_SOURCES = {
+        "daily_rank",
+        "trend_pool_refresh_eod",
+        "trend_pool_history_backfill",
+        "commodity",
+        "heatmap",
+        "daily_hot",
+        "selftest",
+    }
+    POOL_RETENTION_DAYS = 60
+    POOL_SYMBOL_CAPS = {"CN": 100, "US": 100, "HK": 50, "CF": 30}
+    TREND_MAX_SYMBOLS_PER_MARKET = int(os.getenv("TREND_MAX_SYMBOLS_PER_MARKET", "60") or 60)
+
+    BASELINE_SEEDS = {
+        "US": "NVDA:NVIDIA,AAPL:Apple,MSFT:Microsoft,AMZN:Amazon,GOOGL:Alphabet,META:Meta,TSLA:Tesla,AMD:AMD,AVGO:Broadcom,LLY:Eli Lilly,JPM:JPMorgan,UNH:UnitedHealth",
+        "HK": "00700:腾讯控股,09988:阿里巴巴-W,03690:美团-W,01211:比亚迪股份,09868:小鹏汽车-W,09618:京东集团-SW,01810:小米集团-W,00388:香港交易所,02318:中国平安,00941:中国移动",
+        "CN": "600519:贵州茅台,300750:宁德时代,601318:中国平安,600036:招商银行,000858:五粮液,002594:比亚迪,688981:中芯国际,601012:隆基绿能,000333:美的集团,600276:恒瑞医药",
+    }
+
+    @staticmethod
+    def _parse_seed_specs(raw: str, market: str, reason: str) -> List[Dict]:
+        out: List[Dict] = []
+        for part in str(raw or "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" in part:
+                sym, name = part.split(":", 1)
+            else:
+                sym, name = part, ""
+            sym = sym.strip()
+            if not sym:
+                continue
+            out.append({"symbol": sym, "name": name.strip(), "reason": reason})
+        return out
+
+    @staticmethod
+    def _baseline_seed_items() -> Dict[str, List[Dict]]:
+        if str(os.getenv("ENABLE_TREND_BASELINE_SEEDS", "1")).strip().lower() not in {"1", "true", "yes", "on"}:
+            return {}
+        result: Dict[str, List[Dict]] = {}
+        for market, default_raw in TrendService.BASELINE_SEEDS.items():
+            raw = os.getenv(f"TREND_BASELINE_{market}", default_raw)
+            items = TrendService._parse_seed_specs(raw, market, "大票趋势基线")
+            if items:
+                result[market] = items
+        return result
+
+    @staticmethod
+    def _watchlist_seed_items() -> Dict[str, List[Dict]]:
+        result: Dict[str, List[Dict]] = {}
+        try:
+            from modules.monitor.repository import WatchlistRepository
+            data = WatchlistRepository().load_all()
+            for item in (data or {}).values():
+                if not item or not item.get("is_active", True):
+                    continue
+                market = str(item.get("market", "") or "").strip().upper()
+                sym = str(item.get("symbol", "") or "").strip()
+                if market not in {"CN", "HK", "US", "CF"} or not sym:
+                    continue
+                result.setdefault(market, []).append({
+                    "symbol": sym,
+                    "name": str(item.get("name", "") or ""),
+                    "reason": "自选观察",
+                })
+        except Exception as e:
+            logger.debug("Collect watchlist trend seeds failed: %s", e)
+        return result
+
+    @staticmethod
+    def _paper_trade_seed_items() -> Dict[str, List[Dict]]:
+        result: Dict[str, List[Dict]] = {}
+        try:
+            from domain.ledger.paper_trade import PaperTrade
+            with get_ledger_session() as session:
+                rows = session.exec(select(PaperTrade).where(PaperTrade.status == "ACTIVE")).all()
+            for r in rows:
+                market = str(r.market or "").strip().upper()
+                sym = str(r.symbol or "").strip()
+                if market not in {"CN", "HK", "US", "CF"} or not sym:
+                    continue
+                result.setdefault(market, []).append({
+                    "symbol": sym,
+                    "name": str(r.name or ""),
+                    "reason": "模拟持仓",
+                })
+        except Exception as e:
+            logger.debug("Collect paper trade trend seeds failed: %s", e)
+        return result
+
+    @staticmethod
+    def _daily_rank_seed_items(lookback_days: int = 3) -> Dict[str, List[Dict]]:
+        result: Dict[str, List[Dict]] = {}
+        if str(os.getenv("ENABLE_TREND_DAILY_RANK_SEEDS", "1")).strip().lower() not in {"1", "true", "yes", "on"}:
+            return result
+        cutoff = dt.date.today() - dt.timedelta(days=max(1, int(lookback_days or 1)))
+        max_per_market = int(os.getenv("TREND_DAILY_RANK_SEED_MAX", "30") or 30)
+        with get_ledger_session() as session:
+            for market in ["CN", "HK", "US"]:
+                rows = session.exec(
+                    select(DailyRank)
+                    .where(DailyRank.market == market)
+                    .where(DailyRank.date >= cutoff)
+                    .order_by(DailyRank.amount.desc(), DailyRank.change_pct.desc())
+                    .limit(max_per_market * 4)
+                ).all()
+                picked = 0
+                seen = set()
+                for r in rows:
+                    sym = str(r.symbol or "").strip()
+                    if not sym or sym in seen:
+                        continue
+                    seen.add(sym)
+                    pct = float(r.change_pct or 0)
+                    amt = float(r.amount or 0)
+                    if market == "CN" and (amt < float(os.getenv("CN_HARD_AMOUNT_MIN", "200000000") or 200000000) or pct < float(os.getenv("TREND_DAILY_RANK_CN_PCT_MIN", "1.5") or 1.5)):
+                        continue
+                    if market == "HK" and (amt < float(os.getenv("HK_HARD_AMOUNT_MIN", "250000000") or 250000000) or pct < float(os.getenv("TREND_DAILY_RANK_HK_PCT_MIN", "3.0") or 3.0)):
+                        continue
+                    if market == "US":
+                        if TrendCalculator._is_leveraged_like(f"{sym} {str(r.name or '')}"):
+                            continue
+                        if amt < float(os.getenv("TREND_SECONDARY_US_AMOUNT_MIN", "20000000") or 20000000) or pct < float(os.getenv("TREND_DAILY_RANK_US_PCT_MIN", "3.0") or 3.0):
+                            continue
+                    result.setdefault(market, []).append({
+                        "symbol": sym,
+                        "name": str(r.name or ""),
+                        "reason": f"DailyRank高流动性异动 {pct:+.1f}%",
+                    })
+                    picked += 1
+                    if picked >= max_per_market:
+                        break
+        return result
+
+    @staticmethod
+    def refresh_seed_pool_from_sources() -> Dict[str, Dict[str, int]]:
+        """低频扩展 TrendSeedPool：自选/持仓、DailyRank、本地大票基线。"""
+        by_market: Dict[str, List[Dict]] = {}
+        sources = [
+            TrendService._baseline_seed_items(),
+            TrendService._watchlist_seed_items(),
+            TrendService._paper_trade_seed_items(),
+            TrendService._daily_rank_seed_items(int(os.getenv("TREND_SEED_RANK_LOOKBACK_DAYS", "3") or 3)),
+        ]
+        for src in sources:
+            for market, items in (src or {}).items():
+                by_market.setdefault(market, []).extend(items or [])
+
+        summary: Dict[str, Dict[str, int]] = {}
+        for market, items in by_market.items():
+            seen = set()
+            deduped = []
+            for item in items:
+                sym = str(item.get("symbol", "") or "").strip()
+                if not sym or sym in seen:
+                    continue
+                seen.add(sym)
+                deduped.append(item)
+            if deduped:
+                TrendService.add_to_pool(market, deduped)
+            summary[market] = {"candidates": len(items), "saved_or_seen": len(deduped)}
+        logger.info("Trend seed pool multi-source refresh finished: %s", summary)
+        return summary
+
+    @staticmethod
+    def _enforce_pool_symbol_cap(session, market: str):
+        """按市场限制 trend 种子池标的数量，优先保留最近出现的标的。"""
+        cap = TrendService.POOL_SYMBOL_CAPS.get(market)
+        if not cap:
+            return
+
+        cutoff = dt.date.today() - dt.timedelta(days=TrendService.POOL_RETENTION_DAYS)
+        rows = session.exec(
+            select(TrendSeedPool).where(
+                TrendSeedPool.market == market,
+                TrendSeedPool.date >= cutoff,
+            )
+        ).all()
+        if not rows:
+            return
+
+        last_seen = {}
+        for r in rows:
+            prev = last_seen.get(r.symbol)
+            if prev is None or r.date > prev:
+                last_seen[r.symbol] = r.date
+
+        if len(last_seen) <= cap:
+            return
+
+        keep_symbols = {
+            sym
+            for sym, _ in sorted(last_seen.items(), key=lambda x: (x[1], x[0]), reverse=True)[:cap]
+        }
+        drop_symbols = set(last_seen.keys()) - keep_symbols
+        if not drop_symbols:
+            return
+
+        to_delete = session.exec(
+            select(TrendSeedPool).where(
+                TrendSeedPool.market == market,
+                TrendSeedPool.symbol.in_(list(drop_symbols)),
+            )
+        ).all()
+        for row in to_delete:
+            session.delete(row)
+        logger.info(
+            "TrendSeedPool cap enforced: market=%s cap=%s dropped_symbols=%s",
+            market,
+            cap,
+            len(drop_symbols),
+        )
+
+    @staticmethod
+    def _is_anomalous_close(
+        session,
+        market: str,
+        symbol: str,
+        close: float,
+        pct_chg: float,
+        sample_n: int = 20,
+    ) -> bool:
+        """
+        港/美价格异常保护：
+        - 与近期中位数相比出现异常倍数跳变
+        - 且当日涨跌幅并未体现同等异常（通常意味着口径错位）
+        """
+        if market not in {"HK", "US"} or close <= 0:
+            return False
+
+        stmt = (
+            select(TrendDailyBar)
+            .where(TrendDailyBar.market == market)
+            .where(TrendDailyBar.symbol == symbol)
+            .order_by(TrendDailyBar.date.desc())
+        )
+        rows = list(session.exec(stmt).all())[:sample_n]
+        hist = [float(r.close) for r in rows if r.close and float(r.close) > 0]
+        if len(hist) < 5:
+            return False
+
+        hist_sorted = sorted(hist)
+        median = hist_sorted[len(hist_sorted) // 2]
+        if median <= 0:
+            return False
+
+        ratio = close / median
+        # 异常价倍数 + 非异常涨跌幅 => 高概率为错误口径（如币种错位）
+        if (ratio > 2.5 or ratio < 0.4) and abs(float(pct_chg or 0)) <= 25:
+            logger.warning(
+                "TrendDailyBar anomaly blocked: market=%s symbol=%s close=%s median=%s ratio=%.3f pct=%s",
+                market, symbol, close, median, ratio, pct_chg,
+            )
+            return True
+        return False
+
+    @staticmethod
+    def _pick_trusted_quote(symbol: str, market: str):
+        """
+        趋势场景下的可信行情源策略：
+        - US: 仅信任 Finnhub（避免其他源口径偏差）
+        - 其他市场: 接受 DataManager 正常返回
+        """
+        from modules.ingestion.data_factory import data_manager
+        quote = data_manager.get_quote(symbol, market)
+        if not quote:
+            return None
+        if market == "US" and quote.get("provider") != "Finnhub":
+            return None
+        return quote
+
+    @staticmethod
+    def _to_date(value) -> Optional[dt.date]:
+        if value is None:
+            return None
+        if isinstance(value, dt.datetime):
+            return value.date()
+        if isinstance(value, dt.date):
+            return value
+        s = str(value).strip()
+        if not s:
+            return None
+        try:
+            return dt.datetime.fromisoformat(s[:10]).date()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalize_symbol_for_history(symbol: str, market: str) -> str:
+        sym = str(symbol or "").strip()
+        if market == "US" and "." in sym:
+            sym = sym.split(".")[-1].strip()
+        return sym
+
+    @staticmethod
+    def _fetch_symbol_history(market: str, symbol: str):
+        """
+        获取单标的历史日线（优先项目内已验证可用接口）。
+        """
+        import akshare as ak
+
+        sym = TrendService._normalize_symbol_for_history(symbol, market)
+        if not sym:
+            return None
+
+        if market == "CN":
+            prefixed = f"sh{sym}" if str(sym).startswith("6") else f"sz{sym}"
+            try:
+                return ak.stock_zh_a_daily(symbol=prefixed)
+            except Exception:
+                try:
+                    return ak.stock_zh_a_hist(symbol=sym, period="daily")
+                except Exception:
+                    return None
+        if market == "HK":
+            try:
+                return ak.stock_hk_daily(symbol=sym)
+            except Exception:
+                return None
+        if market == "US":
+            try:
+                return ak.stock_us_daily(symbol=sym)
+            except Exception:
+                return None
+        if market == "CF":
+            try:
+                return ak.futures_zh_daily_sina(symbol=sym)
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _build_history_items(market: str, symbol: str, name: str, df, cutoff: dt.date) -> List[Dict]:
+        if df is None or getattr(df, "empty", True):
+            return []
+
+        # 字段兼容（akshare 各接口列名有差异）
+        cols = set(str(c).lower() for c in list(df.columns))
+        date_col = "date" if "date" in cols else ("日期" if "日期" in df.columns else None)
+        open_col = "open" if "open" in cols else ("开盘" if "开盘" in df.columns else None)
+        high_col = "high" if "high" in cols else ("最高" if "最高" in df.columns else None)
+        low_col = "low" if "low" in cols else ("最低" if "最低" in df.columns else None)
+        close_col = "close" if "close" in cols else ("收盘" if "收盘" in df.columns else None)
+        amount_col = "amount" if "amount" in cols else ("成交额" if "成交额" in df.columns else None)
+        turnover_col = "turnover" if "turnover" in cols else ("换手率" if "换手率" in df.columns else None)
+
+        if not date_col or not close_col:
+            return []
+
+        items: List[Dict] = []
+        for _, row in df.iterrows():
+            d = TrendService._to_date(row.get(date_col))
+            if not d or d < cutoff:
+                continue
+            close = float(row.get(close_col, 0) or 0)
+            if close <= 0:
+                continue
+            open_price = float(row.get(open_col, 0) or 0) if open_col else close
+            high = float(row.get(high_col, 0) or 0) if high_col else max(close, open_price)
+            low = float(row.get(low_col, 0) or 0) if low_col else min(close, open_price)
+            amount = float(row.get(amount_col, 0) or 0) if amount_col else 0.0
+            turnover = float(row.get(turnover_col, 0) or 0) if turnover_col else 0.0
+            pct = 0.0
+            if open_price > 0:
+                pct = round((close - open_price) / open_price * 100, 4)
+            items.append(
+                {
+                    "date": d,
+                    "symbol": symbol,
+                    "name": name or "",
+                    "open": open_price if open_price > 0 else close,
+                    "high": high if high > 0 else max(close, open_price),
+                    "low": low if low > 0 else min(close, open_price),
+                    "close": close,
+                    "amount": amount,
+                    "turnover_rate": turnover,
+                    "pct_chg": pct,
+                }
+            )
+        return items
+
+    @staticmethod
+    def _save_historical_bars(market: str, symbol: str, items: List[Dict], source: str) -> int:
+        """
+        仅插入缺失历史，不覆盖已有记录。
+        """
+        if not items:
+            return 0
+        cutoff = dt.date.today() - dt.timedelta(days=180)
+        saved = 0
+        try:
+            with get_ledger_session() as session:
+                existing_dates = {
+                    r.date
+                    for r in session.exec(
+                        select(TrendDailyBar).where(
+                            TrendDailyBar.market == market,
+                            TrendDailyBar.symbol == symbol,
+                            TrendDailyBar.date >= cutoff,
+                        )
+                    ).all()
+                }
+
+                for item in sorted(items, key=lambda x: x["date"]):
+                    d = item["date"]
+                    if d in existing_dates:
+                        continue
+                    close = float(item.get("close", 0) or 0)
+                    if close <= 0:
+                        continue
+                    pct = float(item.get("pct_chg", 0) or 0)
+                    if source != "trend_pool_history_backfill":
+                        if TrendService._is_anomalous_close(session, market, symbol, close, pct):
+                            continue
+                    open_price = float(item.get("open", 0) or 0)
+                    base_open = open_price if open_price > 0 else close
+                    high = float(item.get("high", 0) or 0)
+                    low = float(item.get("low", 0) or 0)
+                    amount = float(item.get("amount", 0) or 0)
+                    turnover = float(item.get("turnover_rate", 0) or 0)
+                    session.add(
+                        TrendDailyBar(
+                            date=d,
+                            market=market,
+                            symbol=symbol,
+                            name=str(item.get("name", "") or ""),
+                            open=base_open,
+                            high=high if high > 0 else max(close, base_open),
+                            low=low if low > 0 else min(close, base_open),
+                            close=close,
+                            amount=amount,
+                            turnover_rate=turnover,
+                            source=source,
+                        )
+                    )
+                    existing_dates.add(d)
+                    saved += 1
+
+                old_rows = session.exec(
+                    select(TrendDailyBar).where(TrendDailyBar.market == market, TrendDailyBar.date < cutoff)
+                ).all()
+                for row in old_rows:
+                    session.delete(row)
+        except Exception as e:
+            logger.error("Failed saving historical bars: market=%s symbol=%s err=%s", market, symbol, e)
+            return 0
+        return saved
+
+    @staticmethod
+    def _get_symbols_need_backfill(market: str, symbols: List[str], cutoff: dt.date, lookback_days: int) -> List[str]:
+        if not symbols:
+            return []
+        dates_by_symbol: Dict[str, set[dt.date]] = {}
+        with get_ledger_session() as session:
+            rows = session.exec(
+                select(TrendDailyBar.symbol, TrendDailyBar.date).where(
+                    TrendDailyBar.market == market,
+                    TrendDailyBar.symbol.in_(symbols),
+                    TrendDailyBar.date >= cutoff,
+                )
+            ).all()
+        for sym, d in rows:
+            if sym and d:
+                dates_by_symbol.setdefault(sym, set()).add(d)
+
+        tolerance_days = 3 if lookback_days >= 14 else 1
+        earliest_threshold = cutoff + dt.timedelta(days=tolerance_days)
+        latest_threshold = dt.date.today() - dt.timedelta(days=7 if market == "US" else 5)
+        # Calendar windows contain roughly 70% trading days. Requiring 35% leaves
+        # room for holidays while still detecting the large sparse-series gaps
+        # that previously produced false 20/60-day returns.
+        min_observations = max(8, int(max(1, lookback_days) * 0.35))
+
+        targets = []
+        for sym in symbols:
+            dates = dates_by_symbol.get(sym) or set()
+            if not dates:
+                targets.append(sym)
+                continue
+            if min(dates) > earliest_threshold:
+                targets.append(sym)
+                continue
+            if max(dates) < latest_threshold:
+                targets.append(sym)
+                continue
+            if len(dates) < min_observations:
+                targets.append(sym)
+        return targets
+
+    @staticmethod
+    def backfill_pool_history(markets: List[str], lookback_days: int = 60) -> Dict[str, Dict[str, int]]:
+        """
+        给趋势池标的补齐近 lookback_days 天的历史交易日收盘序列。
+        只插入缺失日期，不覆盖已落盘数据。
+        """
+        today = dt.date.today()
+        cutoff = today - dt.timedelta(days=lookback_days)
+        summary: Dict[str, Dict[str, int]] = {}
+
+        with get_ledger_session() as session:
+            rows = session.exec(select(TrendSeedPool).where(TrendSeedPool.date >= cutoff)).all()
+            recs = [
+                {"market": r.market, "symbol": r.symbol, "name": r.name}
+                for r in rows
+                if r.market in markets and r.symbol
+            ]
+
+        by_market: Dict[str, Dict[str, str]] = {}
+        for r in recs:
+            by_market.setdefault(r["market"], {})
+            by_market[r["market"]][r["symbol"]] = r.get("name", "")
+
+        for market in markets:
+            sym_map = by_market.get(market, {})
+            symbols = list(sym_map.keys())
+            if not symbols:
+                summary[market] = {"candidates": 0, "targets": 0, "saved_rows": 0}
+                continue
+
+            targets = TrendService._get_symbols_need_backfill(market, symbols, cutoff, lookback_days)
+            saved_rows = 0
+
+            def _work(sym: str) -> int:
+                df = TrendService._fetch_symbol_history(market, sym)
+                items = TrendService._build_history_items(market, sym, sym_map.get(sym, ""), df, cutoff)
+                return TrendService._save_historical_bars(market, sym, items, source="trend_pool_history_backfill")
+
+            if targets:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(targets))) as executor:
+                    future_map = {executor.submit(_work, sym): sym for sym in targets}
+                    for fut in concurrent.futures.as_completed(future_map, timeout=360):
+                        try:
+                            saved_rows += int(fut.result() or 0)
+                        except Exception:
+                            continue
+
+            summary[market] = {
+                "candidates": len(symbols),
+                "targets": len(targets),
+                "saved_rows": saved_rows,
+            }
+
+        logger.info("Trend pool history backfill finished: %s", summary)
+        return summary
+
+    @staticmethod
+    def add_to_pool(market: str, items: List[Dict]):
+        """
+        向滚动种子池添加记录
+        items: [{"symbol": "...", "name": "...", "reason": "..."}]
+        """
+        today = dt.date.today()
+        
+        try:
+            with get_ledger_session() as session:
+                for item in items:
+                    sym = item.get("symbol")
+                    if not sym:
+                        continue
+                        
+                    # 检查今天是否已经入库，避免重复
+                    stmt = select(TrendSeedPool).where(
+                        TrendSeedPool.date == today,
+                        TrendSeedPool.market == market,
+                        TrendSeedPool.symbol == sym
+                    )
+                    existing = session.exec(stmt).first()
+                    
+                    if not existing:
+                        seed = TrendSeedPool(
+                            date=today,
+                            market=market,
+                            symbol=sym,
+                            name=item.get("name", ""),
+                            daily_reason=item.get("reason", "")
+                        )
+                        session.add(seed)
+                # 自动清理 60 天前的数据
+                cutoff = today - dt.timedelta(days=TrendService.POOL_RETENTION_DAYS)
+                del_stmt = select(TrendSeedPool).where(TrendSeedPool.date < cutoff)
+                old_records = session.exec(del_stmt).all()
+                for old in old_records:
+                    session.delete(old)
+
+                # 硬顶控制：按市场限制池内标的总数
+                TrendService._enforce_pool_symbol_cap(session, market)
+                
+                # context manager 将在退出时自动 commit
+            logger.info(f"TrendSeedPool: Saved {len(items)} items for {market}")
+        except Exception as e:
+            logger.error(f"Failed to add to TrendSeedPool: {e}")
+
+    @staticmethod
+    def save_daily_bars(market: str, items: List[Dict], source: str = ""):
+        """
+        保存趋势标的的每日行情快照（滚动保留 180 天）。
+        items: [{"symbol","name","price","pct_chg","amount","turnover_rate","open","high","low"}]
+        """
+        today = dt.date.today()
+        cutoff = today - dt.timedelta(days=180)
+
+        try:
+            if source not in TrendService.EOD_SOURCES:
+                logger.info(
+                    "Skip TrendDailyBar write for non-EOD source: market=%s source=%s items=%s",
+                    market,
+                    source,
+                    len(items),
+                )
+                return
+            with get_ledger_session() as session:
+                for item in items:
+                    sym = str(item.get("symbol", "")).strip()
+                    if not sym:
+                        continue
+
+                    close = float(item.get("price", 0) or 0)
+                    if close <= 0:
+                        continue
+
+                    pct = float(item.get("pct_chg", 0) or 0)
+                    open_price = float(item.get("open", 0) or 0)
+                    if open_price <= 0:
+                        den = 1 + pct / 100.0
+                        open_price = close / den if den > 0 else close
+
+                    high = float(item.get("high", 0) or 0)
+                    low = float(item.get("low", 0) or 0)
+                    amount = float(item.get("amount", 0) or 0)
+                    turnover_rate = float(item.get("turnover_rate", 0) or 0)
+
+                    # US 优先用可信实时源覆盖（防止口径偏差）
+                    if market == "US":
+                        trusted = TrendService._pick_trusted_quote(sym, market)
+                        if trusted and float(trusted.get("price", 0) or 0) > 0:
+                            close = float(trusted.get("price"))
+                            pct = float(trusted.get("pct_chg", pct) or pct)
+                            if open_price <= 0:
+                                den = 1 + pct / 100.0
+                                open_price = close / den if den > 0 else close
+
+                    # 价格异常保护（港/美）
+                    if TrendService._is_anomalous_close(session, market, sym, close, pct):
+                        continue
+
+                    stmt = select(TrendDailyBar).where(
+                        TrendDailyBar.date == today,
+                        TrendDailyBar.market == market,
+                        TrendDailyBar.symbol == sym,
+                    )
+                    existing = session.exec(stmt).first()
+
+                    if existing:
+                        # 当日已写入则不回写，保持“落盘一次”语义
+                        continue
+                    else:
+                        bar = TrendDailyBar(
+                            date=today,
+                            market=market,
+                            symbol=sym,
+                            name=item.get("name", ""),
+                            close=close,
+                            open=open_price,
+                            high=high if high > 0 else max(close, open_price),
+                            low=low if low > 0 else min(close, open_price),
+                            amount=amount,
+                            turnover_rate=turnover_rate,
+                            source=source,
+                            catalyst_tags=str(item.get("catalyst_tags", "") or ""),
+                        )
+                        session.add(bar)
+
+                old_stmt = select(TrendDailyBar).where(TrendDailyBar.date < cutoff)
+                for row in session.exec(old_stmt).all():
+                    session.delete(row)
+            logger.info(f"TrendDailyBar: saved {len(items)} items for {market}, source={source}")
+        except Exception as e:
+            logger.error(f"Failed to save TrendDailyBar for {market}: {e}")
+
+    @staticmethod
+    def refresh_pool_daily_bars(
+        markets: List[str],
+        lookback_days: int = 60,
+        source: str = "trend_pool_refresh_eod",
+        alert_on_zero: bool = False,
+        backfill_history: bool = True,
+    ) -> Dict[str, Dict[str, int]]:
+        """
+        每日补齐趋势池标的的快照价格（按市场批量拉取实时行情）。
+        目标：即使标的不在当日热榜，也能持续更新 trend 价格序列。
+        """
+        from modules.ingestion.data_factory import data_manager
+        today = dt.date.today()
+        cutoff = today - dt.timedelta(days=lookback_days)
+        summary: Dict[str, Dict[str, int]] = {}
+
+        with get_ledger_session() as session:
+            stmt = select(TrendSeedPool).where(TrendSeedPool.date >= cutoff)
+            rows = session.exec(stmt).all()
+            records = [
+                {"market": r.market, "symbol": r.symbol, "name": r.name}
+                for r in rows
+                if r.market in markets and r.symbol
+            ]
+
+        by_market: Dict[str, Dict[str, str]] = {}
+        for r in records:
+            by_market.setdefault(r["market"], {})
+            by_market[r["market"]][r["symbol"]] = r.get("name", "")
+
+        for market in markets:
+            sym_map = by_market.get(market, {})
+            if not sym_map:
+                summary[market] = {"candidates": 0, "quoted": 0, "saved": 0, "backfill_targets": 0, "backfill_saved_rows": 0}
+                continue
+
+            symbols = list(sym_map.keys())
+            payloads: List[Dict] = []
+            us_interval = float(os.getenv("TREND_US_QUOTE_INTERVAL_SEC", "1.1") or 1.1)
+
+            def _fetch(sym: str):
+                # Finnhub 免费额度通常较低，US 走限速串行可显著降低 429 丢数。
+                if market == "US" and us_interval > 0:
+                    time.sleep(us_interval)
+                quote = TrendService._pick_trusted_quote(sym, market)
+                if not quote:
+                    return None
+                price = float(quote.get("price", 0) or 0)
+                if price <= 0:
+                    return None
+                return {
+                    "symbol": sym,
+                    "name": sym_map.get(sym, ""),
+                    "price": price,
+                    "pct_chg": float(quote.get("pct_chg", 0) or 0),
+                    "amount": 0.0,
+                    "turnover_rate": 0.0,
+                }
+
+            max_workers = min(16, len(symbols))
+            timeout_sec = 120
+            if market == "US":
+                max_workers = 1
+                timeout_sec = 300
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {executor.submit(_fetch, sym): sym for sym in symbols}
+                try:
+                    done_iter = concurrent.futures.as_completed(future_map, timeout=timeout_sec)
+                    for future in done_iter:
+                        try:
+                            item = future.result(timeout=0)
+                            if item:
+                                payloads.append(item)
+                        except Exception:
+                            continue
+                except concurrent.futures.TimeoutError:
+                    logger.warning("Trend pool refresh timeout for market=%s, use partial results.", market)
+
+            if payloads:
+                TrendService.save_daily_bars(market, payloads, source=source)
+
+            summary[market] = {
+                "candidates": len(symbols),
+                "quoted": len(payloads),
+                "saved": len(payloads),
+                "backfill_targets": 0,
+                "backfill_saved_rows": 0,
+            }
+
+            if len(symbols) > 0 and len(payloads) == 0:
+                logger.error(
+                    "Trend pool EOD refresh got zero quotes: market=%s candidates=%s",
+                    market,
+                    len(symbols),
+                )
+
+        if backfill_history:
+            try:
+                backfill = TrendService.backfill_pool_history(markets, lookback_days=lookback_days)
+                for market, payload in backfill.items():
+                    summary.setdefault(market, {})
+                    summary[market]["backfill_targets"] = payload.get("targets", 0)
+                    summary[market]["backfill_saved_rows"] = payload.get("saved_rows", 0)
+            except Exception as e:
+                logger.error("Trend pool history backfill failed: %s", e, exc_info=True)
+
+        logger.info("Trend pool daily refresh finished: %s", summary)
+        if alert_on_zero:
+            try:
+                from modules.monitor.notifier import Notifier
+                bad = [
+                    f"{m}:0/{v.get('candidates', 0)}"
+                    for m, v in summary.items()
+                    if v.get("candidates", 0) > 0 and v.get("quoted", 0) == 0
+                ]
+                if bad:
+                    Notifier.broadcast(
+                        "⚠️ Trend收盘价采集异常："
+                        + "，".join(bad)
+                        + "（请检查行情源网络/DNS）"
+                    )
+            except Exception as e:
+                logger.warning("Trend refresh alert failed: %s", e)
+        return summary
+
+class TrendCalculator:
+    @staticmethod
+    def _normalize_symbol_for_api(symbol: str, market: str) -> str:
+        """统一符号格式，兼容 US 的 105.TICKER 形态"""
+        sym = str(symbol or "").strip()
+        if market == "US" and "." in sym:
+            # 例如 105.NVDA -> NVDA
+            sym = sym.split(".")[-1].strip()
+        if market == "US":
+            sym = sym.upper()
+        return sym
+
+    @staticmethod
+    def _symbol_candidates(symbol: str, market: str) -> List[str]:
+        raw = str(symbol or "").strip()
+        if not raw:
+            return []
+        out = [raw]
+        if market == "US":
+            ticker = TrendCalculator._normalize_symbol_for_api(raw, market)
+            out.extend([ticker, f"105.{ticker}", f"106.{ticker}", f"107.{ticker}"])
+        seen = set()
+        deduped = []
+        for s in out:
+            if s and s not in seen:
+                deduped.append(s)
+                seen.add(s)
+        return deduped
+
+    @staticmethod
+    def _calculate_period_return(
+        price_by_date: Dict[dt.date, float],
+        d_days: int,
+    ) -> Tuple[float, float, str]:
+        """Calculate a calendar-window return only when a valid base point exists."""
+        if not price_by_date:
+            return 0.0, 0.0, ""
+
+        dates = sorted(price_by_date)
+        current_date = dates[-1]
+        current_price = float(price_by_date[current_date] or 0)
+        if current_price <= 0:
+            return 0.0, 0.0, ""
+
+        target_date = current_date - dt.timedelta(days=max(1, int(d_days)))
+        past_dates = [d for d in dates if d <= target_date and float(price_by_date.get(d, 0) or 0) > 0]
+        if not past_dates:
+            return 0.0, round(current_price, 4), ""
+
+        base_date = past_dates[-1]
+        # Sparse data must not make a 35-day observation masquerade as a 60-day return.
+        max_base_lag = max(4, min(14, int(round(max(1, int(d_days)) * 0.10)) + 3))
+        if (target_date - base_date).days > max_base_lag:
+            return 0.0, round(current_price, 4), ""
+
+        past_price = float(price_by_date[base_date] or 0)
+        if past_price <= 0:
+            return 0.0, round(current_price, 4), ""
+        if TrendCalculator._has_suspicious_corporate_action_gap(
+            price_by_date,
+            base_date,
+            current_date,
+        ):
+            return 0.0, round(current_price, 4), ""
+        ret = round((current_price - past_price) / past_price * 100, 2)
+        return ret, round(current_price, 4), str(current_date)
+
+    @staticmethod
+    def _has_suspicious_corporate_action_gap(
+        price_by_date: Dict[dt.date, float],
+        start_date: dt.date,
+        end_date: dt.date,
+    ) -> bool:
+        """Reject multi-day returns dominated by an unadjusted split/reverse split."""
+        points = [
+            (d, float(price_by_date.get(d, 0) or 0))
+            for d in sorted(price_by_date)
+            if start_date <= d <= end_date and float(price_by_date.get(d, 0) or 0) > 0
+        ]
+        for (_prev_date, previous), (_date, current) in zip(points, points[1:]):
+            ratio = current / previous if previous > 0 else 0.0
+            # Deliberately conservative: catch common 3x/5x/10x corporate-action
+            # gaps without suppressing ordinary high-volatility trading days.
+            if ratio >= 2.5 or ratio <= 0.4:
+                return True
+        return False
+
+    @staticmethod
+    def _get_return_from_daily_rank_db(symbol: str, market: str, d_days: int) -> Tuple[float, float, str]:
+        """接口失败时，回退使用本地 DailyRank 价格序列计算 N 日收益"""
+        if market == "CF":
+            return 0.0, 0.0, ""
+
+        candidates = TrendCalculator._symbol_candidates(symbol, market)
+        if not candidates:
+            return 0.0, 0.0, ""
+
+        with get_ledger_session() as session:
+            max_rows = max(90, int(d_days) * 25)
+            stmt = (
+                select(DailyRank)
+                .where(DailyRank.market == market)
+                .where(DailyRank.symbol.in_(candidates))
+                .order_by(DailyRank.date.desc())
+                .limit(max_rows)
+            )
+            # 在 session 生命周期内提取纯数据，避免 detached ORM 访问
+            rows = [(r.date, float(r.price)) for r in session.exec(stmt).all() if r.price and r.price > 0]
+
+        # 去重并保留有效价格
+        uniq = {}
+        for d, p in rows:
+            uniq[d] = p
+        if not uniq:
+            return 0.0, 0.0, ""
+
+        return TrendCalculator._calculate_period_return(uniq, d_days)
+
+    @staticmethod
+    def _get_return_from_daily_bar_db(symbol: str, market: str, d_days: int) -> Tuple[float, float, str]:
+        """优先使用本地 TrendDailyBar 序列计算 N 日收益"""
+        candidates = TrendCalculator._symbol_candidates(symbol, market)
+        if not candidates:
+            return 0.0, 0.0, ""
+
+        with get_ledger_session() as session:
+            max_rows = max(120, int(d_days) * 30)
+            stmt = (
+                select(TrendDailyBar)
+                .where(TrendDailyBar.market == market)
+                .where(TrendDailyBar.symbol.in_(candidates))
+                .order_by(TrendDailyBar.date.desc())
+                .limit(max_rows)
+            )
+            # 在 session 生命周期内提取纯数据，避免 detached ORM 访问
+            rows = [(r.date, float(r.close)) for r in session.exec(stmt).all() if r.close and r.close > 0]
+
+        uniq = {}
+        for d, c in rows:
+            uniq[d] = c
+        if not uniq:
+            return 0.0, 0.0, ""
+
+        return TrendCalculator._calculate_period_return(uniq, d_days)
+
+    @staticmethod
+    def _normalize_reason(reason: str) -> str:
+        """归一化理由文本，用于判定“同类理由”"""
+        if not reason:
+            return ""
+        text = str(reason).strip().lower()
+        # 去掉 markdown 与常见噪声词
+        text = re.sub(r"[`*_#>\[\]\(\)\|]+", " ", text)
+        text = re.sub(r"(未找到明显新闻催化|暂无新闻催化|分析原因失败|ai分板解析受限)", " ", text)
+        # 去掉数字/百分号等波动噪声
+        text = re.sub(r"[\d\.\-%％]+", " ", text)
+        # 仅保留中英文数字
+        text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fa5]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    @staticmethod
+    def _is_similar_reason(a: str, b: str, threshold: float = 0.82) -> bool:
+        """粗粒度相似度判定：用于同票同类理由去重"""
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        return SequenceMatcher(None, a, b).ratio() >= threshold
+
+    @staticmethod
+    def _aggregate_reasons_with_decay(
+        reason_records: List[Tuple[dt.date, str]],
+        today: dt.date,
+        decay_base: float = 0.88,
+    ) -> Tuple[str, float]:
+        """
+        聚合理由：
+        1) 同票同类理由去重（避免连续5天重复理由被5倍累加）
+        2) 越新的信号权重越高（指数衰减）
+        返回: (聚合理由文本, 信号强度分)
+        """
+        # 按日期从新到旧，优先保留最新语义与更高权重
+        sorted_records = sorted(reason_records, key=lambda x: x[0], reverse=True)
+
+        buckets: List[dict] = []
+        for r_date, raw_reason in sorted_records:
+            if not raw_reason:
+                continue
+            if "分析原因失败" in raw_reason:
+                continue
+
+            norm = TrendCalculator._normalize_reason(raw_reason)
+            if not norm:
+                continue
+
+            days_ago = max((today - r_date).days, 0)
+            weight = decay_base ** days_ago
+
+            matched = False
+            for b in buckets:
+                if TrendCalculator._is_similar_reason(norm, b["norm"]):
+                    # 同类理由不重复累加，只保留权重更高（更近）的那次
+                    if weight > b["weight"]:
+                        b["weight"] = weight
+                        b["date"] = r_date
+                        b["reason"] = raw_reason.strip()
+                    matched = True
+                    break
+
+            if not matched:
+                buckets.append({
+                    "norm": norm,
+                    "reason": raw_reason.strip(),
+                    "weight": weight,
+                    "date": r_date,
+                })
+
+        if not buckets:
+            return "暂无新闻催化", 0.0
+
+        buckets.sort(key=lambda x: x["weight"], reverse=True)
+        top_reasons = buckets[:3]
+        aggregated_reason = " | ".join([b["reason"] for b in top_reasons])
+        signal_strength = round(sum(b["weight"] for b in top_reasons), 3)
+        return aggregated_reason, signal_strength
+
+    @staticmethod
+    def _get_return(symbol: str, market: str, d_days: int) -> Tuple[float, float, str]:
+        """获取标的 N 天前累计涨幅和现价（仅基于本地收盘价库）"""
+        # 先走本地 TrendDailyBar（收盘快照）
+        try:
+            db_ret = TrendCalculator._get_return_from_daily_bar_db(symbol, market, d_days)
+            if db_ret[:2] != (0.0, 0.0):
+                return db_ret
+        except Exception as e:
+            logger.debug(f"TrendDailyBar fallback failed for {symbol} ({market}): {e}")
+
+        # 再回退 DailyRank 历史价格序列；不再调用外部实时/历史接口，避免口径和可达性波动
+        try:
+            return TrendCalculator._get_return_from_daily_rank_db(symbol, market, d_days)
+        except Exception as e2:
+            logger.debug(f"DailyRank fallback failed for {symbol} ({market}): {e2}")
+            return 0.0, 0.0, ""
+
+
+
+    @staticmethod
+    def _market_topn(market: str) -> int:
+        defaults = {"CN": 10, "HK": 7, "US": 10, "CF": 5}
+        val = os.getenv(f"TREND_TOPN_{market}", "").strip()
+        try:
+            if val:
+                n = int(val)
+                if n > 0:
+                    return n
+        except Exception:
+            pass
+        return defaults.get(market, 10)
+
+    @staticmethod
+    def _market_quota(market: str, topn: int) -> Tuple[int, int, int]:
+        defaults = {
+            # Heatmap Trend daily CN view uses 12 slots: 4 large + 5 mid + 3 small.
+            # Other Trend reports keep the older 10-slot shape unless explicitly overridden.
+            "CN": (4, 5, 3) if int(topn or 0) == 12 else (3, 4, 3),
+            "HK": (3, 3, 1),
+            "US": (3, 5, 2),
+        }
+        raw = os.getenv(f"TREND_QUOTA_{market}", "").strip()
+        quota = defaults.get(market, (topn, 0, 0))
+        if raw:
+            try:
+                arr = [int(x.strip()) for x in raw.split(",") if x.strip()]
+                if len(arr) == 3 and sum(arr) > 0:
+                    quota = (max(0, arr[0]), max(0, arr[1]), max(0, arr[2]))
+            except Exception:
+                pass
+        qsum = sum(quota)
+        if qsum <= 0:
+            return (topn, 0, 0)
+        if qsum == topn:
+            return quota
+        scale = topn / qsum
+        l = int(round(quota[0] * scale))
+        m = int(round(quota[1] * scale))
+        s = max(0, topn - l - m)
+        return (l, m, s)
+
+    @staticmethod
+    def _cap_bucket(item: Dict) -> str:
+        market = str(item.get("market", "")).strip().upper()
+        if market == "CN":
+            cap = float(item.get("total_mv_100m", 0) or 0)
+            large = float(os.getenv("TREND_CN_LARGE_100M", "1200") or 1200)
+            mid = float(os.getenv("TREND_CN_MID_100M", "400") or 400)
+            small = float(os.getenv("TREND_CN_SMALL_100M", "1") or 1)
+            if cap >= large:
+                return "large"
+            if cap >= mid:
+                return "mid"
+            if cap >= small:
+                return "small"
+            return "unknown"
+
+        if market == "HK":
+            cap = float(item.get("market_cap_100m_hkd", 0) or 0)
+            large = float(os.getenv("TREND_HK_LARGE_100M_HKD", "1500") or 1500)
+            mid = float(os.getenv("TREND_HK_MID_100M_HKD", "300") or 300)
+            if cap >= large:
+                return "large"
+            if cap >= mid:
+                return "mid"
+            if cap > 0:
+                return "small"
+            return "unknown"
+
+        if market == "US":
+            cap_musd = float(item.get("market_cap_musd", 0) or 0)
+            large = float(os.getenv("TREND_US_LARGE_MUSD", "50000") or 50000)
+            mid = float(os.getenv("TREND_US_MID_MUSD", "5000") or 5000)
+            if cap_musd >= large:
+                return "large"
+            if cap_musd >= mid:
+                return "mid"
+            if cap_musd > 0:
+                return "small"
+            return "unknown"
+
+        return "unknown"
+
+    @staticmethod
+    def _select_with_quota(stks: List[Dict], market: str, topn_override: Optional[int] = None) -> List[Dict]:
+        topn = int(topn_override) if topn_override and int(topn_override) > 0 else TrendCalculator._market_topn(market)
+        ranked = sorted(stks, key=lambda x: x.get("trend_score", x.get("return_pct", 0)), reverse=True)
+        if market not in {"CN", "HK", "US"}:
+            return ranked[:topn]
+
+        if str(os.getenv("TREND_BUCKET_ENABLE", "1")).strip().lower() not in {"1", "true", "yes", "on"}:
+            return ranked[:topn]
+
+        q_large, q_mid, q_small = TrendCalculator._market_quota(market, topn)
+        buckets = {"large": [], "mid": [], "small": [], "unknown": []}
+        for it in ranked:
+            b = TrendCalculator._cap_bucket(it)
+            it["cap_bucket"] = b
+            buckets.setdefault(b, []).append(it)
+
+        picked: List[Dict] = []
+        used: set[str] = set()
+
+        def _take(kind: str, n: int):
+            if n <= 0:
+                return
+            cnt = 0
+            for cand in buckets.get(kind, []):
+                sym = str(cand.get("symbol", "")).strip()
+                if not sym or sym in used:
+                    continue
+                cand["_quota_locked"] = True
+                picked.append(cand)
+                used.add(sym)
+                cnt += 1
+                if cnt >= n:
+                    break
+
+        _take("large", q_large)
+        _take("mid", q_mid)
+        _take("small", q_small)
+
+        for kind in ["mid", "large", "small", "unknown"]:
+            if len(picked) >= topn:
+                break
+            for cand in buckets.get(kind, []):
+                sym = str(cand.get("symbol", "")).strip()
+                if not sym or sym in used:
+                    continue
+                cand.setdefault("_quota_locked", False)
+                picked.append(cand)
+                used.add(sym)
+                if len(picked) >= topn:
+                    break
+
+        if len(picked) < topn:
+            for cand in ranked:
+                sym = str(cand.get("symbol", "")).strip()
+                if not sym or sym in used:
+                    continue
+                picked.append(cand)
+                used.add(sym)
+                if len(picked) >= topn:
+                    break
+
+        ratio = float(os.getenv("TREND_QUALITY_FLOOR_RATIO", "0.95") or 0.95)
+        old_tail = float(ranked[min(topn, len(ranked)) - 1].get("trend_score", 0) or 0) if ranked else 0.0
+        if old_tail > 0 and picked:
+            floor = old_tail * max(0.0, ratio)
+            picked.sort(key=lambda x: x.get("trend_score", x.get("return_pct", 0)), reverse=True)
+            picked_syms = {str(x.get("symbol", "")).strip() for x in picked}
+            while picked:
+                replace_idx = None
+                for idx in range(len(picked) - 1, -1, -1):
+                    cand0 = picked[idx]
+                    if bool(cand0.get("_quota_locked", False)):
+                        continue
+                    if float(cand0.get("trend_score", 0) or 0) < floor:
+                        replace_idx = idx
+                        break
+                if replace_idx is None:
+                    break
+                repl = None
+                for cand in ranked:
+                    sym = str(cand.get("symbol", "")).strip()
+                    if not sym or sym in picked_syms:
+                        continue
+                    if float(cand.get("trend_score", 0) or 0) >= floor:
+                        cand.setdefault("_quota_locked", False)
+                        repl = cand
+                        break
+                if repl is None:
+                    break
+                old = picked[replace_idx]
+                old_sym = str(old.get("symbol", "")).strip()
+                if old_sym:
+                    picked_syms.discard(old_sym)
+                picked[replace_idx] = repl
+                picked_syms.add(str(repl.get("symbol", "")).strip())
+                picked.sort(key=lambda x: x.get("trend_score", x.get("return_pct", 0)), reverse=True)
+
+        unknown_cap = int(os.getenv(f"TREND_UNKNOWN_MAX_{market}", os.getenv("TREND_UNKNOWN_MAX", "2")) or 2)
+        if unknown_cap >= 0:
+            picked.sort(key=lambda x: x.get("trend_score", x.get("return_pct", 0)), reverse=True)
+            unknown_idx = [i for i, x in enumerate(picked) if str(x.get("cap_bucket", "")) == "unknown"]
+            while len(unknown_idx) > unknown_cap:
+                i = unknown_idx[-1]
+                repl = None
+                for cand in ranked:
+                    sym = str(cand.get("symbol", "")).strip()
+                    if not sym:
+                        continue
+                    if any(str(z.get("symbol", "")).strip() == sym for z in picked):
+                        continue
+                    if str(cand.get("cap_bucket", TrendCalculator._cap_bucket(cand))) == "unknown":
+                        continue
+                    repl = cand
+                    break
+                if repl is None:
+                    break
+                picked[i] = repl
+                picked.sort(key=lambda x: x.get("trend_score", x.get("return_pct", 0)), reverse=True)
+                unknown_idx = [j for j, x in enumerate(picked) if str(x.get("cap_bucket", "")) == "unknown"]
+
+        picked.sort(key=lambda x: x.get("trend_score", x.get("return_pct", 0)), reverse=True)
+        for item in picked:
+            item.pop("_quota_locked", None)
+        return picked[:topn]
+
+
+    @staticmethod
+    def _is_leveraged_like(name: str) -> bool:
+        text = str(name or "")
+        low = text.lower()
+        leveraged_tickers = {
+            "NVDL", "NVDS", "NVDU", "TSLL", "TSLS", "MSTX", "MSTZ", "MUU",
+            "SOXL", "SOXS", "TQQQ", "SQQQ", "SPXL", "SPXS", "LABU", "LABD",
+            "FNGU", "FNGD", "TECL", "TECS", "WEBL", "WEBS", "YINN", "YANG",
+            "CONL", "AAPU", "AAPD", "GGLL", "GGLS", "AMDL", "AMDS",
+            "BABX", "MSTU", "TSDD", "TSLQ", "NOWL", "TSLT", "TSLZ",
+        }
+        import re as _re
+        tokens = {x for x in _re.split(r"[^A-Za-z0-9]+", text.upper()) if x}
+        if tokens & leveraged_tickers:
+            return True
+        if any(k in low for k in ["2x", "3x", "1.5x", "bull", "bear", "leveraged", "inverse"]):
+            return True
+        return bool(_re.search(r"\d[\d.]*[xX]\s+(?:long|short|bull|bear)", text))
+
+    @staticmethod
+    def _augment_with_secondary_candidates(items: List[Dict], days: int) -> List[Dict]:
+        """Dual-channel补漏：在主候选外补充DailyRank高流动性候选。"""
+        enabled = str(os.getenv("ENABLE_TREND_SECONDARY_POOL", "1")).strip().lower() in {"1", "true", "yes", "on"}
+        if not enabled:
+            return items
+
+        fetch_n = max(5, int(os.getenv("TREND_SECONDARY_FETCH_N", "20") or 20))
+        cutoff_rank = dt.date.today() - dt.timedelta(days=max(2, min(5, days)))
+
+        by_market = {}
+        for it in items:
+            by_market.setdefault(str(it.get("market", "")), []).append(it)
+
+        merged = list(items)
+        existing = {
+            (
+                str(it.get("market", "")),
+                TrendCalculator._normalize_symbol_for_api(
+                    str(it.get("symbol", "")),
+                    str(it.get("market", "")),
+                ),
+            )
+            for it in items
+        }
+
+        with get_ledger_session() as session:
+            for market in ["CN", "HK", "US"]:
+                rows = session.exec(
+                    select(DailyRank)
+                    .where(DailyRank.market == market)
+                    .where(DailyRank.date >= cutoff_rank)
+                    .order_by(DailyRank.amount.desc(), DailyRank.change_pct.desc())
+                    .limit(fetch_n * 3)
+                ).all()
+
+                picked = 0
+                for r in rows:
+                    sym = TrendCalculator._normalize_symbol_for_api(str(r.symbol or "").strip(), market)
+                    key = (market, sym)
+                    if (not sym) or (key in existing):
+                        continue
+
+                    pct = float(r.change_pct or 0)
+                    amt = float(r.amount or 0)
+
+                    if market == "CN":
+                        if amt < float(os.getenv("CN_HARD_AMOUNT_MIN", "200000000") or 200000000):
+                            continue
+                        if pct < float(os.getenv("TREND_SECONDARY_CN_PCT_MIN", "2.0") or 2.0):
+                            continue
+                        try:
+                            m = get_cn_market_metrics(sym)
+                            mv = float((m or {}).get("total_mv_100m", 0) or 0)
+                            floor = float(os.getenv("CN_HARD_TOTAL_MV_100M_MIN", "50") or 50)
+                            if mv > 0 and mv < floor:
+                                continue
+                        except Exception:
+                            pass
+
+                    elif market == "HK":
+                        if amt < float(os.getenv("HK_HARD_AMOUNT_MIN", "250000000") or 250000000):
+                            continue
+                        if pct < float(os.getenv("TREND_SECONDARY_HK_PCT_MIN", "4.0") or 4.0):
+                            continue
+
+                    elif market == "US":
+                        if amt < float(os.getenv("TREND_SECONDARY_US_AMOUNT_MIN", "20000000") or 20000000):
+                            continue
+                        if pct < float(os.getenv("TREND_SECONDARY_US_PCT_MIN", "4.0") or 4.0):
+                            continue
+                        try:
+                            m = get_us_market_metrics(sym.split(".")[-1].strip())
+                            cap = float((m or {}).get("market_cap_musd", 0) or 0)
+                            floor = float(os.getenv("US_HARD_MCAP_MUSD_MIN", "1000") or 1000)
+                            if cap > 0 and cap < floor:
+                                continue
+                            if cap <= 0 and TrendCalculator._is_leveraged_like(f"{sym} {getattr(r, 'name', '')}"):
+                                continue
+                        except Exception:
+                            pass
+
+                    merged.append({
+                        "market": market,
+                        "symbol": sym,
+                        "name": str(r.name or ""),
+                        "reason_records": [],
+                    })
+                    existing.add(key)
+                    picked += 1
+                    if picked >= fetch_n:
+                        break
+
+                if picked > 0:
+                    logger.info("Trend secondary pool added: market=%s added=%s", market, picked)
+
+        return merged
+
+    @staticmethod
+    def _min_return_pct(market: str) -> float:
+        raw = os.getenv(f"TREND_MIN_RETURN_PCT_{market}", os.getenv("TREND_MIN_RETURN_PCT", "0"))
+        try:
+            return float(raw or 0)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def calculate_trend(days: int = 7, topn_override: Optional[int] = None) -> Dict[str, List[Dict]]:
+        """
+        计算各市场趋势榜单
+        """
+        from collections import defaultdict
+        import concurrent.futures
+        
+        cutoff = dt.date.today() - dt.timedelta(days=days)
+        
+        # 1. 查询种子池
+        with get_ledger_session() as session:
+            stmt = select(TrendSeedPool).where(TrendSeedPool.date >= cutoff)
+            rows = session.exec(stmt).all()
+            # 避免 session 关闭后 ORM 对象懒加载导致 DetachedInstanceError
+            records = [
+                {
+                    "market": r.market,
+                    "symbol": r.symbol,
+                    "name": r.name,
+                    "date": r.date,
+                    "daily_reason": r.daily_reason,
+                }
+                for r in rows
+            ]
+            
+        # 2. 按市场和代码去重合并理由；无 heatmap 种子时仍允许 DailyRank 二级池补漏
+        grouped = defaultdict(dict)
+        for r in records:
+            market = str(r.get("market", "") or "").strip()
+            symbol = TrendCalculator._normalize_symbol_for_api(str(r.get("symbol", "") or ""), market)
+            if not market or not symbol:
+                continue
+            key = (market, symbol)
+            if key not in grouped:
+                grouped[key] = {
+                    "market": market,
+                    "symbol": symbol,
+                    "name": r["name"],
+                    "reason_records": []
+                }
+            elif r["name"] and not grouped[key].get("name"):
+                grouped[key]["name"] = r["name"]
+            if r["daily_reason"]:
+                grouped[key]["reason_records"].append((r["date"], r["daily_reason"].strip()))
+                
+        items = list(grouped.values())
+        items = TrendCalculator._augment_with_secondary_candidates(items, days)
+        # 候选池限额：避免极端数据膨胀导致内存峰值
+        if TrendService.TREND_MAX_SYMBOLS_PER_MARKET > 0:
+            by_market = defaultdict(list)
+            for it in items:
+                by_market[it.get("market", "")].append(it)
+            reduced = []
+            for mkt, arr in by_market.items():
+                arr.sort(
+                    key=lambda x: (
+                        max((d for d, _ in x.get("reason_records", [])), default=cutoff),
+                        len(x.get("reason_records", [])),
+                    ),
+                    reverse=True,
+                )
+                reduced.extend(arr[: TrendService.TREND_MAX_SYMBOLS_PER_MARKET])
+            items = reduced
+        news_boost = float(os.getenv("TREND_NEWS_BOOST", "0.05") or 0.05)
+        news_lookback_days = int(os.getenv("TREND_NEWS_LOOKBACK_DAYS", str(max(3, min(days, 10)))) or max(3, min(days, 10)))
+
+        # 3. 并发查 N 日涨幅
+        def _process(item: dict):
+            ret, current_price, price_date = TrendCalculator._get_return(item["symbol"], item["market"], days)
+            item["return_pct"] = ret
+            item["current_price"] = current_price
+            item["price_date"] = price_date
+
+            # 多日理由做“同类去重 + 新鲜度衰减”
+            aggregated_reason, signal_strength = TrendCalculator._aggregate_reasons_with_decay(
+                item.get("reason_records", []),
+                today=dt.date.today(),
+            )
+
+            # 新闻强度已禁用（ChromaDB 关闭），跳过查询
+            news_intensity = 0.0
+            item["news_intensity"] = 0.0
+            item["news_count"] = 0
+
+            item["aggregated_reason"] = aggregated_reason
+            item["signal_strength"] = signal_strength
+
+            # 市值乘数：大市值标的优先（容错：获取失败则 1.0x）
+            market = item.get("market", "")
+            mcap_mult = 1.0
+            try:
+                if market == "CN":
+                    metrics = get_cn_market_metrics(str(item.get("symbol", "")))
+                    total_mv = float((metrics or {}).get("total_mv_100m", 0) or 0)
+                    if total_mv >= 1200:
+                        mcap_mult = 1.2
+                    elif total_mv >= 500:
+                        mcap_mult = 1.1
+                    elif total_mv >= 200:
+                        mcap_mult = 1.05
+                    item["total_mv_100m"] = total_mv
+                elif market == "US":
+                    if TrendCalculator._is_leveraged_like(f"{item.get('symbol', '')} {item.get('name', '')}"):
+                        item["market_cap_musd"] = 0.0
+                        item["trend_score"] = 0.0
+                        item["mcap_mult"] = 1.0
+                        return item
+                    metrics = get_us_market_metrics(str(item.get("symbol", "")).split(".")[-1].strip())
+                    cap_musd = float((metrics or {}).get("market_cap_musd", 0) or 0)
+                    if cap_musd >= 300000:   # ≥3000亿美元
+                        mcap_mult = 1.2
+                    elif cap_musd >= 100000: # ≥1000亿美元
+                        mcap_mult = 1.1
+                    elif cap_musd >= 15000:  # ≥150亿美元
+                        mcap_mult = 1.05
+                    item["market_cap_musd"] = cap_musd
+                elif market == "HK":
+                    metrics = get_hk_market_metrics(str(item.get("symbol", "")))
+                    cap_hkd = float((metrics or {}).get("market_cap_100m_hkd", 0) or 0)
+                    if cap_hkd > 0:
+                        item["market_cap_100m_hkd"] = cap_hkd
+            except Exception:
+                mcap_mult = 1.0
+
+            # 趋势总分：价格趋势 * 新鲜信号 * 新闻催化强度 * 市值乘数
+            freshness_factor = min(1.25, 0.85 + signal_strength * 0.18)
+            news_factor = min(1.10, 0.95 + news_intensity * news_boost)
+            item["trend_score"] = round(ret * freshness_factor * news_factor * mcap_mult, 2)
+            item["mcap_mult"] = mcap_mult
+            return item
+            
+        calc_workers = int(os.getenv("TREND_CALC_WORKERS", "5") or 5)
+        calc_workers = max(1, min(calc_workers, max(1, len(items))))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=calc_workers) as executor:
+            results = list(executor.map(_process, items))
+            
+        # 4. 按市场分组排序并取 Top 10
+        market_tops = defaultdict(list)
+        for res in results:
+            market = str(res.get("market", "") or "")
+            if market in {"CN", "HK", "US"}:
+                if market == "US" and TrendCalculator._is_leveraged_like(
+                    f"{res.get('symbol', '')} {res.get('name', '')}"
+                ):
+                    continue
+                try:
+                    ret = float(res.get("return_pct", 0) or 0)
+                    price = float(res.get("current_price", 0) or 0)
+                except Exception:
+                    continue
+                if ret <= TrendCalculator._min_return_pct(market):
+                    continue
+                if price <= 0 or not str(res.get("price_date", "") or "").strip():
+                    continue
+            market_tops[market].append(res)
+            
+        final_tops = {}
+        for mkt, stks in market_tops.items():
+            final_tops[mkt] = TrendCalculator._select_with_quota(stks, mkt, topn_override=topn_override)
+
+        return dict(final_tops)

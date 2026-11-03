@@ -1,0 +1,506 @@
+# 📊 Trade_db — AI 量化监控系统
+
+> 实时异动监控 · 大宗商品追踪 · 每日榜单 · AI驱动归因 · Telegram推送
+
+---
+
+## 一、系统概述
+
+**Trade_db** 是一个基于 Python 的 AI 驱动量化金融监控系统，通过 Telegram Bot 与用户交互，由后台调度器自动执行各类监控与分析任务。
+
+**核心设计理念：**
+- **JIT（即时数据）**：不存储历史 K 线。所有行情在决策时通过新浪/东方财富 API **实时拉取**。
+- **AI 归因 + 降级**：异动/复盘优先 LLM 归因，失败时可回退到本地事件库（定向新闻）兜底，不阻塞推送。
+- **多市场覆盖**：A股（CN）、港股（HK）、美股（US）、大宗商品期货（CF）。
+- **Telegram 优先**：所有输出均通过 Telegram Bot 推送，支持自选股管理与 AI 问答。
+
+---
+
+## 二、目录结构
+
+```
+Trade_db/
+├── main.py                    # 系统入口：初始化DB → 启动调度器 → 启动 Telegram Bot
+├── run.sh / stop.sh / restart.sh  # 进程管理脚本（自动感知 systemd）
+├── config/
+│   └── settings.py            # 全局常量（路径、LLM参数、市场常量等）
+├── core/
+│   ├── db.py                  # DB管理器：SQLite(meta/ledger) + ChromaDB 单例
+│   ├── scheduler.py           # APScheduler 定时任务注册与执行
+│   ├── llm.py                 # LLM客户端封装（OpenAI兼容，支持结构化输出）
+│   ├── agent.py               # ReAct Agent + Tools（web_search/database_search/get_quote）
+│   └── cache.py               # DiskCache 装饰器（行情缓存，防封IP）
+├── domain/
+│   ├── meta/                  # SQLModel ORM：Asset（资产表）
+│   └── ledger/                # SQLModel ORM：DailyRank（日榜）、WatchlistAlert（预警记录）
+├── modules/
+│   ├── ingestion/
+│   │   ├── akshare_client.py  # AkShare封装（重试装饰器+DiskCache）
+│   │   ├── data_factory.py    # DataManager：并发多源搜索路由（SearXNG/Tavily/Bocha）
+│   │   ├── market_cap.py      # A股/港股市值与资金流（多源回退）
+│   │   ├── us_market_cap.py   # 美股市值（Finnhub → Yahoo Finance → DiskCache）
+│   │   ├── yfinance_client.py # Yahoo Finance 兜底
+│   │   ├── sync_news.py       # 定向新闻同步（trend/heatmap + 自选/持仓）→ ChromaDB
+│   │   ├── sync_reports.py    # 研报同步 → ChromaDB
+│   │   ├── sync_financial.py  # 财务数据同步 → SQLite
+│   │   ├── sync_profile.py    # 公司画像向量化 → ChromaDB
+│   │   ├── sync_relations.py  # 供应链关系提取（LLM）→ ChromaDB
+│   │   ├── sync_asset.py      # 股票资产列表同步 → meta.db
+│   │   └── providers/         # 多源行情 Provider（Finnhub / AkShare / Tushare）
+│   ├── monitor/
+│   │   ├── scanner.py         # 个股异动监控（MonitorService）
+│   │   ├── commodity_scanner.py  # 大宗商品异动监控（CommodityScanner）
+│   │   ├── daily_rank_service.py # 每日榜单抓取与持久化（DailyRankService）
+│   │   ├── notifier.py        # Telegram 通知封装（含3次重试+指数退避）
+│   │   ├── manager.py         # 监控列表管理（增删查）
+│   │   ├── news_intel.py      # 新闻情报层（新闻强度分/兜底归因）
+│   │   ├── repository.py      # watchlist.json 读写（线程安全单例）
+│   │   └── resolver.py        # 股票代码识别（规则匹配+联网搜索）
+│   │   ├── us_premarket_scanner_service.py # 美股盘前猎手
+│   │   ├── trend_service.py        # Trend 种子池与日线管理
+│   │   ├── trend_report_service.py # Trend 报告组装与推送
+│   │   ├── daily_summary_service.py # 每日标的汇总TXT
+│   │   ├── daily_rank_service.py   # 每日榜单抓取与持久化
+│   │   └── ipo_calendar_service.py # 次日新股预告
+│   ├── analysis/
+│   │   └── heatmap.py         # 热门榜单生成+LLM归因+Telegram推送
+│   └── probing/
+│       ├── async_prober.py    # 异步行情探针（aiohttp + Semaphore并发控制 + tenacity重试）
+│       └── market.py          # 市场时间工具
+├── strategies/
+│   └── chain_mining.py        # 产业链RAG挖掘策略
+├── interface/
+│   └── telegram_bot.py        # Telegram Bot 命令处理
+├── data/
+│   ├── meta.db                # SQLite：资产基础信息
+│   ├── ledger.db              # SQLite：日榜记录、预警记录
+│   ├── watchlist.json         # JSON：自选股监控列表（含chat_id绑定）
+│   ├── vector_store/          # ChromaDB 持久化目录
+│   └── cache/                 # DiskCache 行情缓存
+└── tests/
+    └── run_all_features.py    # E2E 集成测试脚本
+```
+
+---
+
+## 三、数据存储架构（3层 + 1缓存）
+
+### 3.1 `meta.db`（SQLite，元数据）
+
+| 表 | 字段 | 说明 |
+|---|---|---|
+| `asset` | symbol, name, market, industry, listing_status | 股票基础信息 |
+
+### 3.2 `ledger.db`（SQLite，业务记录）
+
+| 表 | 关键字段 | 说明 |
+|---|---|---|
+| `dailyrank` | date, market, rank_type, symbol, name, price, change_pct, amount, turnover_rate | 每日榜单 |
+| `watchlistalert` | symbol, name, market, alert_reason, price, change_pct, status | 异动预警记录 |
+| `papertrade` | symbol, name, market, entry_date, entry_price, status, exit_price, pnl_pct, review_status, review_attempts, review_error, review_source, last_reviewed_at | AI 模拟投研复盘（含状态机与失败追踪） |
+
+### 3.3 `vector_store`（ChromaDB，语义知识库）
+
+| Collection | 内容 | 用途 |
+|---|---|---|
+| `company_chunks` | 公司画像分块文本 | 公司语义检索、产业链映射 |
+| `industry_knowledge` | 研报摘要、产业链结构描述 | RAG 产业链挖掘 |
+| `market_events` | 异动归因 + 定向新闻事件 | 复盘/异动兜底/趋势新闻强度 |
+| `entity_relation` | 供应链关系三元组 | 知识图谱查询 |
+
+### 3.4 `data/cache/`（DiskCache，运行时缓存）
+
+通过 `@cached(key, ttl)` 装饰器对 AkShare API 结果缓存：
+- 行情数据 TTL = 60s
+- 股票列表、财务数据 TTL = 1h / 24h
+
+---
+
+## 四、定时任务一览
+
+由 `APScheduler (BackgroundScheduler)` 管理，系统启动后自动运行：
+
+| Job | 触发方式 | 功能 |
+|---|---|---|
+| `sync_news` | `NEWS_SYNC_INTERVAL_MINUTES`（默认120分钟） | 定向新闻同步（trend/heatmap + 自选/持仓）到 `market_events` |
+| `monitor_scan` | **每 1 分钟** | 自选股异动监控 → Telegram推送 |
+| `commodity_scan` | 周二至周六 08:00 | 大宗商品每日固定战报 → Telegram推送 |
+| `cn_heatmap` | 工作日 17:35 | A股当日Trend算法榜 → Telegram推送（与daily_summary A股段同源） |
+| `hk_heatmap` | 工作日 17:30 | 港股热门榜单 → Telegram推送 |
+| `us_heatmap` | 周二至周六 07:00 | 美股热门榜单 → Telegram推送 |
+| `us_asset_universe_sync` | 每天 05:30 | Nasdaq 官方证券表增量同步，补齐美股新股与代码变更 |
+| `us_premarket_hunter` | 工作日 20:00/21:00 | 美股盘前猎手（函数内按纽约08:00守卫，自动兼容DST） |
+| `sync_reports` | 每天 18:00 | 同步行业研报到ChromaDB |
+| `sync_fundamentals` | 每天 02:00 | 全量财务数据+公司画像更新 |
+| `trend_7d` | 每周日 10:00 | 7日趋势简报推送 |
+| `trend_30d` | 每月最后一天 11:00 | 30日趋势简报推送 |
+| `daily_summary` | 工作日 18:00 | 每日综合汇总TXT（A股Trend日榜 + 港/美Heatmap + 大宗商品） |
+| `trend_pool_refresh_cn_hk` | 工作日 19:10 | 趋势池日线补齐(A/H) |
+| `trend_pool_refresh_cn_hk_retry` | 工作日 21:10 | 趋势池日线补齐(A/H)重试 |
+| `trend_pool_refresh_us_cf` | 周二至周六 08:10 | 趋势池日线补齐(US/CF) |
+| `trend_pool_refresh_us_cf_retry` | 周二至周六 10:10 | 趋势池日线补齐(US/CF)重试 |
+| `ipo_tomorrow` | 每天 16:30 | 次日新股预告推送（A/H/US） |
+| `paper_trade_check` | 每天 19:20 | 模拟交易到期检查与自动平仓复盘推送 |
+
+---
+
+## 五、功能模块详解
+
+### 5.1 个股异动监控（`MonitorService`）
+
+**数据流：**
+```
+watchlist.json → 过滤开盘中标的 → AsyncMarketProber（新浪 HQ 异步批量拉取）
+→ 检查涨跌幅阈值（默认3%，可按股设置）→ 冷却判断（同一日只触发一次）
+→ 线程池提交 _analyze_and_report（多源搜索 + LLM归因）
+→ 单条完整消息推送 Telegram（价格+归因+置信度+摘要）
+→ 归因结果存入 ChromaDB market_events
+```
+
+**市场开盘时间（时区感知）：**
+- CN（上海）：09:30-11:35，13:00-15:30，仅工作日
+- HK（香港）：09:30-12:05，13:00-16:30，仅工作日
+- US（纽约）：09:30-16:30，仅工作日
+
+**归因步骤（`_analyze_and_report`）：**
+1. 并发双路搜索（个股专项 + 大盘板块背景）
+2. LLM结构化输出（`AnalysisResult`：reason/confidence/summary/sources）
+3. 组装单条紧凑消息后发送（**不再两阶段发送**）
+4. 若 LLM 不可用，使用 `news_intel.build_fallback_reason` 基于近端事件兜底归因，并附带新闻强度
+
+### 5.2 全市场长线趋势挖掘（`/trend` 生态）
+
+**架构流转：**
+```
+每日收盘盘后 (CN/HK/US/商品) → 提取热点候选 → 归因
+→ 存入 SQLite TrendSeedPool (带30日滚动清理)
+→ 用户触发 /trend N → 提取 N日内种子池
+→ 获取所有初筛池标的 当前价 vs N天前真实收盘价
+→ 聚合同池标的多日异动理由 + 近端新闻强度（news_intel）→ 送入大模型提取【产业链/宏观主线归因】
+→ Telegram 并发分包投递长线深度研报
+```
+
+Trend 数据一致性约束：
+
+- 现价与区间涨幅使用同一个价格端点；普通 Trend 刷新价格时会批量合并本地日线，并按新末端重新定位 N 日基准，避免“新价格 + 旧涨幅”拼接和窗口漂移。
+- 慢趋势榜先把三地实时行情并入本地序列，再计算 20/60 日收益、MA20/60、入榜门槛与评分。
+- 20/60/90/180 日收益必须存在接近目标日期的真实基准点；历史不足时不再用最早记录冒充完整周期。
+- 趋势池定时历史窗口为 120 天；慢趋势查询发现候选历史稀疏时会限量在内存自修复，持久化统一交给定时补齐任务，并先排除杠杆产品，避免无效请求、重复写库和日志噪声。
+- 多日收益遇到未复权的拆股/反向拆股级价格跳变会判为无效，普通 Trend 同样强制排除杠杆产品，避免公司行动制造虚假超高涨幅。
+- 当日强势只在本地榜单日期等于当天时刷新行情，并直接采用实时当日涨跌幅；历史日榜保持日期绑定。
+
+### 5.2 大宗商品监控（`CommodityScanner`）
+
+**功能定位：**
+每天 **08:00 定时执行**的盘前大宗商品战报，涵盖前一日日盘及夜盘的全貌，不再产生高频碎片化推送。
+
+**数据流：**
+```
+ak.futures_display_main_sina()（拉取全市场约 80+ 个实物主力合约）
+→ 逐个查询 ak.futures_zh_spot(market="CF") 截面收盘数据
+→ 按内置的 5 大骨干分类字典（贵金属、黑色系、化工、农产品、特殊）进行静态归置
+→ （特殊防御逻辑：匹配不到的新品种统一兜底至“航运及特殊”板块）
+→ 每个板块按当日绝对涨幅降序排列，各自精准截断 Top 3（且仅筛选涨幅 > 0%）
+→ 将最高 15 个品种提交 _analyze_and_push：
+    ├── 聚合各板块最新资讯
+    ├── LLM 以“板块”为维度，结构化输出（SectorAnalysis）：
+    │   ├── 提炼板块集体异级的核心【宏观催化剂】
+    │   └── 映射 A/港股核心【受益标的】
+    └── 组装为【图文并茂的单条每日复盘战报】
+→ Notifier.broadcast() 发送
+```
+
+### 5.3 每日榜单（`DailyRankService`）
+
+补充：每日 18:00 汇总 TXT（`daily_summary`）已合并为单文件口径：
+- A股：复用 Heatmap 页面 `Trend算法榜(days=1)`，默认 `12` 支，市值分层为 `large>=1200亿 / mid=400~1200亿 / small=1~400亿`，默认配额 `large/mid/small = 4/5/3`；日榜评分按涨停幅度归一化（主板10%、创业/科创20%、北交30%），近涨停边界抹平，并对创业/科创强势标的默认 `1.05x` 轻量提权
+- 港股：复用 Heatmap 日榜，默认 `7` 支
+- 美股：复用 Heatmap 日榜，默认 `12` 支
+- 大宗商品：保留原战报标的段
+
+股票行统一输出 `现价 | 涨幅 | 市值`，A股 Trend 段额外输出 `成交额 | 评分 | 行业 | 催化`。
+
+**数据流：**
+```
+检查 _should_sync_today()（CN/HK跳过周末，US跳过周日/周一北京时间）
+→ 检查当天是否已同步
+→ akshare_client.get_daily_top_ranks(market, rank_type, top_n=10)：
+    ├── CN：ak.stock_zh_a_spot_em() → 粗排300条 → _distill_ranks精排
+    ├── HK：ak.stock_hk_spot_em()
+    └── US：ak.stock_us_spot_em()
+→ 存入 ledger.db DailyRank 表
+→ Top3 提交 AI 归因（_analyze_and_report）
+```
+
+**精排算法（`_distill_ranks`）：**
+- 综合评分 = 涨幅归一化×40% + 换手率归一化×40% + 成交额归一化×20%
+
+### 5.4 热门榜单（`MarketHeatMap` + 新闻强度重排）
+
+**CN 热榜（当前版本：五因子评分 + 市场状态切换）**
+- 候选池硬漏斗：`成交额 >= 2亿`，总市值已知时要求 `总市值 >= 50亿`
+- 入池阈值：按板块使用绝对涨幅线，避免 20cm 大票被统一归一化门槛误杀
+  - 主板：`涨幅 >= 5%`
+  - 创业板/科创板：`涨幅 >= 6%`
+  - 北交所：`涨幅 >= 8%`
+  - 极弱市兜底：默认降级为 `4% / 5% / 6%`
+- 归一化涨幅：仍按主板 10%、创业板/科创板 20%、北交所 30% 计算，作为涨幅评分因子
+- 近涨停抹平：`0.97~1.03` 统一视作 `1.0`，避免 19.98/19.99 这类噪声
+- 换手率因子：
+  - 优先使用实时换手率
+  - 缺失时用近似换手率回填：`amount / (circ_mv_100m * 1e8) * 100`
+- 市值因子：
+  - 候选池内按成交额优先抓取总市值（腾讯接口），`log1p` 后做百分位评分
+  - 目标是提高大票趋势线标的权重，而非硬性过滤
+- 趋势延续因子：
+  - 综合近 5/10 日动量 + 近阶段新高特征（来自 `TrendDailyBar`）
+- FOMO 惩罚（高位派发检测）：
+  - 用上影线比率 + 成交额 vs MA5 判断疑似派发
+  - 触发时 heat_score 乘以 `FOMO_PENALTY_FACTOR`（默认 0.95）降权
+- 最终评分（默认）= 五因子加权：
+  - `rank_pct + rank_log_amount + rank_turnover + rank_mcap + rank_trend`
+  - 震荡市默认：`0.16/0.30/0.20/0.24/0.10`
+  - 趋势市默认：`0.22/0.28/0.20/0.18/0.12`
+  - 程序会基于"上涨占比>=60%"且"全市场成交额>=近7日均量*1.05"自动切换权重
+  - 可叠加新闻强度重排：`heat_score_v2 = (1-HEATMAP_W_NEWS)*rank(heat_score)+HEATMAP_W_NEWS*news_intensity`
+- 结构性加成：创业板/科创板且涨幅 >10%，默认 `1.10x`
+
+**HK/US 热榜筛选规则**
+- 涨幅 ≥ 5%，成交额过滤仙股
+- 评分 = 涨幅百分位 + 成交额百分位 + 换手率百分位
+- HK 市值补齐：`Finnhub profile2` 优先 → `Yahoo Finance` 兜底，TTL=600s
+- **US 市值多源回退**：
+  - `get_us_market_metrics()`：Finnhub → Yahoo Finance → DiskCache（TTL=1800s）
+  - **市值获取失败不丢票**：未拿到市值的标的保留入榜，仅不给超大市值乘数
+  - 仅对"已知市值 >= 门槛"的标的执行硬过滤
+  - 市值查询量上限：默认取前 160 只候选（可配置 `US_HEAT_MCAP_FETCH_CAP`）
+- US 额外：去权证、同底层杠杆ETF去重；并做市值过滤
+- 美股超大市值提权：>500亿美金 *1.3，>1000亿 *1.6，>3000亿 *2.0
+- 美股代码覆盖：Nasdaq 官方 Screener 每 6 小时缓存、每日 05:30 增量写入 `meta.asset`；Heatmap 拉取时再合并一次当前官方证券表，避免新股或临时代码切换因本地资产表滞后而漏票。
+
+
+### 5.4.1 美股盘前猎手（`USPremarketScannerService`）
+
+- 扫描时点：北京时间 20:00/21:00 双触发，函数内仅在纽约时间工作日 08:00 执行（防重复且自动兼容夏令时）
+- 数据源：Yahoo quote 接口（`preMarketPrice` / `preMarketVolume` / `preMarketChangePercent` / `marketCap`）
+- 入池门槛：
+  - 盘前成交额 `preMarketPrice * preMarketVolume > 500万 USD`
+  - `abs(盘前涨跌幅) > 5%`
+  - `总市值 > 10亿 USD`
+- 输出：按盘前成交额与波动排序，推送 Top 5 至 Telegram
+
+### 5.4.2 市值获取多源回退与限流防护
+
+为降低 Finnhub API 免费额度压力，市值相关调用统一做以下优化：
+
+| 调用链路 | 缓存策略 | 回退源 | 说明 |
+|---|---|---|---|
+| `get_us_market_metrics()` | DiskCache TTL=1800s | Finnhub → yfinance | 硬过滤前只查 Top N 候选（默认160） |
+| `get_hk_market_metrics()` | DiskCache TTL=600s | Finnhub → yfinance | 港股市值 |
+| `FinnhubProvider.get_quote()` | DiskCache TTL=120s | — | Trend 报告 US 价格刷新，避免重复调 |
+| `industry_intel` 行业标签 | 复用 `get_*_market_metrics` 缓存 | — | 不再裸调 Finnhub 行业接口 |
+
+**关键容错设计：**
+- 市值拉取失败 **不剔除股票**，仅不给予超大市值乘数
+- 并发线程数从 12 降至 8，降低瞬时请求峰值
+- Finnhub 行业标签通过已有 `profile2` 缓存复用，零额外请求
+
+### 5.5 ReAct Agent（`ReactAgent`）
+
+手动实现的 ReAct 循环（无需 LangChain），最多6轮工具调用：
+
+| 指令格式 | 对应工具 | 功能 |
+|---|---|---|
+| `SEARCH: 关键词` | `Tools.web_search` | 并发多搜索引擎聚合（SearXNG/Tavily/Bocha） |
+| `QUOTE: 代码或名称` | `Tools.get_quote` | 多源行情（Finnhub → AkShare → Tushare） |
+| `DB: 关键词` | `Tools.database_search` | ChromaDB 公司画像语义搜索 |
+
+### 5.6 模拟交易与复盘（`PaperTradingService` + `PaperTradeReviewer`）
+
+**交互命令：**
+- `/buy 代码 [天数] [逻辑]`：建仓并进入跟踪
+- `/sell 代码`：平仓并立即触发复盘
+- `/review 代码`：手动复盘最近一笔交易记录
+- `/holds`：查看当前持仓
+
+**复盘状态机：**
+- `PENDING`：待复盘
+- `DONE`：复盘成功
+- `FAILED`：复盘失败（记录 `review_error`）
+
+**可靠性改进：**
+- `/sell` 与 `/review` 都会持久化复盘结果，不再“只推送不落库”
+- 复盘事件优先消费 `targeted_news`，并注入“新闻强度/新闻条数”到复盘 Prompt
+- 自动到期复盘任务失败不会阻断调度主流程
+- 复盘记录保留 `review_attempts/review_source/last_reviewed_at` 便于追踪
+
+
+---
+
+## 六、Telegram Bot 指令
+
+| 指令 | 功能 |
+|---|---|
+| `/add 代码或名称` | 添加自选股监控（自动识别A股/港股/美股） |
+| `/list` | 查看当前监控列表 |
+| `/del 代码` | 移除监控标的 |
+| `/quote 代码` | 实时行情查询 |
+| `/chain 产业名` | 产业链深度挖掘 (已过滤 AI 推理过程) |
+| `/buy 代码 [天数] [逻辑]`| 模拟建仓并进入跟踪状态 |
+| `/sell 代码` | 模拟平仓并输出 AI 深度回测报告 |
+| `/holds` | 查看当前正在进行的模拟持仓列表 |
+| `/review 代码` | 手动提取特定股票的最新 AI 回测复盘 |
+| 任意文本 | 触发 AI 投研问答（被@或群内直接提及即可） |
+
+---
+
+## 七、搜索数据源（DataManager 路由）
+
+`DataManager` 并发调用所有可用搜索源，自动过滤失去响应的源：
+
+| Provider | 类型 | 配置方式 |
+|---|---|---|
+| `SearXNGProvider` | 搜索 | `localhost:8080`（本地部署） |
+| `TavilyProvider` | 搜索 | `TAVILY_API_KEY` 环境变量 |
+| `BochaProvider` | 搜索 | `BOCHA_API_KEY` 环境变量 |
+| `FinnhubProvider` | 行情 | `FINNHUB_API_KEY` 环境变量 |
+| `AkShareProvider` | 行情 | 免费，内置 |
+| `TushareProvider` | 行情 | `TUSHARE_TOKEN` 环境变量 |
+
+---
+
+## 八、环境配置
+
+复制 `.env.example` 为 `.env` 并填写以下配置：
+
+```env
+# LLM（必填）
+OPENAI_API_KEY=sk-...
+OPENAI_API_BASE=https://api.openai.com/v1   # 可替换为任何兼容接口
+OPENAI_MODEL=gpt-4o-mini
+
+# Telegram Bot（必填）
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_ADMIN_ID=...          # 接收广播推送的群组ID或个人ID (建议填入群组以实现群发)
+ALLOWED_USER_IDS=...           # 允许私聊使用的个人ID，逗号分隔
+ALLOWED_GROUP_IDS=...          # 允许该群组成员全体使用的群组ID，逗号分隔
+
+# Web 登录（可选）
+WEB_USERNAME=game2du
+WEB_USERS_JSON='{"game2du":{"role":"admin","chat_id":...},"user2":{"role":"user","chat_id":-1002}}'
+WEB_TRADE_HISTORY_SCOPE=user       # user=各账号隔离；admin/all=仅管理员可看全部交易历史
+
+# 搜索（至少配置一个，否则定向新闻/LLM归因无新闻来源）
+BOCHA_API_KEY=...
+TAVILY_API_KEY=...
+
+# 可选行情补充
+FINNHUB_API_KEY=...
+TUSHARE_TOKEN=...
+
+# 定向新闻同步（建议）
+NEWS_SYNC_INTERVAL_MINUTES=120
+NEWS_TARGET_MAX_SYMBOLS=24
+NEWS_LIMIT_PER_SOURCE=2
+NEWS_SEARCH_TIMEOUT=12
+NEWS_TREND_LOOKBACK_DAYS=2
+NEWS_RANK_LOOKBACK_DAYS=1
+
+# Heatmap 新闻强度（可选）
+HEATMAP_W_NEWS=0.12
+HEATMAP_NEWS_LOOKBACK_DAYS=3
+
+# Trend 新闻强度（可选）
+TREND_NEWS_BOOST=0.18
+TREND_NEWS_LOOKBACK_DAYS=7
+
+# A股 Heatmap 五因子参数（可选）
+CN_HEAT_MAIN_PCT_MIN=5.0
+CN_HEAT_20CM_PCT_MIN=6.0
+CN_HEAT_BJ_PCT_MIN=8.0
+CN_HEAT_MAIN_PCT_FALLBACK_MIN=4.0
+CN_HEAT_20CM_PCT_FALLBACK_MIN=5.0
+CN_HEAT_BJ_PCT_FALLBACK_MIN=6.0
+CN_HEAT_NEAR_LIMIT_LOW=0.97
+CN_HEAT_NEAR_LIMIT_HIGH=1.03
+CN_HEAT_GEM_BONUS=1.10
+CN_HEAT_TURNOVER_FETCH_CAP=220
+CN_HEAT_MCAP_FETCH_CAP=260
+CN_HEAT_TREND_LOOKBACK_DAYS=20
+
+# FOMO 高位派发惩罚（可选）
+FOMO_UPPER_SHADOW_PCT=0.03     # 上影线阈值
+FOMO_PENALTY_FACTOR=0.95       # 触发后的降权乘数
+
+# US Heatmap 市值查询参数（可选）
+US_HEAT_MCAP_FETCH_CAP=160     # 最多查多少只候选股的市值
+
+# A股 Heatmap 市场状态切换阈值（可选）
+CN_HEAT_REGIME_POS_RATIO=0.60
+CN_HEAT_REGIME_MEDIAN_PCT=1.00
+
+# 震荡市权重（pct/amount/turnover/mcap/trend）
+CN_HEAT_W_PCT_RANGE=0.16
+CN_HEAT_W_AMOUNT_RANGE=0.30
+CN_HEAT_W_TURNOVER_RANGE=0.20
+CN_HEAT_W_MCAP_RANGE=0.24
+CN_HEAT_W_TREND_RANGE=0.10
+
+# 趋势市权重（pct/amount/turnover/mcap/trend）
+CN_HEAT_W_PCT_TREND=0.22
+CN_HEAT_W_AMOUNT_TREND=0.28
+CN_HEAT_W_TURNOVER_TREND=0.20
+CN_HEAT_W_MCAP_TREND=0.18
+CN_HEAT_W_TREND_TREND=0.12
+```
+
+### Web 多账号隔离说明
+
+轻量 Web 账号由 `.env` 的 `WEB_USERS_JSON` 配置，不引入密码体系。`WEB_USERNAME` 对应主账号，继续读写原有 `data/watchlist.json`；其他 Web 账号会读写 `data/watchlists/<username>.json`。`holds` 与交易历史按账号的 `chat_id` 隔离，非管理员即使配置了 `WEB_TRADE_HISTORY_SCOPE=all` 也不会看到其他账号数据。
+
+---
+
+## 九、快速启动
+
+> 单实例说明：同一个 Telegram Bot Token 必须只运行一个进程，否则会出现 `409 Conflict`。
+
+脚本会自动检测是否安装了 `trade_db.service`（systemd），优先使用 systemd 管理：
+
+```bash
+# 1. 安装依赖
+pip install -r requirements.txt
+
+# 2. 配置环境
+cp .env.example .env
+# 编辑 .env 填写 Token
+
+# 3. 启动
+sh run.sh        # 有 systemd 则 systemctl start；无则 nohup
+
+# 4. 查看实时日志
+tail -f trade_db.log
+# 若使用 systemd：journalctl -u trade_db.service -f
+
+# 5. 重启（更新代码后用）
+sh restart.sh    # systemctl restart 或 stop+run
+
+# 6. 停止服务
+sh stop.sh       # systemctl stop 或 kill
+```
+
+---
+
+## 十、技术栈
+
+| 类目 | 选型 |
+|---|---|
+| 语言 | Python 3.12 |
+| 关系数据库 | SQLite + SQLModel |
+| 向量数据库 | ChromaDB（本地持久化） |
+| 运行时缓存 | DiskCache |
+| 定时调度 | APScheduler |
+| 异步行情 | aiohttp + tenacity |
+| LLM | OpenAI SDK（兼容 DeepSeek、通义、本地模型） |
+| Embedding | `BAAI/bge-small-zh-v1.5`（CPU） |
+| 市场数据 | AkShare（主）+ 新浪 HQ API（行情）|
+| Telegram | python-telegram-bot |

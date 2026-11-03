@@ -1,0 +1,626 @@
+
+"""
+Task Scheduler - 核心调度系统
+"""
+import logging
+import time
+import os
+import gc
+import datetime as dt
+from zoneinfo import ZoneInfo
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+
+# Import modules (Lazy import inside functions to avoid circular deps if any)
+from modules.ingestion.sync_news import news_syncer
+from modules.ingestion.sync_reports import report_syncer
+from modules.ingestion.sync_financial import financial_syncer
+from modules.ingestion.sync_profile import profile_syncer
+from modules.ingestion.sync_relations import relation_syncer
+from modules.analysis.heatmap import heatmap_service
+from modules.monitor.ipo_calendar_service import ipo_calendar_service
+from modules.monitor.us_premarket_scanner_service import us_premarket_scanner_service
+
+logger = logging.getLogger(__name__)
+
+class TaskScheduler:
+    """
+    任务调度器
+    """
+    def __init__(self):
+        # 固定调度时区，避免部署机器时区变化导致任务错时执行
+        self.scheduler = BackgroundScheduler(
+            timezone="Asia/Shanghai",
+            job_defaults={
+                # 长任务错过调度点时合并执行，避免堆积补跑
+                "coalesce": True,
+                # 同一任务禁止并发重入，避免扫描和同步任务叠加
+                "max_instances": 1,
+                # 允许 5 分钟内的触发误差，超过则丢弃该次执行
+                "misfire_grace_time": 300,
+            },
+        )
+        self.jobs = []
+        self._job_stats = {}
+        self._obs_enabled = os.getenv("SCHED_OBS_ENABLED", "1") == "1"
+        self._obs_interval_minutes = max(5, int(os.getenv("SCHED_OBS_INTERVAL_MIN", "30") or 30))
+        self._slow_job_ms = max(1000, int(os.getenv("SCHED_SLOW_JOB_MS", "120000") or 120000))
+
+    def start(self):
+        """启动调度器"""
+        self._register_jobs()
+        self.scheduler.start()
+        logger.info("Task Scheduler started.")
+
+    def stop(self):
+        """停止调度器"""
+        self.scheduler.shutdown()
+        logger.info("Task Scheduler stopped.")
+
+    def _register_jobs(self):
+        """注册所有定时任务"""
+        
+        # 1. 实时新闻监控 —— 已禁用（ChromaDB 关闭，节省内存）
+        # self.scheduler.add_job(
+        #     self._job_sync_news,
+        #     IntervalTrigger(minutes=int(os.getenv("NEWS_SYNC_INTERVAL_MINUTES", "120") or 120)),
+        #     id="sync_news",
+        #     name="实时新闻监控",
+        #     replace_existing=True
+        # )
+        
+        # 2. 研报同步 —— 已禁用（ChromaDB 关闭，节省内存）
+        # self.scheduler.add_job(
+        #     self._job_sync_reports,
+        #     CronTrigger(hour=18, minute=0),
+        #     id="sync_reports",
+        #     name="研报同步",
+        #     replace_existing=True
+        # )
+
+        # 3. 异动监控 (每 1 分钟)
+        self.scheduler.add_job(
+            self._job_monitor_scan,
+            IntervalTrigger(minutes=1),
+            id="monitor_scan",
+            name="股票异动监控",
+            replace_existing=True
+        )
+        
+        # 3.5 大宗商品每日龙虎榜战报 (周二至周六 08:00，涵盖前一日日盘及夜盘)
+        self.scheduler.add_job(
+            self._job_commodity_scan,
+            CronTrigger(day_of_week='tue-sat', hour=8, minute=0),
+            id="commodity_scan",
+            name="大宗商品每日战报",
+            replace_existing=True
+        )
+
+        self.scheduler.add_job(
+            self._job_macro_dashboard,
+            IntervalTrigger(minutes=15),
+            id="macro_dashboard",
+            name="宏观与外盘商品看板快照",
+            replace_existing=True
+        )
+        
+        # 4. CN 热度榜单 (工作日 17:35，错开港股避免OOM)
+        self.scheduler.add_job(
+            self._job_cn_heatmap,
+            CronTrigger(day_of_week='mon-fri', hour=17, minute=35),
+            id="cn_heatmap",
+            name="A股热门榜单",
+            replace_existing=True
+        )
+
+        # 4.1 HK 热度榜单 (工作日 17:30，留时间发酵盘后新闻)
+        self.scheduler.add_job(
+            self._job_hk_heatmap,
+            CronTrigger(day_of_week='mon-fri', hour=17, minute=30),
+            id="hk_heatmap",
+            name="港股热门榜单",
+            replace_existing=True
+        )
+
+        # 5. US 热度榜单 (周二至周六 07:00，对应美股周一到周五收盘后)
+        self.scheduler.add_job(
+            self._job_us_heatmap,
+            CronTrigger(day_of_week='tue-sat', hour=7, minute=0),
+            id="us_heatmap",
+            name="美股热门榜单",
+            replace_existing=True
+        )
+
+        # 5.0 美股证券表增量同步（每日 05:30，先于盘后热榜）
+        self.scheduler.add_job(
+            self._job_us_asset_universe_sync,
+            CronTrigger(hour=5, minute=30),
+            id="us_asset_universe_sync",
+            name="美股证券表增量同步",
+            replace_existing=True
+        )
+
+        # 5.1 美股盘前猎手（北京时间 20:00/21:00 双触发，函数内按纽约时间08:00守卫）
+        self.scheduler.add_job(
+            self._job_us_premarket_hunter,
+            CronTrigger(day_of_week="mon-fri", hour=20, minute=0),
+            id="us_premarket_hunter_2000",
+            name="美股盘前猎手(20:00)",
+            replace_existing=True
+        )
+        self.scheduler.add_job(
+            self._job_us_premarket_hunter,
+            CronTrigger(day_of_week="mon-fri", hour=21, minute=0),
+            id="us_premarket_hunter_2100",
+            name="美股盘前猎手(21:00)",
+            replace_existing=True
+        )
+        
+        # 6. 基本面/财务/画像深度全量更新 (每天 02:00)
+        self.scheduler.add_job(
+            self._job_sync_fundamentals,
+            CronTrigger(hour=2, minute=0),
+            id="sync_fundamentals",
+            name="基本面及画像同步",
+            replace_existing=True
+        )
+        
+        # 7. Trend 7日简报 (每周日 10:00)
+        self.scheduler.add_job(
+            self._job_trend_7d,
+            CronTrigger(day_of_week='sun', hour=10, minute=0),
+            id="trend_7d",
+            name="7日趋势简报",
+            replace_existing=True
+        )
+        
+        # 8. Trend 30日简报 (每月最后一天 11:00)
+        self.scheduler.add_job(
+            self._job_trend_30d,
+            CronTrigger(day='last', hour=11, minute=0),
+            id="trend_30d",
+            name="30日趋势简报",
+            replace_existing=True
+        )
+
+        # 9. 每日推送标的汇总 TXT (工作日 18:00，北京时间)
+        self.scheduler.add_job(
+            self._job_daily_summary,
+            CronTrigger(day_of_week='mon-fri', hour=18, minute=0),
+            id="daily_summary",
+            name="每日推送标的汇总",
+            replace_existing=True
+        )
+
+        # 10. 趋势池日线补齐（A/H）: 工作日 19:10
+        self.scheduler.add_job(
+            self._job_trend_pool_refresh_cn_hk,
+            CronTrigger(day_of_week='mon-fri', hour=19, minute=10),
+            id="trend_pool_refresh_cn_hk",
+            name="趋势池日线补齐(A/H)",
+            replace_existing=True
+        )
+
+        # 10.1 趋势池日线补齐（A/H）重试: 工作日 21:10
+        self.scheduler.add_job(
+            self._job_trend_pool_refresh_cn_hk_retry,
+            CronTrigger(day_of_week='mon-fri', hour=21, minute=10),
+            id="trend_pool_refresh_cn_hk_retry",
+            name="趋势池日线补齐(A/H)-重试",
+            replace_existing=True
+        )
+
+        # 11. 趋势池日线补齐（US/CF）: 周二至周六 08:10
+        self.scheduler.add_job(
+            self._job_trend_pool_refresh_us_cf,
+            CronTrigger(day_of_week='tue-sat', hour=8, minute=10),
+            id="trend_pool_refresh_us_cf",
+            name="趋势池日线补齐(US/CF)",
+            replace_existing=True
+        )
+
+        # 11.1 趋势池日线补齐（US/CF）重试: 周二至周六 10:10
+        self.scheduler.add_job(
+            self._job_trend_pool_refresh_us_cf_retry,
+            CronTrigger(day_of_week='tue-sat', hour=10, minute=10),
+            id="trend_pool_refresh_us_cf_retry",
+            name="趋势池日线补齐(US/CF)-重试",
+            replace_existing=True
+        )
+
+        # 12/13. DailyRank 独立同步任务（默认关闭）
+        # 当前主链路由 heatmap 直接写入 ledger.dailyrank，避免双链路口径冲突。
+        if os.getenv("ENABLE_DAILY_RANK_JOB", "0") == "1":
+            self.scheduler.add_job(
+                self._job_daily_rank_cn_hk,
+                CronTrigger(day_of_week='mon-fri', hour=18, minute=50),
+                id="daily_rank_cn_hk",
+                name="每日榜单同步(CN/HK)",
+                replace_existing=True
+            )
+
+            self.scheduler.add_job(
+                self._job_daily_rank_us,
+                CronTrigger(day_of_week='tue-sat', hour=8, minute=5),
+                id="daily_rank_us",
+                name="每日榜单同步(US)",
+                replace_existing=True
+            )
+        else:
+            logger.info("DailyRank standalone jobs disabled; heatmap pipeline will persist DailyRank directly.")
+
+        # 13.5 明日新股预告 (每天 16:30)
+        self.scheduler.add_job(
+            self._job_ipo_tomorrow,
+            CronTrigger(hour=16, minute=30),
+            id="ipo_tomorrow",
+            name="明日新股预告",
+            replace_existing=True
+        )
+
+        # 13.6 机构筹码低频缓存：SEC 13F 只在新季度数据出现时下载，HK CCASS 每日刷新汇总缓存
+        self.scheduler.add_job(
+            self._job_institutional_cache_refresh,
+            CronTrigger(hour=3, minute=30),
+            id="institutional_cache_refresh",
+            name="机构筹码低频缓存",
+            replace_existing=True
+        )
+
+        # 13.7 Trend 多源种子池刷新：自选/持仓、DailyRank、大票基线
+        self.scheduler.add_job(
+            self._job_trend_seed_pool_refresh,
+            CronTrigger(hour=3, minute=45),
+            id="trend_seed_pool_refresh",
+            name="Trend多源种子池刷新",
+            replace_existing=True
+        )
+
+        # 14. 模拟交易到期检查 (每天 19:20 扫一波)
+        self.scheduler.add_job(
+            self._job_paper_trade_check,
+            CronTrigger(hour=19, minute=20),
+            id="paper_trade_check",
+            name="模拟交易到期检查",
+            replace_existing=True
+        )
+
+        if self._obs_enabled:
+            self.scheduler.add_job(
+                self._job_observability_heartbeat,
+                IntervalTrigger(minutes=self._obs_interval_minutes),
+                id="observability_heartbeat",
+                name="系统观测心跳",
+                replace_existing=True
+            )
+
+        logger.info(f"Registered {len(self.scheduler.get_jobs())} jobs.")
+
+    @staticmethod
+    def _current_rss_mb() -> float:
+        try:
+            with open('/proc/self/status', 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        return round(float(line.split()[1]) / 1024.0, 1)
+        except Exception:
+            pass
+        return 0.0
+
+    def _update_job_stats(self, job_id: str, duration_ms: int, ok: bool):
+        stats = self._job_stats.get(job_id)
+        if not stats:
+            stats = {"runs": 0, "fails": 0, "dur_sum": 0, "dur_max": 0}
+            self._job_stats[job_id] = stats
+
+        stats["runs"] += 1
+        stats["dur_sum"] += max(0, int(duration_ms or 0))
+        stats["dur_max"] = max(int(stats.get("dur_max", 0)), max(0, int(duration_ms or 0)))
+        if not ok:
+            stats["fails"] += 1
+
+    def _job_observability_heartbeat(self):
+        """低频健康心跳：聚合输出，避免高频日志膨胀。"""
+        if not self._job_stats:
+            logger.info("HEARTBEAT | rss_mb=%.1f | jobs=0", self._current_rss_mb())
+            return
+
+        total_runs = sum(int(v.get("runs", 0)) for v in self._job_stats.values())
+        total_fails = sum(int(v.get("fails", 0)) for v in self._job_stats.values())
+        fail_rate = (total_fails / total_runs * 100.0) if total_runs else 0.0
+
+        hot = []
+        for job_id, v in self._job_stats.items():
+            runs = int(v.get("runs", 0))
+            avg = int(v.get("dur_sum", 0) / runs) if runs else 0
+            hot.append((int(v.get("fails", 0)), avg, job_id, runs, int(v.get("dur_max", 0))))
+        hot.sort(reverse=True)
+        top = hot[:4]
+        top_text = "; ".join([f"{jid}(r={r},f={f},avg={a}ms,max={m}ms)" for f, a, jid, r, m in top])
+
+        logger.info(
+            "HEARTBEAT | rss_mb=%.1f | jobs=%s | runs=%s | fails=%s | fail_rate=%.2f%% | top=%s",
+            self._current_rss_mb(),
+            len(self._job_stats),
+            total_runs,
+            total_fails,
+            fail_rate,
+            top_text,
+        )
+
+    def _run_job(self, job_id: str, func, *args, **kwargs):
+        """统一任务执行包装：低噪音 + 慢任务/失败强告警。"""
+        started = time.perf_counter()
+        rss_before = self._current_rss_mb()
+        try:
+            result = func(*args, **kwargs)
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            rss_after = self._current_rss_mb()
+            self._update_job_stats(job_id, duration_ms, True)
+
+            if duration_ms >= self._slow_job_ms:
+                logger.warning(
+                    "Job slow: %s | duration_ms=%s | rss_mb=%s | delta_mb=%.1f",
+                    job_id,
+                    duration_ms,
+                    rss_after,
+                    rss_after - rss_before,
+                )
+            gc.collect()
+            return result
+        except Exception as e:
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            self._update_job_stats(job_id, duration_ms, False)
+            logger.error(
+                "Job failed: %s | duration_ms=%s | rss_mb=%s | error=%s",
+                job_id,
+                duration_ms,
+                self._current_rss_mb(),
+                e,
+                exc_info=True,
+            )
+            gc.collect()
+            return None
+
+    def _job_sync_news(self):
+        """Job: 同步新闻"""
+        self._run_job("sync_news", news_syncer.sync_news_stream, limit=int(os.getenv("NEWS_TARGET_MAX_SYMBOLS", "24") or 24))
+
+    def _job_sync_reports(self):
+        """Job: 同步研报"""
+        self._run_job("sync_reports", report_syncer.sync_industry_reports)
+
+    def _job_cn_heatmap(self):
+        """Job: 生成A股热门榜单"""
+        self._run_job("cn_heatmap", heatmap_service.process_and_notify, "CN")
+
+    def _job_hk_heatmap(self):
+        """Job: 生成港股热门榜单"""
+        self._run_job("hk_heatmap", heatmap_service.process_and_notify, "HK")
+
+    def _job_us_heatmap(self):
+        """Job: 生成美股热门榜单"""
+        self._run_job("us_heatmap", heatmap_service.process_and_notify, "US")
+
+    def _job_us_asset_universe_sync(self):
+        """Job: 从 Nasdaq 官方证券表增量补齐美股新股/改码。"""
+        from modules.ingestion.sync_asset import asset_syncer
+        self._run_job("us_asset_universe_sync", asset_syncer.sync_market, "US", False)
+
+
+    @staticmethod
+    def _is_us_premarket_slot() -> bool:
+        """仅在纽约时间工作日08:00触发盘前任务，自动兼容DST。"""
+        try:
+            now_ny = dt.datetime.now(ZoneInfo("America/New_York"))
+            return now_ny.weekday() < 5 and now_ny.hour == 8
+        except Exception:
+            return False
+
+    def _job_us_premarket_hunter(self):
+        """Job: 美股盘前猎手"""
+        if not self._is_us_premarket_slot():
+            logger.info("Skip us_premarket_hunter: not in NY 08:00 slot")
+            return
+        self._run_job("us_premarket_hunter", us_premarket_scanner_service.scan_and_notify)
+
+    def _job_monitor_scan(self):
+        """Job: 自选股异动扫描"""
+        from modules.monitor.scanner import MonitorService
+        self._run_job("monitor_scan", MonitorService.scan_and_alert)
+
+    def _job_commodity_scan(self):
+        """Job: 大宗商品每日战报"""
+        from modules.monitor.commodity_scanner import CommodityScanner
+        self._run_job("commodity_scan", CommodityScanner.generate_daily_report)
+
+    def _job_macro_dashboard(self):
+        """Job: independently refresh read-only macro/commodity snapshots."""
+        from modules.monitor.macro_dashboard import refresh_snapshot
+        self._run_job("macro_dashboard", refresh_snapshot)
+
+    def _job_trend_7d(self):
+        """Job: 7日趋势简报"""
+        from modules.monitor.trend_report_service import TrendReportService
+        self._run_job("trend_7d", TrendReportService.generate_and_push, 7)
+
+    def _job_trend_30d(self):
+        """Job: 30日趋势简报"""
+        from modules.monitor.trend_report_service import TrendReportService
+        self._run_job("trend_30d", TrendReportService.generate_and_push, 30)
+
+    def _job_daily_summary(self):
+        """Job: 每日推送标的汇总 + 当日Trend算法榜汇总 TXT。"""
+        from modules.monitor.daily_summary_service import DailySummaryService
+        self._run_job("daily_summary", DailySummaryService.generate_all_and_save)
+
+    def _job_sync_fundamentals(self):
+        """Job: 全市场基本面更新 (仅财务数据入 SQLite)"""
+        def _execute():
+            # 1. 结构化：财务数据入 SQLite
+            fin_results = {}
+            for market in ["CN", "HK", "US"]:
+                fin_results[market] = financial_syncer.sync_financials(market=market)
+
+            # 2. 非结构化：画像 Chunking 入 Chroma — ChromaDB 已禁用，跳过
+            # profile_results = {}
+            # for market in ["CN", "HK", "US"]:
+            #     profile_results[market] = profile_syncer.sync_profiles_batch(market=market, skip_existing=False)
+
+            # 3. 供应链关系提取 — 依赖 LLM 且只跑 5 只股票，价值低，跳过
+            # from core.db import db_manager
+            # from sqlmodel import select
+            # from domain.meta import Asset
+            # with db_manager.meta_session() as session:
+            #     statement = select(Asset.symbol).where(Asset.market == "CN").limit(5)
+            #     symbols = list(session.exec(statement).all())
+            # relation_synced = 0
+            # for symbol in symbols:
+            #     relation_synced += int(relation_syncer.sync_relations_for_symbol(symbol) or 0)
+
+            return {
+                "financial": fin_results,
+            }
+
+        self._run_job("sync_fundamentals", _execute)
+
+    def _job_trend_pool_refresh_cn_hk(self):
+        """Job: 趋势池日线补齐（CN/HK）"""
+        from modules.monitor.trend_service import TrendService
+        self._run_job(
+            "trend_pool_refresh_cn_hk",
+            TrendService.refresh_pool_daily_bars,
+            ["CN", "HK"],
+            120,
+            "trend_pool_refresh_eod",
+            True,
+        )
+
+    def _job_trend_pool_refresh_cn_hk_retry(self):
+        """Job: 趋势池日线补齐重试（CN/HK）"""
+        from modules.monitor.trend_service import TrendService
+        self._run_job(
+            "trend_pool_refresh_cn_hk_retry",
+            TrendService.refresh_pool_daily_bars,
+            ["CN", "HK"],
+            120,
+            "trend_pool_refresh_eod",
+            False,
+        )
+
+    def _job_trend_pool_refresh_us_cf(self):
+        """Job: 趋势池日线补齐（US/CF）"""
+        from modules.monitor.trend_service import TrendService
+        self._run_job(
+            "trend_pool_refresh_us_cf",
+            TrendService.refresh_pool_daily_bars,
+            ["US", "CF"],
+            120,
+            "trend_pool_refresh_eod",
+            True,
+        )
+
+    def _job_trend_pool_refresh_us_cf_retry(self):
+        """Job: 趋势池日线补齐重试（US/CF）"""
+        from modules.monitor.trend_service import TrendService
+        self._run_job(
+            "trend_pool_refresh_us_cf_retry",
+            TrendService.refresh_pool_daily_bars,
+            ["US", "CF"],
+            120,
+            "trend_pool_refresh_eod",
+            False,
+        )
+
+    def _job_daily_rank_cn_hk(self):
+        """Job: 每日榜单同步（CN/HK）"""
+        from modules.monitor.daily_rank_service import DailyRankService
+        self._run_job("daily_rank_cn_hk", DailyRankService.sync_daily_ranks, ["CN", "HK"])
+
+    def _job_daily_rank_us(self):
+        """Job: 每日榜单同步（US）"""
+        from modules.monitor.daily_rank_service import DailyRankService
+        self._run_job("daily_rank_us", DailyRankService.sync_daily_ranks, ["US"])
+
+    def _job_institutional_cache_refresh(self):
+        # Job: 机构筹码低频缓存（SEC 13F / HK CCASS）。
+        def _execute():
+            from modules.ingestion.institutional_factor import refresh_hk_ccass_cache, refresh_us_sec13f_cache
+            return {
+                "sec13f": refresh_us_sec13f_cache(force=False, max_periods=2),
+                "hk_ccass": refresh_hk_ccass_cache(force=False),
+            }
+
+        self._run_job("institutional_cache_refresh", _execute)
+
+    def _job_trend_seed_pool_refresh(self):
+        """Job: Trend 多源种子池刷新。"""
+        from modules.monitor.trend_service import TrendService
+        self._run_job("trend_seed_pool_refresh", TrendService.refresh_seed_pool_from_sources)
+
+    def _job_ipo_tomorrow(self):
+        """Job: 明日新股预告"""
+        self._run_job("ipo_tomorrow", ipo_calendar_service.generate_and_push_tomorrow)
+
+    def _job_paper_trade_check(self):
+        """Job: 模拟交易到期检查"""
+        from modules.paper_trading.service import PaperTradingService
+        from modules.paper_trading.reviewer import PaperTradeReviewer
+        from modules.monitor.notifier import Notifier
+
+        def _safe_push(chat_id: int, message_text: str):
+            # Notifier 使用同步 HTTP，适合 scheduler 线程；失败时不抛异常阻塞主流程。
+            if not chat_id or not message_text:
+                return
+            chunk_size = 3500
+            for i in range(0, len(message_text), chunk_size):
+                Notifier.send_telegram(chat_id, message_text[i:i + chunk_size])
+
+        def _execute():
+            expired_trades = PaperTradingService.check_expired_trades()
+            if not expired_trades:
+                return {"expired_count": 0, "review_done": 0, "review_failed": 0, "notified_count": 0}
+
+            review_done = 0
+            review_failed = 0
+            notified_count = 0
+
+            for trade in expired_trades:
+                try:
+                    PaperTradingService.mark_review_pending(trade.id, "auto_expire")
+                    report = PaperTradeReviewer.generate_review(trade)
+
+                    if str(report).strip().startswith("❌"):
+                        PaperTradingService.save_review_failure(trade.id, report, "auto_expire")
+                        review_failed += 1
+                        continue
+
+                    saved = PaperTradingService.save_review_success(trade.id, report, "auto_expire")
+                    if saved:
+                        review_done += 1
+
+                    if trade.chat_id:
+                        text = (
+                            f"🚨 【到期复盘】您的模拟持仓 {trade.name}({trade.symbol}) 已到达打卡时间！"
+                            f"自动平仓并复盘：\n\n{report}"
+                        )
+                        _safe_push(trade.chat_id, text)
+                        notified_count += 1
+                except Exception as e:
+                    PaperTradingService.save_review_failure(trade.id, f"auto_expire_exception: {e}", "auto_expire")
+                    logger.error("Failed to process expired trade %s: %s", trade.symbol, e, exc_info=True)
+                    review_failed += 1
+
+            return {
+                "expired_count": len(expired_trades),
+                "review_done": review_done,
+                "review_failed": review_failed,
+                "notified_count": notified_count,
+            }
+
+        self._run_job("paper_trade_check", _execute)
+
+
+# 全局单例
+task_scheduler = TaskScheduler()

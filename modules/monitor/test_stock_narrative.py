@@ -1,0 +1,77 @@
+import unittest
+from unittest.mock import patch, Mock
+
+from modules.monitor.stock_narrative import growth_clue, profile_highlight, business_detail, _clean, _profile_symbol, extract_sec_item1, extract_sec_item4_20f, sec_business_info
+
+
+class StockNarrativeTest(unittest.TestCase):
+    def test_sec_20f_uses_business_overview_after_real_item4(self):
+        html = ('<html><body>Item 4. Information on the Company 42 Item 4A. Staff Comments '
+                'Item 4. INFORM ATION ON THE COMPANY A. History and Development of the Company. '
+                'The company was founded in 2012. B. Business Overview—Regulations” cross reference. '
+                'B. Business Overview We build electric vehicles. '
+                + 'We sell cars and provide battery services worldwide. ' * 25
+                + 'C. Organizational Structure</body></html>')
+        excerpt = extract_sec_item4_20f(html)
+        self.assertIn('electric vehicles', excerpt)
+        self.assertNotIn('Organizational Structure', excerpt)
+
+    def test_sec_fallback_rejects_ticker_cik_mismatch(self):
+        ticker_response = Mock()
+        ticker_response.json.return_value = {
+            'fields': ['cik', 'name', 'ticker', 'exchange'],
+            'data': [[123, 'Example', 'TEST', 'Nasdaq']],
+        }
+        submission_response = Mock()
+        submission_response.json.return_value = {'tickers': ['OTHER']}
+        with patch('modules.monitor.stock_narrative.get_cache', return_value=None), \
+             patch('modules.monitor.stock_narrative.set_cache'), \
+             patch('modules.monitor.stock_narrative.os.getenv', return_value='TradeDB contact@example.com'), \
+             patch('modules.monitor.stock_narrative.requests.get', side_effect=[ticker_response, submission_response]) as get:
+            self.assertEqual(sec_business_info('TEST'), {})
+            self.assertEqual(get.call_count, 2)
+
+    def test_sec_item1_skips_contents_and_stops_before_risk_factors(self):
+        html = ('<html><body>Item 1. Business 7 Item 1A. Risk Factors 20 '
+                'Item 1. Business Overview We operate communications towers. '
+                + 'We lease infrastructure to wireless carriers. ' * 25
+                + 'Item 1A. Risk Factors Losses may occur.</body></html>')
+        excerpt = extract_sec_item1(html)
+        self.assertIn('communications towers', excerpt)
+        self.assertNotIn('Risk Factors', excerpt)
+
+    def test_us_bare_ticker_finds_nyse_profile(self):
+        class AssetStub:
+            market = 'US'
+            asset_type = 'STOCK'
+
+        class SessionStub:
+            def get(self, _, symbol):
+                return AssetStub() if symbol == '106.CCI' else None
+
+        self.assertIsNotNone(_profile_symbol(SessionStub(), 'US', 'CCI'))
+
+    def test_growth_only_quotes_explicit_direction(self):
+        self.assertEqual(growth_clue('公司销售手机和电脑。'), '')
+        self.assertEqual(growth_clue('公司销售手机和电脑。未来将拓展海外市场。'), '未来将拓展海外市场。')
+
+    def test_profile_text_is_bounded_and_whitespace_normalized(self):
+        self.assertEqual(_clean('  手机\n 电脑  ', 20), '手机 电脑')
+        self.assertEqual(_clean('nan'), '')
+        self.assertEqual(len(_clean('a' * 500, 120)), 120)
+
+    def test_profile_highlight_skips_founding_boilerplate(self):
+        text = '公司成立于1998年。公司主要为企业客户提供网络安全产品与服务。'
+        self.assertEqual(profile_highlight(text), '公司主要为企业客户提供网络安全产品与服务。')
+        text = '公司是世界领先的科技公司。公司提供社交服务与电子游戏产品。还提供云计算业务和企业软件服务。'
+        self.assertEqual(profile_highlight(text), '公司提供社交服务与电子游戏产品。还提供云计算业务和企业软件服务。')
+
+    def test_short_us_business_uses_existing_profile_detail_only(self):
+        intro = '公司成立于1975年。公司提供企业软件、云平台和网络安全服务。'
+        self.assertEqual(business_detail('US', '软件服务', intro),
+                         '软件服务；公司提供企业软件、云平台和网络安全服务。')
+        self.assertEqual(business_detail('CN', '软件服务', intro), '软件服务')
+
+
+if __name__ == '__main__':
+    unittest.main()
