@@ -76,7 +76,8 @@ def record_stock_turnover(market, frame, now=None):
     stamp = datetime.fromtimestamp(now or time.time(), SHANGHAI)
     row = {'market': market, 'day': stamp.date().isoformat(), 'amount': round(float(positive.sum()), 2),
            'quotes': len(work), 'traded': len(positive), 'asof': stamp.isoformat(),
-           'source': 'Trade_db / 新浪股票行情覆盖池', 'unit': 'CNY' if market == 'CN' else 'HKD'}
+           'source': 'Trade_db / ' + ('、'.join(sorted(set(work['行情来源'].dropna().astype(str)))) if '行情来源' in work else 'Sina') + ' 股票行情覆盖池',
+           'unit': 'CNY' if market == 'CN' else 'HKD'}
     existing = stock_history()
     previous = max((item for item in existing if item.get('market') == market and item.get('day') < row['day']),
                    key=lambda item: item['day'], default=None)

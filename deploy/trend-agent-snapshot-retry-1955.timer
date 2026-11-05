@@ -1,0 +1,11 @@
+[Unit]
+Description=Independent weekday Agent snapshot retry at 19:55 Beijing
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 19:55:00
+AccuracySec=1s
+Persistent=false
+Unit=trend-agent-snapshot.service
+
+[Install]
+WantedBy=timers.target

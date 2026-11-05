@@ -17,6 +17,33 @@ from generate_agent_period_snapshot import generate as generate_period
 from agent_market_scan import scan as scan_agent_market
 from agent_research_focus import write_focus
 from agent_market_extensions import write_extensions
+from collect_agent_market_context import collect as collect_market_context
+
+STAGE = 'sync'
+
+
+def verify_remote(repo, paths, archive_date):
+    """Read back from the explicitly fetched origin/agent-data, not local HEAD."""
+    git(repo, 'fetch', 'origin', 'refs/heads/agent-data:refs/remotes/origin/agent-data')
+    verified = []
+    for path in sorted(paths):
+        if not path.endswith('.json'):
+            continue
+        raw = git(repo, 'show', 'refs/remotes/origin/agent-data:' + path)
+        data = json.loads(raw)
+        if path.startswith('agent/v1/history/'):
+            if data.get('archive_date') != archive_date or path != f'agent/v1/history/{archive_date}.json':
+                raise ValueError('remote archive_date/path mismatch')
+            for key in ('snapshot_id', 'generated_at', 'overview', 'anomalies', 'source_health', 'session_date'):
+                if key not in data:
+                    raise ValueError('remote archive missing structure: ' + key)
+            if not isinstance(data['overview'].get('markets'), list) or not isinstance(data['anomalies'], dict):
+                raise ValueError('remote archive invalid market structure')
+        local = json.loads((repo / path).read_text(encoding='utf-8'))
+        if data != local:
+            raise ValueError('remote JSON differs from committed local artifact: ' + path)
+        verified.append(path)
+    return verified
 
 
 def git(repo, *arguments):
@@ -25,6 +52,8 @@ def git(repo, *arguments):
 
 
 def publish(root, crypto_db, repo, preview_periods=False, daily_only=False, period_only=False, focus_only=False, extensions_only=False):
+    global STAGE
+    STAGE = 'sync'
     if sum((preview_periods, daily_only, period_only, focus_only, extensions_only)) > 1:
         raise ValueError('choose only one publication mode')
     if git(repo, "branch", "--show-current") != "agent-data":
@@ -35,6 +64,7 @@ def publish(root, crypto_db, repo, preview_periods=False, daily_only=False, peri
         git(repo, "fetch", "origin", "agent-data")
         git(repo, "merge", "--ff-only", "FETCH_HEAD")
         now = datetime.now(ZoneInfo("Asia/Shanghai"))
+        STAGE = 'generate'
         output = repo / "agent/v1"
         allowed = set()
         published = []
@@ -47,6 +77,7 @@ def publish(root, crypto_db, repo, preview_periods=False, daily_only=False, peri
             legacy_archive = (today_archive.exists() and
                               not json.loads(today_archive.read_text(encoding='utf-8')).get('market_anomalies'))
             if not today_archive.exists():
+                collect_market_context(root, now)
                 scan_agent_market(root, root / 'data/agent_market_scan', now)
                 # The quote scan runs after the timer fires. Audit against its
                 # completion time, not the earlier timer-entry timestamp.
@@ -83,7 +114,10 @@ def publish(root, crypto_db, repo, preview_periods=False, daily_only=False, peri
             git(repo, "-c", "user.name=trend-agent-snapshot",
                 "-c", "user.email=trend-agent@localhost",
                 "commit", "-m", f"Publish Trend snapshot {now.date().isoformat()}")
+        STAGE = 'upload'
         git(repo, "push", "origin", "HEAD:agent-data")
+        STAGE = 'verify'
+        verify_remote(repo, allowed, now.date().isoformat())
         return published, git(repo, "rev-parse", "HEAD")
 
 
@@ -100,8 +134,26 @@ def main():
     mode.add_argument("--focus-only", action="store_true", help="publish research universe only, without market scans")
     mode.add_argument("--extensions-only", action="store_true", help="publish classified securities and global ETF supplement without freezing daily/period archives")
     args = parser.parse_args()
-    published, commit = publish(args.root, args.crypto_db, args.repo,
-                                args.preview_periods, args.daily_only, args.period_only, args.focus_only, args.extensions_only)
+    from agent_publication_status import receipt, classify_failure, safe_error, alert
+    started = datetime.now(ZoneInfo('Asia/Shanghai'))
+    mode_name = ('daily' if args.daily_only else 'period' if args.period_only else
+                 'focus' if args.focus_only else 'extensions' if args.extensions_only else 'combined')
+    receipt(args.root, mode_name, started, 'running', 'sync')
+    import signal
+    def terminated(_signum, _frame):
+        raise TimeoutError('publication terminated before verification; independent retries remain scheduled')
+    signal.signal(signal.SIGTERM, terminated)
+    try:
+        published, commit = publish(args.root, args.crypto_db, args.repo,
+                                    args.preview_periods, args.daily_only, args.period_only, args.focus_only, args.extensions_only)
+    except Exception as exc:
+        result = receipt(args.root, mode_name, started, 'failed', STAGE,
+                         category=classify_failure(exc, STAGE), **safe_error(exc))
+        sent = alert(args.root, result)
+        print(json.dumps({'operational_alert_sent': sent}), flush=True)
+        raise SystemExit(1)
+    receipt(args.root, mode_name, started, 'verified' if published else 'not_due', STAGE,
+            commit=commit, published=published)
     print(f"Published {published}, commit {commit}")
 
 

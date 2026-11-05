@@ -13,6 +13,14 @@ import publish_agent_snapshot as publisher
 
 
 class PublishClockTest(unittest.TestCase):
+    def setUp(self):
+        collector = patch.object(publisher, 'collect_market_context', return_value={})
+        collector.start()
+        self.addCleanup(collector.stop)
+        verifier = patch.object(publisher, 'verify_remote', return_value=[])
+        verifier.start()
+        self.addCleanup(verifier.stop)
+
     def test_extensions_mode_does_not_freeze_daily_or_period(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

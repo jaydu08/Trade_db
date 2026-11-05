@@ -128,3 +128,23 @@ def fetch_quotes(symbols, market: str, timeout: int = 12) -> dict[str, dict]:
             for rows in pool.map(fetch, batches):
                 results.update(rows)
     return results
+
+
+def fetch_unadjusted_daily(symbol, market, count=90):
+    """Read raw daily closes only; never silently substitute qfq/hfq series."""
+    code = quote_code(symbol, market)
+    response = requests.get('https://web.ifzq.gtimg.cn/appstock/app/fqkline/get',
+                            params={'param': f'{code},day,,,{count},'}, timeout=12)
+    response.raise_for_status()
+    rows = (response.json().get('data') or {}).get(code, {}).get('day')
+    if not isinstance(rows, list):
+        raise ValueError('unadjusted daily field unavailable')
+    points = {}
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 3:
+            raise ValueError('malformed daily row')
+        day, close = dt.date.fromisoformat(row[0]), _number(row[2])
+        if close is None or close <= 0 or day in points:
+            raise ValueError('invalid or duplicate daily close')
+        points[day] = close
+    return sorted(points.items())

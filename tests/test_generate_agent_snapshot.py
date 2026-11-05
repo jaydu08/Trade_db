@@ -88,7 +88,8 @@ class SnapshotTest(unittest.TestCase):
     def test_real_fields_direction_session_and_immutable_history(self):
         first, size = MODULE.generate(self.root, self.crypto, self.output, self.now)
         self.assertLess(size, 100_000)
-        self.assertEqual(first["schema_version"], "1.2")
+        self.assertEqual(first["schema_version"], "1.3")
+        self.assertEqual(first['archive_date'], '2026-10-13')
         self.assertEqual(first["overview"]["markets"][2]["session_date"], "2026-10-12")
         self.assertEqual(first["overview"]["macro"][0]["value"], 4.5)
         self.assertIn("BBB", [x["symbol"] for x in first["anomalies"]["stocks_down"]])

@@ -22,12 +22,14 @@ from agent_market_calendar import (SOURCES as MARKET_CALENDAR_SOURCES, closed_re
                                    archived_session, market_phase)
 from agent_research_focus import build_focus
 from agent_market_extensions import build_extensions
+from agent_security_identity import canonical_symbol, deduplicate, catalog_type
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 NEW_YORK = ZoneInfo("America/New_York")
-# Includes legacy duplicate anomaly fields plus a bounded 100 KB research focus.
-MAX_BYTES = 350_000
+# Includes legacy duplicate anomaly fields, source lineage and dated market context.
+# Transport bound only; no source quality/readiness thresholds are relaxed.
+MAX_BYTES = 500_000
 CRYPTO_STALE_SECONDS = 900
 ONCHAIN_MIN_LIQUIDITY = 50_000
 ONCHAIN_MIN_VOLUME = 50_000
@@ -405,7 +407,7 @@ def stock_anomaly_snapshot(root, now):
                                      selected_count=0, positive_eligible_count=0,
                                      negative_eligible_count=0, flat_eligible_count=0,
                                      coverage_scope='market_closed_no_current_session',
-                                     selection_version='agent_anomaly_v1', coverage_ratio=None,
+                                     selection_version='agent_anomaly_v2_security_identity', coverage_ratio=None,
                                      excluded_reason_counts=segment.get('excluded_reason_counts') or {},
                                      source_contributions={},
                                      negative_coverage_status='market_closed',
@@ -457,14 +459,15 @@ def stock_anomaly_snapshot(root, now):
                     excluded['invalid_ranking_input'] = excluded.get('invalid_ranking_input', 0) + 1
                     continue
                 bar = by_symbol.get(symbol)
-                asset_type, type_source = classify_stock_asset(symbol, row.get('name'), catalog.get(symbol))
+                resolved_type = catalog_type(market, symbol, catalog)
+                asset_type, type_source = classify_stock_asset(symbol, row.get('name'), resolved_type)
+                if resolved_type and resolved_type != catalog.get(symbol):
+                    type_source += ':verified_us_symbol_alias'
                 if asset_type in ('ETF', 'LEVERAGED_ETF'):
                     excluded['non_stock_instrument'] = excluded.get('non_stock_instrument', 0) + 1
                     continue
                 verified_product = verified_hk_product(symbol)
-                canonical = (symbol.split('.', 1)[1].upper()
-                             if market == 'US' and re.fullmatch(r'\d{3}\.[A-Za-z][A-Za-z0-9.\-]*', symbol)
-                             else symbol)
+                canonical = canonical_symbol(market, symbol)
                 leverage = {'SOXL': 3, 'SOXS': -3, 'TQQQ': 3, 'SQQQ': -3,
                             'SPXL': 3, 'SPXS': -3}.get(canonical.upper())
                 amount = number(bar['amount']) if bar else None
@@ -501,12 +504,15 @@ def stock_anomaly_snapshot(root, now):
                             quality='partial', stale=False,
                             missing_reason='price adjustment or exact exchange not confirmed')
                 items.append(item)
+            raw_eligible_count = len(items)
+            items = deduplicate(items)
+            excluded['duplicate_security_alias'] = raw_eligible_count - len(items)
             sorted_returns = sorted(i['change_pct'] for i in items)
             median = sorted_returns[len(sorted_returns) // 2] if sorted_returns else None
             for item in items:
                 item['relative_strength_pct'] = round(item['change_pct'] - median, 3) if median is not None else None
-            positive = sorted((i for i in items if i['change_pct'] > 0), key=lambda i: i['change_pct'], reverse=True)
-            negative = sorted((i for i in items if i['change_pct'] < 0), key=lambda i: i['change_pct'])
+            positive = sorted((i for i in items if i['change_pct'] > 0), key=lambda i: (-i['change_pct'], i['canonical_symbol']))
+            negative = sorted((i for i in items if i['change_pct'] < 0), key=lambda i: (i['change_pct'], i['canonical_symbol']))
             up.extend(positive[:10]); down.extend(negative[:10])
             relative_up.extend(sorted(items, key=lambda i: i['relative_strength_pct'], reverse=True)[:3])
             relative_down.extend(sorted(items, key=lambda i: i['relative_strength_pct'])[:3])
@@ -525,7 +531,7 @@ def stock_anomaly_snapshot(root, now):
                                  positive_eligible_count=len(positive), negative_eligible_count=len(negative),
                                  flat_eligible_count=eligible - len(positive) - len(negative),
                                  coverage_scope='rolling_120d_TrendSeedPool_union_current_archived_bars',
-                                 selection_version='agent_anomaly_v1', coverage_ratio=ratio,
+                                 selection_version='agent_anomaly_v2_security_identity', coverage_ratio=ratio,
                                  excluded_reason_counts=excluded, source_contributions=contributions,
                                  negative_coverage_status=('insufficient' if not enough else
                                                            'none_observed' if not negative else 'complete'),
@@ -697,6 +703,16 @@ def macro_snapshot(root, now):
 
 def build_snapshot(root, crypto_db, now):
     markets, legacy_up, legacy_down, stock_health, limitations = stock_snapshot(root, now)
+    context = read_json(root / 'data/agent_market_context' / f'{now.date().isoformat()}.json', {})
+    for market in markets:
+        segment = context.get('markets', {}).get(market['market'], {})
+        if segment.get('session_date') == market.get('session_date'):
+            indices = segment.get('indices') or []
+            market['major_indices'] = indices
+            market['major_index'] = indices[0] if indices else None
+            market['breadth'] = segment.get('breadth')
+        else:
+            market['index_breadth_missing_reason'] = 'dated independent market context unavailable or session mismatch'
     stocks_up, stocks_down, relative_up, relative_down, coverage = stock_anomaly_snapshot(root, now)
     coverage_by_market = {row['market']: row for row in coverage}
     for market in markets:
@@ -732,21 +748,29 @@ def build_snapshot(root, crypto_db, now):
     limitations.extend(crypto_limits)
     limitations.extend(["Trend Selection与独立Market Anomaly Scan分开；后者仅为可观测样本的真实1日涨跌幅，不是全市场或Z-score",
                         "加密 CEX 仅覆盖 Binance USDT 现货/永续按 24h 成交额各前 150；链上仅覆盖已发现合约，安全通过不保证可卖出",
-                        "主要综合指数与完整市场广度当前无可靠归档，保持 null；20:00 北京时间美股采用上一已完成纽约交易日",
+                        "指数、独立全量供应商市场枚举广度、Trend候选池统计分开；广度不是交易所认证全市场统计，缺失或日期无法核验时保持null；美股采用上一已完成纽约交易日",
                         "跨市场因果归因与交易评级未实现"])
     anomaly_health = [dict(domain=f"agent_anomaly_{row['market']}", session_date=row['session_date'],
                            data_asof=row['data_asof'], quality=row['quality'], stale=row['stale'],
                            market_status=row.get('market_status', 'open'),
                            closure_reason=row.get('closure_reason'),
                            source='independent Agent market scan', missing_reason=row['missing_reason']) for row in coverage]
-    all_health = stock_health + anomaly_health + crypto_health + [macro_health]
-    return dict(schema_version="1.2", snapshot_id=f"{now.date().isoformat()}-{int(now.timestamp())}",
+    context_health = []
+    for market in markets:
+        indices, breadth = market.get('major_indices') or [], market.get('breadth') or {}
+        stale_context = not indices or any(i.get('stale') for i in indices) or breadth.get('stale', True)
+        context_health.append(dict(domain='market_context_' + market['market'], session_date=market['session_date'],
+                                   data_asof=context.get('generated_at'), source='Tencent indices; Eastmoney independent market enumeration',
+                                   quality='missing' if not indices else 'partial', stale=stale_context,
+                                   missing_reason='one or more index/breadth sources absent or unverified' if stale_context else breadth.get('missing_reason')))
+    all_health = stock_health + anomaly_health + crypto_health + [macro_health] + context_health
+    return dict(schema_version="1.3", archive_date=now.date().isoformat(), snapshot_id=f"{now.date().isoformat()}-{int(now.timestamp())}",
                 generated_at=now.isoformat(timespec="seconds"), timezone="Asia/Shanghai",
                 snapshot_generated_at=now.isoformat(timespec="seconds"),
                 session_date={m['market']: m['session_date'] for m in markets},
                 data_asof={h['domain']: h['data_asof'] for h in all_health},
                 stale=any(h['stale'] for h in all_health) or any(o['stale'] for o in macro), quality="partial",
-                missing_reason="major-index/breadth and some baseline/adjustment fields unavailable; see limitations",
+                missing_reason="some baseline/adjustment and source coverage fields incomplete; see per-record quality and limitations",
                 overview=dict(markets=markets, macro=macro, crypto_activity=crypto_activity),
                 trend_selected=trend_selected,
                 research_focus=build_focus(root, now),

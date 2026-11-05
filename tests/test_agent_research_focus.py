@@ -100,6 +100,7 @@ class FocusTest(unittest.TestCase):
         def fake_git(_repo, *args):
             return 'agent-data' if args == ('branch', '--show-current') else 'test-id' if args == ('rev-parse', 'HEAD') else ''
         with patch.object(publisher, 'git', side_effect=fake_git), \
+             patch.object(publisher, 'verify_remote', return_value=[]), \
              patch.object(publisher, 'scan_agent_market') as scan, \
              patch.object(publisher, 'generate') as daily, \
              patch.object(publisher, 'generate_period') as period, \

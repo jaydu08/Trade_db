@@ -80,7 +80,9 @@ def audit(snapshot, output, now):
                   source_health=snapshot.get('source_health', []),
                   stale_macro_indicators=stale_macro,
                   stale_indicator_count=len(stale_macro),
-                  missing_fields=['market_index_breadth', 'verified_stock_adjustment'])
+                  missing_fields=['verified_stock_adjustment'] + [
+                      f"market_index_breadth:{row['market']}" for row in snapshot.get('overview', {}).get('markets', [])
+                      if not row.get('major_index') or not row.get('breadth') or row.get('breadth', {}).get('advancing') is None])
     return result
 
 

@@ -73,21 +73,34 @@ def fetch_global_assets(now=None):
     import akshare as ak
     now = now or datetime.now(ZoneInfo('Asia/Shanghai'))
     old = {r['id']: r for r in read_snapshot().get('global_assets', [])}
+    from modules.ingestion.tencent_quote import fetch_quotes, fetch_unadjusted_daily
+    local_quotes = {}
+    for market in ('CN', 'HK'):
+        symbols = [meta['symbol'] for meta in ASSET_META.values() if meta['listing_market'] == market]
+        local_quotes[market] = fetch_quotes(symbols, market)
     def one(entry):
         symbol, (name, group, kind, url) = entry
         meta = ASSET_META.get(symbol, dict(listing_market='US', currency='USD', symbol=symbol))
         market, code = meta['listing_market'], meta['symbol']
+        source = '新浪 ' + market + ' 日线 / AkShare'
         try:
-            if market == 'CN':
-                frame = ak.fund_etf_hist_sina(('sh' if code.startswith('5') else 'sz') + code)
-            elif market == 'HK':
-                frame = ak.stock_hk_daily(code, adjust='')
-            else:
-                frame = ak.index_us_stock_sina('.SOX') if symbol == 'SOX' else ak.stock_us_daily(code, adjust='')
-            if frame is None or frame.empty:
-                raise ValueError('empty daily series')
-            points = [(value.date() if hasattr(value, 'date') else value, close)
-                      for value, close in zip(frame['date'], frame['close'])]
+            try:
+                if market == 'CN':
+                    frame = ak.fund_etf_hist_sina(('sh' if code.startswith('5') else 'sz') + code)
+                elif market == 'HK':
+                    frame = ak.stock_hk_daily(code, adjust='')
+                else:
+                    frame = ak.index_us_stock_sina('.SOX') if symbol == 'SOX' else ak.stock_us_daily(code, adjust='')
+                if frame is None or frame.empty:
+                    raise ValueError('empty daily series')
+                from datetime import date
+                points = [(value.date() if hasattr(value, 'date') else date.fromisoformat(str(value)[:10]), close)
+                          for value, close in zip(frame['date'], frame['close'])]
+            except Exception:
+                if market not in ('CN', 'HK'):
+                    raise
+                points = fetch_unadjusted_daily(code, market)
+                source = '腾讯 ' + market + ' 未复权日线'
             points = [(value, finite(close)) for value, close in points if value]
             points = [(day, close) for day, close in points if close is not None and close > 0]
             zone = ZoneInfo('America/New_York') if market == 'US' else ZoneInfo('Asia/Shanghai')
@@ -95,6 +108,18 @@ def fetch_global_assets(now=None):
             cutoff = (16, 20) if market in ('HK', 'US') else (15, 10)
             points = sorted({day: close for day, close in points
                              if day < local.date() or (day == local.date() and (local.hour, local.minute) >= cutoff)}.items())
+            quote = local_quotes.get(market, {}).get(code)
+            if market in ('CN', 'HK') and (local.hour, local.minute) >= cutoff and not quote:
+                raise ValueError('cannot verify latest local completed session without a dated quote')
+            if quote and (local.hour, local.minute) >= cutoff:
+                expected = str(quote['timestamp'])[:10]
+                if not points or points[-1][0].isoformat() < expected:
+                    points = fetch_unadjusted_daily(code, market)
+                    points = [(day, close) for day, close in points if day.isoformat() <= expected]
+                    source = '腾讯 ' + market + ' 未复权日线（新浪日期落后回退）'
+                if (not points or points[-1][0].isoformat() != expected or
+                        abs(points[-1][1] / quote['price'] - 1) > .002):
+                    raise ValueError('daily close/date disagrees with current completed quote')
             if len(points) < 20:
                 raise ValueError('insufficient daily series')
             day, price = points[-1]
@@ -105,7 +130,7 @@ def fetch_global_assets(now=None):
                     'price_adjustment': 'unadjusted close; excludes dividends',
                     'collection_quality': 'ok', 'missing_reason': None,
                     'observation_stale': (local.date() - day).days > 7,
-                    'source': '新浪 ' + market + ' 日线 / AkShare', 'url': url}
+                    'source': source, 'url': url}
         except Exception as exc:
             LOG.warning('Global asset %s unavailable: %s', symbol, exc)
             previous = old.get(symbol)
@@ -266,7 +291,10 @@ def refresh_snapshot(force=False, now=None):
     for key, ttl, fetcher in [('macro', 6 * 3600, fetch_fred),
                               ('futures', 15 * 60, fetch_futures),
                               ('global_assets', 6 * 3600, fetch_global_assets)]:
-        if not force and snapshot.get(key) and now - snapshot.get(key + '_checked_at', 0) < ttl:
+        if key == 'global_assets' and any(r.get('collection_quality') == 'stale' for r in snapshot.get(key, [])):
+            ttl = 900
+        post_close_due = key == 'global_assets' and global_post_close_due(snapshot, now)
+        if not force and not post_close_due and snapshot.get(key) and now - snapshot.get(key + '_checked_at', 0) < ttl:
             continue
         try:
             snapshot[key] = fetcher()
@@ -302,6 +330,19 @@ def refresh_snapshot(force=False, now=None):
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
     return snapshot
+
+
+def global_post_close_due(snapshot, now):
+    """One refresh after each listing market closes, even inside the six-hour TTL."""
+    checked = finite(snapshot.get('global_assets_checked_at')) or 0
+    for market, zone_name, hour, minute in [('CN', 'Asia/Shanghai', 15, 10),
+                                          ('HK', 'Asia/Shanghai', 16, 20),
+                                          ('US', 'America/New_York', 16, 20)]:
+        local = datetime.fromtimestamp(now, ZoneInfo(zone_name))
+        close = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if local.weekday() < 5 and local >= close and checked < close.timestamp():
+            return True
+    return False
 
 
 def commodity_movers():

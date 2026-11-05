@@ -78,6 +78,22 @@ class SnapshotRegressionTest(unittest.TestCase):
         self.assertEqual(market_phase('HK', self.now.replace(month=12, day=24, hour=13)), 'post_close')
         self.assertEqual(market_phase('HK', self.now.replace(day=19)), 'closed')
 
+    def test_us_plain_ticker_without_catalog_inherits_verified_alias_type(self):
+        with sqlite3.connect(self.root / 'data/meta.db') as db:
+            db.execute('CREATE TABLE asset(symbol TEXT,asset_type TEXT)')
+            db.execute('INSERT INTO asset VALUES(?,?)', ('105.SNDK', 'STOCK'))
+        with sqlite3.connect(self.root / 'data/ledger.db') as db:
+            for symbol in ('105.SNDK', 'SNDK'):
+                for archive, close in [('2026-10-22', 100), ('2026-10-23', 90)]:
+                    db.execute('INSERT INTO trenddailybar VALUES(?,?,?,?,?,?,?,?,?,?)',
+                               (archive, 'US', symbol, 'SanDisk', close, 1000, 1, 'heatmap',
+                                archive + ' 00:30:00', ''))
+        _, down, *_ = stock_anomaly_snapshot(self.root, self.now)
+        us = [r for r in down if r['market'] == 'US']
+        self.assertEqual(len(us), 1)
+        self.assertEqual(us[0]['instrument_type'], 'STOCK')
+        self.assertEqual(us[0]['raw_symbols'], ['105.SNDK', 'SNDK'])
+
     def test_macro_observation_stale_rolls_up_without_stale_collector(self):
         now = self.now
         payload = dict(refreshed_at=now.timestamp(), macro_checked_at=now.timestamp(),

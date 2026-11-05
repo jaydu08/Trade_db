@@ -11,8 +11,10 @@ private migration reports.
 - `Caddyfile`: port 80 reverse proxy to the unchanged application on port 9800.
 - `logrotate.conf`: bounded application stdout/file logs; do not copy old logs.
 
-Retain Asia/Shanghai timezone and existing schedules: weekday snapshot retries
-19:12/19:18/19:23; weekly/monthly eligibility checks 09:30/09:40/09:50.
+Retain Asia/Shanghai timezone. Weekday first attempt: 19:12, timeout 600 seconds
+(before the 19:25 target). Independently enable the two timers from `deploy/`:
+`trend-agent-snapshot-retry-1940.timer` and `trend-agent-snapshot-retry-1955.timer`.
+Weekly/monthly eligibility checks remain 09:30/09:40/09:50.
 The exporter decides whether the date is Sunday/month-end. Do not replace frozen
 archives or publish incomplete staging data simply to test migration.
 
