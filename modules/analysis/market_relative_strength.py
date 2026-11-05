@@ -27,7 +27,7 @@ def _finite(value):
         return None
 
 
-def fetch_index_return(market: str, target_date: dt.date):
+def _fetch_sina_index_return(market: str, target_date: dt.date):
     """Use the same Sina quote source as the daily stock scan, only if fresh."""
     symbol, name = INDEXES[market]
     response = requests.get(
@@ -52,6 +52,19 @@ def fetch_index_return(market: str, target_date: dt.date):
     if pct is None or str(target_date) not in asof.replace("/", "-"):
         raise ValueError(f"stale or invalid {market} benchmark quote: {asof}")
     return {"return_pct": round(pct, 4), "basis": name, "source": "Sina index quote", "asof": asof}
+
+
+def fetch_index_return(market: str, target_date: dt.date):
+    try:
+        return _fetch_sina_index_return(market, target_date)
+    except (requests.RequestException, ValueError, IndexError):
+        from modules.ingestion.tencent_quote import fetch_quotes
+        code = {'CN': 'sh000300', 'HK': 'HSI', 'US': 'INX'}[market]
+        quote = fetch_quotes([code], market).get(code)
+        if not quote or str(target_date) not in quote['timestamp']:
+            raise ValueError('Tencent benchmark unavailable or stale: ' + market)
+        return {'return_pct': round(quote['pct_chg'], 4), 'basis': INDEXES[market][1],
+                'source': 'Tencent index quote', 'asof': quote['timestamp']}
 
 
 def liquid_stock_median(frame, market: str):

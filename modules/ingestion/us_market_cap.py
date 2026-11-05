@@ -147,7 +147,17 @@ def get_us_market_metrics(symbol: str) -> Dict[str, float]:
     sina = _market_cap_from_sina(raw)
     if sina:
         return sina
+    return _market_cap_from_tencent(raw)
 
+
+def _market_cap_from_tencent(raw: str) -> Dict[str, float]:
+    from modules.ingestion.tencent_quote import fetch_quotes
+    quote = fetch_quotes([raw], 'US').get(raw, {})
+    cap = quote.get('market_cap')
+    if cap and quote.get('currency') == 'USD':
+        return {'provider': 'tencent', 'symbol': raw,
+                'market_cap_musd': round(cap / 1000000, 4),
+                'market_cap_100m_usd': round(cap / 100000000, 4)}
     return {}
 
 
@@ -157,4 +167,4 @@ def get_us_market_metrics_light(symbol: str) -> Dict[str, float]:
     raw = str(symbol or "").split(".")[-1].strip().upper()
     if not raw:
         return {}
-    return _market_cap_from_sina(raw)
+    return _market_cap_from_sina(raw) or _market_cap_from_tencent(raw)

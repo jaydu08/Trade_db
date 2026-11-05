@@ -169,7 +169,9 @@ class USPremarketScannerService:
         for row in rows:
             # Sina usually carries the pre-market reference close. Local EOD is only a
             # fallback because sparse daily caches can lag by one trading session.
-            if USPremarketScannerService._to_float(row.get("sina_prev_close")) > 0:
+            if (USPremarketScannerService._to_float(row.get("sina_prev_close")) > 0
+                    or row.get('reference_close_source') in {'Yahoo completed regular session',
+                                                           'Nasdaq completed regular session'}):
                 continue
             sym = USPremarketScannerService._normalize_us_symbol(row.get("symbol", ""))
             local = mapping.get(sym)
@@ -416,7 +418,7 @@ class USPremarketScannerService:
             text = resp.text or ""
         except Exception as e:
             logger.warning("US premarket: sina batch failed size=%s err=%s", len(symbols), e)
-            return []
+            text = ""
 
         results = []
         for line in text.splitlines():
@@ -467,6 +469,11 @@ class USPremarketScannerService:
                 })
             except Exception:
                 continue
+        found = {row['symbol'] for row in results}
+        missing = [symbol for symbol in symbols if symbol not in found]
+        if missing:
+            from modules.ingestion.us_premarket_fallback import fetch_premarket
+            results.extend(fetch_premarket(missing, timeout=timeout_sec))
         return results
 
     @staticmethod

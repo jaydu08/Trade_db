@@ -127,6 +127,8 @@ class AsyncMarketProber:
             await asyncio.sleep(random.uniform(0.1, 0.5))
             
             async with session.get(url, headers=REFERER_HEADER, timeout=10) as response:
+                if response.status == 403:
+                    return None  # Switch provider; do not repeatedly hit a denied endpoint.
                 response.raise_for_status()
                 # Sina 返回的是 GBK 编码数据
                 text = await response.text(encoding="gbk", errors="ignore")
@@ -166,6 +168,19 @@ class AsyncMarketProber:
                 elif response is not None:
                     results[self._result_key(symbol, market)] = response
                     
+        missing_by_market = {}
+        for item in items:
+            if item['market'] not in {'CN', 'HK', 'US'}:
+                continue
+            if self._result_key(item['symbol'], item['market']) not in results:
+                missing_by_market.setdefault(item['market'], []).append(item['symbol'])
+        if missing_by_market:
+            from modules.ingestion.tencent_quote import fetch_quotes
+            loop = asyncio.get_running_loop()
+            for market, symbols in missing_by_market.items():
+                fallback = await loop.run_in_executor(None, fetch_quotes, symbols, market)
+                for symbol, quote in fallback.items():
+                    results[self._result_key(symbol, market)] = quote
         return results
 
 # 全局单例

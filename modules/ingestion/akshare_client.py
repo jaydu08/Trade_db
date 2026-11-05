@@ -245,6 +245,10 @@ class AkShareClient:
                         }
                     except Exception:
                         continue
+        missing = [symbol for symbol in query_map.values() if symbol not in results]
+        if missing:
+            from modules.ingestion.tencent_quote import fetch_quotes
+            results.update(fetch_quotes(missing, market))
         return results
 
     @staticmethod
@@ -362,6 +366,23 @@ class AkShareClient:
                         })
                     except: continue
                     
+        found = {row['代码'] for row in results if row.get('最新价', 0) > 0}
+        missing = [sym for sym, _ in query_map.values() if sym not in found]
+        if missing:
+            from modules.ingestion.tencent_quote import fetch_quotes
+            fallback = fetch_quotes(missing, market)
+            # Do not let a malformed primary row suppress a valid fallback.
+            results = [row for row in results if row.get('最新价', 0) > 0]
+            for sym, quote in fallback.items():
+                results.append({
+                    '代码': sym, '名称': quote['name'], '最新价': quote['price'],
+                    '涨跌幅': quote['pct_chg'], '成交额': quote['amount'],
+                    '成交量': quote['volume'], '开盘': quote['open'],
+                    '最高': quote['high'], '换手率': quote['turnover_rate'],
+                    '行情来源': quote['provider'], '行情时间': quote['timestamp'],
+                })
+            logger.warning('Stock quote fallback: market=%s primary=%s Tencent=%s missing=%s',
+                           market, len(found), len(fallback), len(missing) - len(fallback))
         return pd.DataFrame(results)
 
     @staticmethod
@@ -652,6 +673,10 @@ class AkShareClient:
         原为东方财富获取实时行情，由于IP被限，替换为新浪行情接口 (兼容原返回格式)。
         """
         import requests
+
+        if market in {'CN', 'HK', 'US'}:
+            quotes = AkShareClient.get_realtime_quotes_batch([symbol], market)
+            return quotes.get(symbol, {})
 
         if market == "CF":
             try:
