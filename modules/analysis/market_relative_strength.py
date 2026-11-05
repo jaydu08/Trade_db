@@ -29,12 +29,17 @@ def _finite(value):
 
 def _fetch_sina_index_return(market: str, target_date: dt.date):
     """Use the same Sina quote source as the daily stock scan, only if fresh."""
+    from modules.ingestion.tencent_quote import sina_available, mark_sina_denied
+    if not sina_available():
+        raise ValueError('Sina denied; provider cooling down')
     symbol, name = INDEXES[market]
     response = requests.get(
         f"http://hq.sinajs.cn/list={symbol}",
         headers={"Referer": "http://finance.sina.com.cn"},
         timeout=8,
     )
+    if response.status_code == 403:
+        mark_sina_denied()
     response.raise_for_status()
     response.encoding = "gbk"
     raw = response.text.split('="', 1)[1].split('";', 1)[0]

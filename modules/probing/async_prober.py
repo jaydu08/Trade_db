@@ -119,6 +119,9 @@ class AsyncMarketProber:
     )
     async def _fetch_quote_with_retry(self, session: aiohttp.ClientSession, symbol: str, market: str) -> Optional[Dict[str, Any]]:
         """带重试机制的行情查询 (针对单一标的或小批量)"""
+        from modules.ingestion.tencent_quote import sina_available, mark_sina_denied
+        if not sina_available():
+            return None
         sina_symbol = self._format_symbol_for_sina(symbol, market)
         url = f"{SINA_HQ_URL}{sina_symbol}"
         
@@ -128,6 +131,7 @@ class AsyncMarketProber:
             
             async with session.get(url, headers=REFERER_HEADER, timeout=10) as response:
                 if response.status == 403:
+                    mark_sina_denied()
                     return None  # Switch provider; do not repeatedly hit a denied endpoint.
                 response.raise_for_status()
                 # Sina 返回的是 GBK 编码数据

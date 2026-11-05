@@ -1,0 +1,16 @@
+[Unit]
+Description=Alpha Binance signals monitor (migration candidate)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/alpha_news
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/.pyenv/versions/3.8.5/bin/python3 -m bn_monitor_v2.main --push --settings /root/alpha_news/config/bn_monitor_v2.yaml
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

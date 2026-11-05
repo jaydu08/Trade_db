@@ -13,6 +13,8 @@ receives 200. No proxy or regional-block bypass is installed.
 
 - Keep Sina as the first provider; fill missing ordinary stock/index quotes from
   Tencent public quotes. Preserve the provider name, actual timestamp and currency.
+  A definite Sina 403 opens a five-minute process-local cooldown, so subsequent
+  UI requests do not repeatedly wait for a denied endpoint.
 - Convert Mainland volume from hands to shares, amount from CNY 10,000 to CNY.
   HK and US volume/amount already use shares/local currency.
 - Missing/invalid fields remain unavailable, not fabricated. Regular US quotes
@@ -41,7 +43,7 @@ over port 80; the previous Caddy configuration is privately backed up for rollba
 
 ## Verification
 
-- 20 new normalization, fallback, benchmark and premarket tests pass.
+- 21 new normalization, fallback, benchmark and premarket tests pass.
 - Existing Trade_db baseline: 81 tests, 4 pre-existing errors in
   `test_paper_trading_reviewer.py`, reproduced on the old server.
 - 47 crypto/security/DEX/Flap tests pass; Binance push regression set passes too.

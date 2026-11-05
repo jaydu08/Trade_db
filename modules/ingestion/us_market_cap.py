@@ -64,6 +64,9 @@ def _finnhub_cap_to_musd(symbol: str, cap_m: float, payload: Dict) -> tuple[floa
 
 
 def _market_cap_from_sina(raw: str) -> Dict[str, float]:
+    from modules.ingestion.tencent_quote import sina_available, mark_sina_denied
+    if not sina_available():
+        return {}
     try:
         sid = _to_sina_symbol(raw)
         resp = requests.get(
@@ -71,6 +74,9 @@ def _market_cap_from_sina(raw: str) -> Dict[str, float]:
             headers={"Referer": "http://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"},
             timeout=6,
         )
+        if resp.status_code == 403:
+            mark_sina_denied()
+            return {}
         text = (resp.text or "").strip()
         if (not text) or ("=\"\"" in text):
             return {}

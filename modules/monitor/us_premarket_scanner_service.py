@@ -413,8 +413,13 @@ class USPremarketScannerService:
         # Convert to Sina format: gb_aapl, gb_msft, ...
         sina_syms = [f"gb_{s.lower().replace('.', '$')}" for s in symbols]
         try:
+            from modules.ingestion.tencent_quote import sina_available, mark_sina_denied
+            if not sina_available():
+                raise ValueError('Sina denied; provider cooling down')
             url = f"{USPremarketScannerService.SINA_HQ_URL}{','.join(sina_syms)}"
             resp = requests.get(url, headers=USPremarketScannerService.SINA_HEADERS, timeout=timeout_sec)
+            if resp.status_code == 403:
+                mark_sina_denied()
             text = resp.text or ""
         except Exception as e:
             logger.warning("US premarket: sina batch failed size=%s err=%s", len(symbols), e)

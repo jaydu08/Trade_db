@@ -1,0 +1,16 @@
+[Unit]
+Description=Alpha DEX alerts (migration candidate)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/alpha_news
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/.pyenv/versions/3.8.5/bin/python3 /root/alpha_news/tools/dex_monitor.py
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

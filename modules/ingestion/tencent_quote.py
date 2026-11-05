@@ -10,10 +10,21 @@ import datetime as dt
 import logging
 import math
 import re
+import time
 
 import requests
 
 logger = logging.getLogger(__name__)
+_SINA_RETRY_AFTER = 0.0
+
+
+def sina_available():
+    return time.monotonic() >= _SINA_RETRY_AFTER
+
+
+def mark_sina_denied():
+    global _SINA_RETRY_AFTER
+    _SINA_RETRY_AFTER = max(_SINA_RETRY_AFTER, time.monotonic() + 300)
 
 
 def quote_code(symbol: str, market: str) -> str:

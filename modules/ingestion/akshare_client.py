@@ -169,6 +169,9 @@ class AkShareClient:
         batches = [sina_symbols[i:i + batch_size] for i in range(0, len(sina_symbols), batch_size)]
 
         def _fetch_batch(batch):
+            from modules.ingestion.tencent_quote import sina_available, mark_sina_denied
+            if not sina_available():
+                return []
             try:
                 url = "http://hq.sinajs.cn/list=" + ",".join(batch)
                 resp = requests.get(
@@ -176,6 +179,9 @@ class AkShareClient:
                     headers={"Referer": "http://finance.sina.com.cn"},
                     timeout=12,
                 )
+                if resp.status_code == 403:
+                    mark_sina_denied()
+                    return []
                 resp.raise_for_status()
                 resp.encoding = "gbk"
                 return resp.text.splitlines()
@@ -308,9 +314,15 @@ class AkShareClient:
         
         results = []
         def fetch_batch(batch):
+            from modules.ingestion.tencent_quote import sina_available, mark_sina_denied
+            if not sina_available():
+                return []
             try:
                 url = "http://hq.sinajs.cn/list=" + ",".join(batch)
                 resp = requests.get(url, headers={"Referer": "http://finance.sina.com.cn"}, timeout=10)
+                if resp.status_code == 403:
+                    mark_sina_denied()
+                    return []
                 return resp.text.splitlines()
             except: return []
                 

@@ -19,6 +19,21 @@ def sample(code, stamp='20261105160000', volume='100', amount='200', price='10',
 
 
 class TencentQuoteTests(unittest.TestCase):
+    def setUp(self):
+        from modules.ingestion import tencent_quote
+        self.cooldown = patch.object(tencent_quote, '_SINA_RETRY_AFTER', 0)
+        self.cooldown.start()
+        self.addCleanup(self.cooldown.stop)
+
+    def test_permission_denial_has_bounded_cooldown(self):
+        from modules.ingestion.tencent_quote import sina_available, mark_sina_denied
+        with patch('modules.ingestion.tencent_quote.time.monotonic', return_value=100):
+            self.assertTrue(sina_available())
+            mark_sina_denied()
+            self.assertFalse(sina_available())
+        with patch('modules.ingestion.tencent_quote.time.monotonic', return_value=401):
+            self.assertTrue(sina_available())
+
     def test_symbol_mapping(self):
         self.assertEqual(quote_code('105.MSTR', 'US'), 'usMSTR')
         self.assertEqual(quote_code('BRK.B', 'US'), 'usBRK.B')
@@ -77,6 +92,7 @@ class TencentQuoteTests(unittest.TestCase):
         quote = parse_quotes(sample('hk00700'), {'hk00700': '00700'}, 'HK')['00700']
         fetch.return_value = {'00700': quote}
         with patch('modules.ingestion.akshare_client.requests.get') as get:
+            get.return_value.status_code = 403
             get.return_value.raise_for_status.side_effect = requests.HTTPError('403')
             result = AkShareClient.get_realtime_quotes_batch(['00700'], 'HK')
         self.assertEqual(result['00700']['provider'], 'Tencent')
