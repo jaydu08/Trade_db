@@ -1,5 +1,7 @@
 """Private, atomic publication receipts and bounded operational alerts."""
 import json
+import fcntl
+import hashlib
 import os
 import re
 import sys
@@ -18,7 +20,7 @@ def classify_failure(exc, stage):
         return 'upload_failed'
     if stage == 'verify':
         return 'verification_failed'
-    if re.search(r'not ready|unavailable|insufficient|coverage|source|completed session', diagnostic, re.I):
+    if re.search(r'not ready|unavailable|insufficient|coverage|source|completed.*session|NYSE|verified.*close', diagnostic, re.I):
         return 'data_source_unavailable'
     return 'generation_failed'
 
@@ -47,8 +49,7 @@ def receipt(root, mode, started, status, stage, **extra):
     return result
 
 
-def alert(root, result):
-    """Operational failure only, separate from all market-signal templates."""
+def _send_operational(root, text):
     try:
         from dotenv import dotenv_values
         import requests
@@ -57,14 +58,65 @@ def alert(root, result):
         chat = config.get('TELEGRAM_ADMIN_ID') or (config.get('ALLOWED_USER_IDS') or '').split(',')[0]
         if not token or not chat:
             return False
-        text = ('⚠️ Agent快照发布失败（运维告警，非行情信号）\n'
-                f"日期: {result['archive_date']}\n阶段: {result['stage']}\n"
-                f"分类: {result['category']}\n后续独立定时任务将继续重试。")
         response = requests.post('https://api.telegram.org/bot' + token + '/sendMessage',
                                  json={'chat_id': chat, 'text': text}, timeout=10)
         return response.status_code == 200 and bool(response.json().get('ok'))
     except Exception:
         return False
+
+
+def _notify_once(root, result, recovered=False):
+    """Cross-invocation/day deduplication, independent of all market alerts."""
+    directory = Path(root) / 'data/agent_publication_status'
+    directory.mkdir(parents=True, exist_ok=True)
+    day, mode = result['archive_date'], result['mode']
+    path = directory / f'{day}-{mode}-alerts.json'
+    with (directory / 'alerts.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            state = json.loads(path.read_text())
+        except (OSError, ValueError):
+            state = {'sent': [], 'active': False, 'epoch': 0}
+        if recovered:
+            # Also recognize failures recorded before the deduplication upgrade.
+            if not state['active'] and not state.get('recovered'):
+                for attempt in (directory / day).glob('*-' + mode + '.json'):
+                    try:
+                        if json.loads(attempt.read_text()).get('status') == 'failed':
+                            state['active'] = True
+                            break
+                    except (OSError, ValueError):
+                        pass
+            if not state['active']:
+                return False
+            key = f"recovery:{state['epoch']}"
+            text = (f"✅ Agent快照发布已恢复（运维通知）\n日期: {day}\n"
+                    f"模式: {mode}\n已从 agent-data 分支回读验证。")
+        else:
+            diagnostic = re.sub(r'\d+', '#', result.get('diagnostic', ''))
+            cause = '|'.join((result['stage'], result['category'], diagnostic))
+            key = f"failure:{state['epoch']}:" + hashlib.sha256(cause.encode()).hexdigest()[:20]
+            state['active'] = True
+            state['recovered'] = False
+            text = ('⚠️ Agent快照发布失败（运维告警，非行情信号）\n'
+                    f"日期: {day}\n阶段: {result['stage']}\n分类: {result['category']}\n"
+                    '后续独立定时任务将继续重试；同日同一故障不重复提醒。')
+        sent = False
+        if key not in state['sent'] and _send_operational(root, text):
+            state['sent'].append(key)
+            sent = True
+            if recovered:
+                state.update(active=False, recovered=True, epoch=state['epoch'] + 1)
+        atomically_write(path, (json.dumps(state) + '\n').encode())
+        return sent
+
+
+def alert(root, result):
+    return _notify_once(root, result)
+
+
+def recovery(root, result):
+    return _notify_once(root, result, recovered=True)
 
 
 def systemd_finalize(root):

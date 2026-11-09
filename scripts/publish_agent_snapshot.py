@@ -91,6 +91,11 @@ def publish(root, crypto_db, repo, preview_periods=False, daily_only=False, peri
                (30, (now + timedelta(days=1)).month != now.month)]
         for days, scheduled in due:
             if not (daily_only or focus_only or extensions_only) and (scheduled or preview_periods):
+                folder = "weekly" if days == 7 else "monthly"
+                if ((root / 'data/ledger.db').exists() and
+                        not (output / folder / f'{now.date().isoformat()}.json').exists()):
+                    from collect_agent_us_closes import collect as collect_us
+                    collect_us(root, now)
                 snapshot, size = generate_period(root, crypto_db, output, days, now)
                 folder = "weekly" if days == 7 else "monthly"
                 allowed.add(f"agent/v1/{folder}/{now.date().isoformat()}.json")
@@ -134,7 +139,7 @@ def main():
     mode.add_argument("--focus-only", action="store_true", help="publish research universe only, without market scans")
     mode.add_argument("--extensions-only", action="store_true", help="publish classified securities and global ETF supplement without freezing daily/period archives")
     args = parser.parse_args()
-    from agent_publication_status import receipt, classify_failure, safe_error, alert
+    from agent_publication_status import receipt, classify_failure, safe_error, alert, recovery
     started = datetime.now(ZoneInfo('Asia/Shanghai'))
     mode_name = ('daily' if args.daily_only else 'period' if args.period_only else
                  'focus' if args.focus_only else 'extensions' if args.extensions_only else 'combined')
@@ -152,8 +157,10 @@ def main():
         sent = alert(args.root, result)
         print(json.dumps({'operational_alert_sent': sent}), flush=True)
         raise SystemExit(1)
-    receipt(args.root, mode_name, started, 'verified' if published else 'not_due', STAGE,
-            commit=commit, published=published)
+    result = receipt(args.root, mode_name, started, 'verified' if published else 'not_due', STAGE,
+                     commit=commit, published=published)
+    if published:
+        recovery(args.root, result)
     print(f"Published {published}, commit {commit}")
 
 

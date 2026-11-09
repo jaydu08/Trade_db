@@ -76,6 +76,34 @@ class PeriodTest(unittest.TestCase):
                   (datetime(2026, 10, 14).date(), {'close': 110})]
         self.assertIsNone(period._return(points, 30)[0])
 
+    def test_mixed_us_history_dates_and_weekend_expected_session(self):
+        now = datetime.fromisoformat('2026-11-08T09:30:00+08:00')
+        self._bar('US','REAL','2026-10-30',100,source='trend_pool_history_backfill')
+        self._bar('US','REAL','2026-11-06',110,source='trend_pool_history_backfill')
+        self._bar('US','LAG','2026-10-31',100,source='heatmap')
+        self._bar('US','LAG','2026-11-05',150,source='heatmap')
+        rows, health = period.stock_period(self.root,7,now,{})
+        real = next(row for row in rows if row['symbol']=='REAL')
+        self.assertEqual(real['session_date'],'2026-11-06')
+        self.assertEqual(real['return_pct'],10)
+        self.assertNotIn('LAG',{row['symbol'] for row in rows})
+        us = next(row for row in health if row['domain']=='stocks_US')
+        self.assertEqual(us['expected_session_date'],'2026-11-06')
+        self.assertFalse(us['stale'])
+        self.assertEqual(us['latest_session_coverage_status'],'insufficient')
+
+    def test_late_verified_recovery_is_explicit_opt_in(self):
+        now = datetime.fromisoformat('2026-11-08T09:30:00+08:00')
+        self._bar('US','RECOVER','2026-10-31',100,source='heatmap')
+        self._bar('US','RECOVER','2026-11-07',110,source='agent_us_verified_close')
+        with sqlite3.connect(self.root / 'data/ledger.db') as db:
+            db.execute("UPDATE trenddailybar SET updated_at='2026-11-09 13:00:00' WHERE source='agent_us_verified_close'")
+        ordinary,_ = period.stock_period(self.root,7,now,{})
+        self.assertNotIn('RECOVER',{row['symbol'] for row in ordinary})
+        corrected,_ = period.stock_period(self.root,7,now,{},allow_late_verified_backfill=True)
+        recovered = next(row for row in corrected if row['symbol']=='RECOVER')
+        self.assertEqual(recovered['session_date'],'2026-11-06')
+
     def test_month_end_morning_excludes_incomplete_stock_session(self):
         morning = datetime(2026, 11, 30, 9, 35, tzinfo=timezone(timedelta(hours=8)))
         with sqlite3.connect(self.root / 'data/ledger.db') as db:

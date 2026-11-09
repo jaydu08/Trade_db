@@ -37,6 +37,31 @@ class IdentityTest(unittest.TestCase):
 
 
 class PublicationReliabilityTest(unittest.TestCase):
+    def test_independent_attempts_deduplicate_and_recover_once(self):
+        from agent_publication_status import alert, recovery
+        with tempfile.TemporaryDirectory() as temp, \
+             patch('agent_publication_status._send_operational', return_value=True) as send:
+            root = Path(temp)
+            result = dict(archive_date='2026-11-09', mode='daily', stage='generate',
+                          category='data_source_unavailable', diagnostic='US close not ready: 0/100')
+            self.assertTrue(alert(root, result))
+            self.assertFalse(alert(root, dict(result, diagnostic='US close not ready: 2/101')))
+            self.assertFalse(alert(root, result))
+            self.assertTrue(recovery(root, result))
+            self.assertFalse(recovery(root, result))
+            self.assertEqual(send.call_count, 2)
+            self.assertTrue(alert(root, result))  # A new failure after recovery must alert.
+            self.assertTrue(alert(root, dict(result, stage='upload', category='upload_failed')))
+
+    def test_failed_notification_is_retried(self):
+        from agent_publication_status import alert
+        result = dict(archive_date='2026-11-09', mode='daily', stage='upload', category='upload_failed')
+        with tempfile.TemporaryDirectory() as temp, \
+             patch('agent_publication_status._send_operational', side_effect=[False, True]) as send:
+            self.assertFalse(alert(Path(temp), result))
+            self.assertTrue(alert(Path(temp), result))
+            self.assertEqual(send.call_count, 2)
+
     def test_service_timeout_writes_failure_and_alerts_once(self):
         with tempfile.TemporaryDirectory() as temp, \
              patch.dict(os.environ, {'SERVICE_RESULT': 'timeout', 'INVOCATION_ID': 'test-timeout'}), \

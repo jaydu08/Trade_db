@@ -9,12 +9,16 @@ from generate_agent_snapshot import atomically_write, read_json, stock_snapshot
 
 
 def collect(root, now):
+    from collect_agent_us_closes import collect as collect_us
+    from modules.market_sessions import us_last_completed
+    collect_us(root, now)
     sys.path.insert(0, str(root))
     from modules.ingestion.market_context import qualify_breadth
     cached = read_json(root / 'data/agent_market_context' / (now.date().isoformat() + '.json'), {})
     try:
         age = (now - datetime.fromisoformat(cached['generated_at'])).total_seconds()
-        if 0 <= age < 900 and set(cached.get('markets', {})) == {'CN', 'HK', 'US'} and not cached.get('errors'):
+        if (0 <= age < 900 and set(cached.get('markets', {})) == {'CN', 'HK', 'US'} and not cached.get('errors')
+                and cached['markets']['US'].get('session_date') == str(us_last_completed(now))):
             for market, segment in cached['markets'].items():
                 segment['breadth'] = qualify_breadth(market, segment.get('breadth', {}))
             atomically_write(root / 'data/agent_market_context' / (now.date().isoformat() + '.json'),

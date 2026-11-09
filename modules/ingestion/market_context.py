@@ -120,6 +120,16 @@ def qualify_breadth(market, record):
                 else 'too few same-session quotes to publish meaningful market breadth')
 
 
+def qualify_index_record(record):
+    record = dict(record)
+    if record.get('market') == 'US':
+        # Index points * vendor volume is not traded USD. This field has no
+        # verified cash-notional definition for Tencent US index symbols.
+        record.update(turnover=None, turnover_currency=None,
+                      turnover_missing_reason='US index quote amount/unit not verified; never treat index-points times volume as USD turnover')
+    return record
+
+
 def fetch_indices(market, expected, now):
     from modules.ingestion.tencent_quote import fetch_quotes
     quotes = fetch_quotes([code for code, _, _ in INDEXES[market]], market)
@@ -130,7 +140,12 @@ def fetch_indices(market, expected, now):
         valid = stamp[:10] == expected and bool(quote.get('price'))
         try:
             observed = dt.datetime.fromisoformat(stamp).replace(tzinfo=ZoneInfo(quote.get('timestamp_timezone') or 'Asia/Shanghai'))
-            valid = valid and observed.hour >= (15 if market == 'CN' else 16) and observed <= now.astimezone(observed.tzinfo)
+            if market == 'US':
+                from modules.market_sessions import us_close_at
+                closed = observed >= us_close_at(dt.date.fromisoformat(expected))
+            else:
+                closed = observed.hour >= (15 if market == 'CN' else 16)
+            valid = valid and closed and observed <= now.astimezone(observed.tzinfo)
         except ValueError:
             valid = False
         result.append(dict(symbol=code, name=name, market=market, exchange=exchange,
@@ -146,4 +161,4 @@ def fetch_indices(market, expected, now):
                            price_adjustment='index-provider published level; not a stock adjusted price',
                            quality='ok' if valid else 'missing', stale=not valid,
                            missing_reason=None if valid else 'index quote absent or does not match expected completed session'))
-    return result
+    return [qualify_index_record(row) for row in result]

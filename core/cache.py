@@ -6,6 +6,8 @@ Cache 缓存管理 - DiskCache 封装
 import logging
 import hashlib
 import pickle
+import sqlite3
+import time
 from typing import Any, Callable, Optional, TypeVar
 from functools import wraps
 
@@ -40,10 +42,12 @@ class CacheManager:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         
         # 初始化 DiskCache
-        self._cache = Cache(
-            directory=str(CACHE_DIR),
-            size_limit=CACHE_SIZE_LIMIT,
-        )
+        self._cache = None
+        self._failure_until = 0.0
+        try:
+            self._cache = Cache(directory=str(CACHE_DIR), size_limit=CACHE_SIZE_LIMIT)
+        except (sqlite3.Error, OSError) as exc:
+            self._cache_failed(exc)
         
         self._initialized = True
         logger.info(f"CacheManager initialized: {CACHE_DIR}")
@@ -55,39 +59,70 @@ class CacheManager:
     
     def get(self, key: str) -> Optional[Any]:
         """获取缓存值"""
-        value = self._cache.get(key)
+        if self._cache is None or time.monotonic() < self._failure_until:
+            return None
+        try:
+            value = self._cache.get(key)
+        except (sqlite3.Error, OSError) as exc:
+            self._cache_failed(exc)
+            return None
         if value is not None:
             logger.debug(f"Cache hit: {key}")
         return value
     
     def set(self, key: str, value: Any, ttl: int = CACHE_TTL_SECONDS) -> None:
         """设置缓存值"""
-        self._cache.set(key, value, expire=ttl)
+        if self._cache is None or time.monotonic() < self._failure_until:
+            return
+        try:
+            self._cache.set(key, value, expire=ttl)
+        except (sqlite3.Error, OSError) as exc:
+            self._cache_failed(exc)
+            return  # A disposable cache must never discard a valid upstream response.
         logger.debug(f"Cache set: {key} (ttl={ttl}s)")
     
     def delete(self, key: str) -> bool:
         """删除缓存值"""
-        result = self._cache.delete(key)
+        if self._cache is None or time.monotonic() < self._failure_until:
+            return False
+        try:
+            result = self._cache.delete(key)
+        except (sqlite3.Error, OSError) as exc:
+            self._cache_failed(exc)
+            return False
         if result:
             logger.debug(f"Cache deleted: {key}")
         return result
     
     def clear(self) -> None:
         """清空所有缓存"""
-        self._cache.clear()
+        if self._cache is None or time.monotonic() < self._failure_until:
+            return
+        try:
+            self._cache.clear()
+        except (sqlite3.Error, OSError) as exc:
+            self._cache_failed(exc)
+            return
         logger.info("Cache cleared")
     
     def stats(self) -> dict:
         """获取缓存统计信息"""
-        return {
-            "size": len(self._cache),
-            "volume": self._cache.volume(),
-        }
+        if self._cache is not None and time.monotonic() >= self._failure_until:
+            try:
+                return {"size": len(self._cache), "volume": self._cache.volume()}
+            except (sqlite3.Error, OSError) as exc:
+                self._cache_failed(exc)
+        return {"size": None, "volume": None, "available": False}
     
     def close(self) -> None:
         """关闭缓存"""
-        self._cache.close()
+        if self._cache is not None:
+            self._cache.close()
         logger.info("Cache closed")
+
+    def _cache_failed(self, exc):
+        self._failure_until = time.monotonic() + 60
+        logger.error('Disposable quote cache unavailable (%s); use uncached upstream data for 60s', type(exc).__name__)
 
 
 # 全局单例

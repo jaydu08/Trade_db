@@ -11,6 +11,12 @@ from pathlib import Path
 def audit(snapshot, output, now):
     from generate_agent_snapshot import atomically_write, immutably_create, number
     problems = []
+    from modules.market_sessions import us_last_completed
+    expected_us = str(us_last_completed(now))
+    us = next((row for row in snapshot.get('overview', {}).get('markets', [])
+               if row.get('market') == 'US'), None)
+    if us and us.get('session_date') != expected_us:
+        problems.append(f'US session mismatch: expected {expected_us}, got {us.get("session_date")}')
     required = ('schema_version', 'snapshot_id', 'generated_at', 'overview',
                 'market_anomalies', 'source_health')
     problems.extend(f'missing top-level {key}' for key in required if key not in snapshot)

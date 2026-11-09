@@ -12,6 +12,7 @@ from pathlib import Path
 from agent_research_focus import build_focus
 from agent_market_extensions import build_extensions
 from agent_market_calendar import archived_session
+from modules.market_sessions import us_last_completed, us_is_session, CALENDAR_SOURCE
 
 from generate_agent_snapshot import (NEW_YORK, SHANGHAI, classify_stock_asset, verified_hk_product,
                                      epoch_iso, immutably_create, number, read_json,
@@ -20,14 +21,14 @@ from generate_agent_snapshot import (NEW_YORK, SHANGHAI, classify_stock_asset, v
 MAX_BYTES = 300_000  # existing period payload plus up to 100 KB research focus
 
 
-def archive_session(market, archive_day):
+def archive_session(market, archive_day, source=None):
     """US archive dates are UTC ingestion dates, not NY trade dates.
 
     The existing US EOD writer runs just after 00:00 UTC and archives the
     preceding New York session. `updated_at` is a write timestamp, not a
     vendor-confirmed exchange timestamp, so it must not define the session.
     """
-    return archived_session(market, archive_day)
+    return archived_session(market, archive_day, source)
 
 
 def amount_measure(value, source, *, verified_zero=False):
@@ -115,23 +116,26 @@ def _rank(rows, limit):
             yield row
 
 
-def stock_period(root, days, now, scores):
+def stock_period(root, days, now, scores, allow_late_verified_backfill=False):
     path = root / 'data/ledger.db'
     if not path.exists():
         return [], [{'domain': 'stocks_and_commodities', 'quality': 'missing', 'missing_reason': 'ledger.db unavailable'}]
     catalog = _stock_catalog(root)
+    from agent_security_identity import catalog_type, canonical_symbol
+    catalog_types = {symbol: meta['asset_type'] for symbol, meta in catalog.items()}
     with closing(readonly_db(path)) as db:
         raw = db.execute('SELECT date,market,symbol,name,close,amount,turnover_rate,source,updated_at '
                          'FROM trenddailybar WHERE date>=? AND close>0',
                          ((now.date() - timedelta(days=days + 25)).isoformat(),)).fetchall()
         seen = defaultdict(dict)
-        preference = {'heatmap': 4, 'daily_hot': 3, 'commodity': 3, 'trend_pool_refresh_eod': 1}
+        preference = {'agent_us_verified_close':5, 'heatmap': 4, 'daily_hot': 3, 'commodity': 3, 'trend_pool_refresh_eod': 1}
         local_now = now.astimezone(SHANGHAI)
         today = local_now.date().isoformat()
         incomplete_markets = set()
         for row in raw:
             written = utc_naive_iso(row['updated_at'])
-            if written and datetime.fromisoformat(written) > now.astimezone(timezone.utc):
+            if (written and datetime.fromisoformat(written) > now.astimezone(timezone.utc)
+                    and not (allow_late_verified_backfill and row['source']=='agent_us_verified_close')):
                 # A historical replay must not see rows backfilled after its cutoff.
                 continue
             # A/H and commodity bars from a morning trading session are not a
@@ -142,9 +146,12 @@ def stock_period(root, days, now, scores):
             if row['date'] > today:
                 continue
             key = (row['market'], str(row['symbol']))
-            prior = seen[key].get(row['date'])
+            point_day = archive_session(row['market'],row['date'],row['source']).isoformat()
+            if row['market']=='US' and point_day > str(us_last_completed(now)):
+                continue
+            prior = seen[key].get(point_day)
             if prior is None or preference.get(row['source'], 0) > preference.get(prior['source'], 0):
-                seen[key][row['date']] = row
+                seen[key][point_day] = row
         latest_market = {}
         for (market, _), by_day in seen.items():
             last = max(by_day)
@@ -155,28 +162,41 @@ def stock_period(root, days, now, scores):
             persistence[(row['market'], str(row['symbol']))].add(row['date'])
     market_sessions = defaultdict(set)
     for (market, _), by_day in seen.items():
-        market_sessions[market].update(archive_session(market, day) for day in by_day)
+        market_sessions[market].update(date.fromisoformat(day) for day in by_day)
+    actual_reference = {market:max(sessions) for market,sessions in market_sessions.items() if sessions}
+    if market_sessions.get('US'):
+        day = min(market_sessions['US'])
+        while day <= us_last_completed(now):
+            if us_is_session(day): market_sessions['US'].add(day)
+            day += timedelta(days=1)
     reference = {market: max(sessions) for market, sessions in market_sessions.items() if sessions}
     groups, health, excluded = defaultdict(list), [], defaultdict(list)
     for market in ('CN', 'HK', 'US', 'CF'):
         last = reference.get(market)
+        latest_count = len({canonical_symbol(m,symbol) for (m, symbol), points in seen.items()
+                            if m == market and last and last.isoformat() in points})
         health.append({'domain': f'stocks_{market}' if market != 'CF' else 'commodities',
-                       'data_asof': last.isoformat() if last else None,
+                       'data_asof': actual_reference.get(market).isoformat() if actual_reference.get(market) else None,
+                       'expected_session_date': str(us_last_completed(now)) if market=='US' else None,
                        'market_reference_session': last.isoformat() if last and market != 'CF' else None,
                        'archive_reference_date': last.isoformat() if last and market == 'CF' else None,
                        'calendar_basis': ('CF archive date; exchange session not verified' if market == 'CF' else
-                                          'observed market-wide TrendDailyBar sessions; not an official exchange calendar'),
+                                          CALENDAR_SOURCE if market=='US' else 'observed market-wide TrendDailyBar sessions; not an official exchange calendar'),
                        'coverage_pool': 'TrendDailyBar candidate archive; not full market',
+                       'latest_session_security_count': latest_count,
+                       'latest_session_coverage_status': 'sufficient' if latest_count >= 10 else 'insufficient',
                        'quality': 'partial' if last else 'missing',
-                       'stale': not last or (now.date() - last).days > 5,
-                       'missing_reason': None if last else 'no historical bars'})
+                       'stale': (actual_reference.get(market) != us_last_completed(now)) if market=='US' else not last or (now.date() - last).days > 5,
+                       'missing_reason': ('US archive misses latest completed exchange session' if market=='US' and actual_reference.get(market)!=us_last_completed(now)
+                                          else 'latest US session has fewer than 10 securities' if market=='US' and latest_count < 10
+                                          else None if last else 'no historical bars')})
     for (market, symbol), by_day in seen.items():
         if market not in ('CN', 'HK', 'US', 'CF'):
             continue
         points = sorted((date.fromisoformat(day), row) for day, row in by_day.items())
         end, latest = points[-1]
         market_date = reference.get(market)
-        asset_session = archive_session(market, end)
+        asset_session = end
         if not market_date:
             continue
         session_gap = sum(asset_session < session <= market_date for session in market_sessions[market])
@@ -195,7 +215,7 @@ def stock_period(root, days, now, scores):
                     'data_asof': utc_naive_iso(latest['updated_at'])})
             continue
         meta = catalog[symbol]
-        baseline_session = archive_session(market, baseline)
+        baseline_session = date.fromisoformat(baseline)
         target_session = market_date - timedelta(days=days)
         base_status, missing_base_sessions = baseline_quality(
             market_sessions[market], baseline_session, target_session)
@@ -215,7 +235,7 @@ def stock_period(root, days, now, scores):
                                 f'session(s) before target {target_session}')
         else:
             eligibility, exclusion_reason = 'eligible', None
-        asset_type, asset_source = classify_stock_asset(symbol, latest['name'], meta['asset_type'])
+        asset_type, asset_source = classify_stock_asset(symbol, latest['name'], catalog_type(market,symbol,catalog_types))
         if verified_product and verified_product.get('product_type') == 'INVERSE_ETF':
             eligibility, exclusion_reason = 'non_stock_instrument', 'inverse ETF excluded from ordinary-stock ranking'
         if market == 'CF':
@@ -267,7 +287,7 @@ def stock_period(root, days, now, scores):
                'window_basis': (f'{days} calendar archive days; CF exchange session unverified' if market == 'CF' else
                                 f'{days} calendar days ending at market reference session; earlier baseline only if no observed market session skipped'),
                'session_date': asset_session.isoformat() if market != 'CF' else None,
-               'archive_date': end.isoformat(),
+               'archive_date': latest['date'],
                'archive_reference_date': market_date.isoformat() if market == 'CF' else None,
                'market_reference_session': market_date.isoformat() if market != 'CF' else None,
                'asset_session_date': asset_session.isoformat() if market != 'CF' else None,
@@ -282,7 +302,7 @@ def stock_period(root, days, now, scores):
                'persistence': {'trend_seed_days': len(persistence[(market, symbol)]),
                                'observed_bar_days': len(points)},
                'phase_returns_pct': {'recent_half': first_half, 'earlier_half': second_half},
-               'quality': 'partial', 'stale': (now.date() - asset_session).days > 5 or eligibility != 'eligible',
+               'quality': 'partial', 'stale': (asset_session != us_last_completed(now) if market=='US' else (now.date() - asset_session).days > 5) or eligibility != 'eligible',
                'missing_reason': 'unadjusted/adjustment status unverified' }
         if eligibility == 'eligible':
             groups[market].append(row)
@@ -295,6 +315,8 @@ def stock_period(root, days, now, scores):
         item['excluded_candidates'] = sorted(excluded[market], key=lambda r: abs(r['return_pct'] or 0), reverse=True)[:limit]
     output = []
     for market, rows in groups.items():
+        from agent_security_identity import deduplicate
+        rows = deduplicate(rows)
         ordered = sorted(r['return_pct'] for r in rows)
         median = ordered[len(ordered) // 2]
         phases = {}

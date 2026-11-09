@@ -279,14 +279,18 @@ class TrendService:
     def _pick_trusted_quote(symbol: str, market: str):
         """
         趋势场景下的可信行情源策略：
-        - US: 仅信任 Finnhub（避免其他源口径偏差）
+        - US: 必须具有可核验的最近完整纽约交易日及常规收盘时间
         - 其他市场: 接受 DataManager 正常返回
         """
+        if market == 'US':
+            from modules.ingestion.tencent_quote import fetch_quotes
+            from modules.market_sessions import verified_us_quote, NY
+            quote = fetch_quotes([symbol], market).get(symbol)
+            checked = verified_us_quote(quote, dt.datetime.now(NY))
+            return checked
         from modules.ingestion.data_factory import data_manager
         quote = data_manager.get_quote(symbol, market)
         if not quote:
-            return None
-        if market == "US" and quote.get("provider") != "Finnhub":
             return None
         return quote
 
@@ -653,6 +657,9 @@ class TrendService:
                     # US 优先用可信实时源覆盖（防止口径偏差）
                     if market == "US":
                         trusted = TrendService._pick_trusted_quote(sym, market)
+                        if not trusted:
+                            # Do not archive an intraday or undated fallback as a completed close.
+                            continue
                         if trusted and float(trusted.get("price", 0) or 0) > 0:
                             close = float(trusted.get("price"))
                             pct = float(trusted.get("pct_chg", pct) or pct)

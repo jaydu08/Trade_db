@@ -101,7 +101,8 @@ class AgentDataQualityTest(unittest.TestCase):
         minimal = dict(overview={'markets': [dict(market=m, session_date='2026-10-14',
             candidate_universe=12, turnover=100, data_asof='2026-10-14T16:05:00+08:00')
             for m in ('CN', 'HK')] + [dict(market='US', session_date='2026-10-13',
-            candidate_universe=12, data_asof='2026-10-14T00:20:00+00:00')]},
+            candidate_universe=12, data_asof='2026-10-14T00:20:00+00:00',
+            verified_close_session='2026-10-13', verified_close_count=12)]},
             source_health=[dict(domain=domain, stale=False, quality='ok')
                 for domain in ('crypto_spot', 'crypto_futures', 'crypto_onchain', 'macro')],
             market_anomalies={'coverage': coverage})
@@ -156,6 +157,7 @@ class AgentDataQualityTest(unittest.TestCase):
             dict(market='HK', session_date='2026-10-16', market_status='closed',
                  candidate_universe=12, turnover=100, data_asof='2026-10-16T16:05:00+08:00'),
             dict(market='US', session_date='2026-10-16', candidate_universe=12,
+                 verified_close_session='2026-10-16',verified_close_count=12,
                  data_asof='2026-10-17T00:20:00+00:00')]},
             source_health=[dict(domain=domain, stale=False, quality='ok')
                 for domain in ('crypto_spot', 'crypto_futures', 'crypto_onchain', 'macro')],

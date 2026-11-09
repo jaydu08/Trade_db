@@ -60,6 +60,16 @@ class MarketContextTest(unittest.TestCase):
         self.assertIsNone(result[0]['close'])
         self.assertTrue(result[0]['stale'])
 
+    @patch('modules.ingestion.tencent_quote.fetch_quotes')
+    def test_us_index_amount_is_not_traded_cash_notional(self, fetch):
+        now = datetime.fromisoformat('2026-11-09T20:00:00+08:00')
+        fetch.return_value = {'INX':dict(price=7000,pct_chg=1,amount=25e12,volume=3e9,
+                                       timestamp='2026-11-06 16:37:09',timestamp_timezone='America/New_York')}
+        result = fetch_indices('US','2026-11-06',now)[0]
+        self.assertEqual(result['close'],7000)
+        self.assertIsNone(result['turnover'])
+        self.assertIn('not verified',result['turnover_missing_reason'])
+
     def test_partial_but_explicit_hk_observed_universe_is_not_all_market_estimate(self):
         from modules.ingestion.market_context import qualify_breadth
         result = qualify_breadth('HK', dict(enumerated_count=4700, covered_count=3100,

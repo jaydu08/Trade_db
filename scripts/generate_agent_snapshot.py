@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 from agent_market_calendar import (SOURCES as MARKET_CALENDAR_SOURCES, closed_reason, last_session,
                                    archived_session, market_phase)
+from modules.market_sessions import us_last_completed
 from agent_research_focus import build_focus
 from agent_market_extensions import build_extensions
 from agent_security_identity import canonical_symbol, deduplicate, catalog_type
@@ -311,8 +312,12 @@ def stock_snapshot(root, now):
             board_items = board_items if isinstance(board_items, list) else []
             board_by_symbol = {str(item.get("symbol")): item for item in board_items if isinstance(item, dict)}
             last_asof = max((utc_naive_iso(b["updated_at"]) for b in latest.values()), default=None)
-            session = archived_session(market, source_date).isoformat()
-            old = (now.date() - date.fromisoformat(source_date)).days > 4
+            session = max(archived_session(market, source_date,b['source']) for b in latest.values()).isoformat()
+            verified_us = read_json(root / f'data/agent_us_closes/{session}.json', {}) if market == 'US' else {}
+            if verified_us.get('session_date') == session:
+                observations = [r.get('observed_at') for r in verified_us.get('items',[]) if r.get('observed_at')]
+                last_asof = max(observations,default=last_asof)
+            old = session != str(us_last_completed(now)) if market == 'US' else (now.date() - date.fromisoformat(source_date)).days > 4
             activity_row = next((a for a in activity if a.get("market") == market and a.get("day") == source_date), None)
             markets.append(dict(market=market, session_date=session, archive_date=source_date,
                                 market_status=market_phase(market, now),
@@ -322,6 +327,8 @@ def stock_snapshot(root, now):
                                 quality="partial", stale=old, missing_reason=None if latest else "no valid close",
                                 turnover=number(activity_row.get("amount")) if activity_row else None,
                                 turnover_currency=CURRENCY[market], breadth=None, major_index=None,
+                                verified_close_session=verified_us.get('session_date') if market == 'US' else None,
+                                verified_close_count=verified_us.get('verified_count') if market == 'US' else None,
                                 candidate_universe=len(latest), archive_source_counts=archive_source_counts))
             health.append(dict(domain=f"stocks_{market}", session_date=session, data_asof=last_asof,
                                market_status=market_phase(market, now),
@@ -441,15 +448,22 @@ def stock_anomaly_snapshot(root, now):
                 seeds = {str(r['symbol']) for r in db.execute(
                     'SELECT symbol FROM trendseedpool WHERE market=? AND date>=?', (market, seed_cutoff))} if seed_cutoff else set()
                 source_count = len(seeds | set(by_symbol))
+                inferred = max((archived_session(market,archive,b['source']) for b in by_symbol.values()),default=None)
+                verified_payload = read_json(root / f'data/agent_us_closes/{inferred}.json',{})
+                verified_quotes = {r['symbol']:r for r in verified_payload.get('items',[])}
                 for symbol, bar in by_symbol.items():
                     price = number(bar['close'])
-                    change = bar_returns(db, market, symbol, archive, price)['1d'] if price else None
+                    verified_quote = verified_quotes.get(symbol) or {}
+                    if verified_quote and price and abs(price-verified_quote['price']) > max(.01,price*.00001):
+                        excluded['verified_close_conflict'] = excluded.get('verified_close_conflict',0)+1
+                        continue
+                    change = verified_quote.get('change_pct') if verified_quote else bar_returns(db, market, symbol, archive, price)['1d'] if price else None
                     if change is None:
                         excluded['insufficient_1d_history'] = excluded.get('insufficient_1d_history', 0) + 1
                         continue
                     rows.append(dict(symbol=symbol, name=bar['name'], price=price,
-                                     change_pct=change, observed_at=None,
-                                     source_checked_at=utc_naive_iso(bar['updated_at']),
+                                     change_pct=change, observed_at=verified_quote.get('observed_at'),
+                                     source_checked_at=verified_quote.get('collected_at') or utc_naive_iso(bar['updated_at']),
                                      provider=f"TrendDailyBar:{bar['source']}", price_type='archived_latest'))
             items, contributions = [], {}
             for row in rows:
@@ -474,7 +488,7 @@ def stock_anomaly_snapshot(root, now):
                 amount = amount if amount is not None and amount > 0 else None
                 source = row.get('provider') or 'unknown'
                 contributions[source] = contributions.get(source, 0) + 1
-                session = archived_session(market, archive).isoformat() if archive else None
+                session = archived_session(market, archive,bar['source'] if bar else None).isoformat() if archive else None
                 if market in ('CN', 'HK'):
                     session = scanned.get(market, {}).get('session_date')
                 item = dict(market=market, symbol=symbol, raw_symbol=symbol,
@@ -494,7 +508,7 @@ def stock_anomaly_snapshot(root, now):
                             trend_score=None, relative_strength_pct=None,
                             relative_strength_basis='same-market eligible candidate median; not an index',
                             session_date=session, archive_date=archive,
-                            session_date_basis=('previous UTC date of existing US EOD ingestion archive'
+                            session_date_basis=('source-aware NYSE session: vendor history date or prior session of EOD ingestion date'
                                                 if market == 'US' else 'validated current market quote scan'),
                             observed_at=row.get('observed_at'),
                             source_checked_at=row.get('source_checked_at'),
@@ -520,11 +534,13 @@ def stock_anomaly_snapshot(root, now):
                 available = len(rows)
             eligible = len(items)
             ratio = round(available / source_count, 3) if source_count else None
-            enough = bool(source_count and ratio is not None and ratio >= 0.5 and eligible >= 10)
+            enough = bool(source_count and ratio is not None and ratio >= 0.5 and eligible >= 10
+                          and (market != 'US' or inferred == us_last_completed(now)))
             coverage.append(dict(market=market, session_date=items[0]['session_date'] if items else
-                                 archived_session(market, archive).isoformat() if market == 'US' and archive else None,
+                                 archived_session(market, archive,next(iter(by_symbol.values()))['source']).isoformat() if market == 'US' and archive and by_symbol else None,
                                  market_status=market_phase(market, now),
                                  data_asof=max((i['data_asof'] for i in items if i['data_asof']), default=None),
+                                 source_checked_at=max((i['source_checked_at'] for i in items if i.get('source_checked_at')), default=None),
                                  source_universe_count=source_count, available_universe_count=available,
                                  eligible_universe_count=eligible,
                                  selected_count=len(positive[:10]) + len(negative[:10]),
@@ -539,7 +555,7 @@ def stock_anomaly_snapshot(root, now):
                                      'independent scan coverage insufficient' if not enough else
                                      'no negative returns in eligible sample' if not negative else None),
                                  quality='partial' if enough else 'missing', stale=not enough,
-                                 missing_reason=None if enough else 'independent quote scan absent or covered under half the candidate pool'))
+                                 missing_reason=None if enough else 'independent scan incomplete or market session is not the latest completed session'))
     return up, down, relative_up, relative_down, coverage
 
 
@@ -707,7 +723,8 @@ def build_snapshot(root, crypto_db, now):
     for market in markets:
         segment = context.get('markets', {}).get(market['market'], {})
         if segment.get('session_date') == market.get('session_date'):
-            indices = segment.get('indices') or []
+            from modules.ingestion.market_context import qualify_index_record
+            indices = [qualify_index_record(row) for row in segment.get('indices') or []]
             market['major_indices'] = indices
             market['major_index'] = indices[0] if indices else None
             market['breadth'] = segment.get('breadth')
@@ -726,7 +743,7 @@ def build_snapshot(root, crypto_db, now):
             if market.get('market_status') == 'closed' else
             'current-day valid TrendDailyBar symbols at generation time; not full market')
         market['observed_at'] = row.get('data_asof')
-        market['source_checked_at'] = row.get('data_asof')
+        market['source_checked_at'] = row.get('source_checked_at')
     trend_selected = []
     for market in markets:
         if market.get('market_status') == 'closed':
@@ -815,11 +832,11 @@ def ensure_daily_ready(snapshot, now, require_market_scan=True):
     us_asof = us.get("data_asof")
     if not us_asof or not us.get("candidate_universe"):
         raise ValueError("US completed session unavailable")
-    ny_asof = datetime.fromisoformat(us_asof).astimezone(NEW_YORK)
-    if (us["session_date"] != ny_asof.date().isoformat() or ny_asof.hour < 16
-            or ny_asof.date() >= now.astimezone(NEW_YORK).date()
-            or (now.astimezone(NEW_YORK).date() - ny_asof.date()).days > 4):
-        raise ValueError("US archive is not a recent completed New York session")
+    expected_us = str(us_last_completed(now))
+    if us['session_date'] != expected_us:
+        raise ValueError(f'US completed session not ready: expected {expected_us}, observed {us["session_date"]}')
+    if require_market_scan and (us.get('verified_close_session') != expected_us or (us.get('verified_close_count') or 0) < 10):
+        raise ValueError('US verified regular-close provenance not ready for ' + expected_us)
     health = {h["domain"]: h for h in snapshot["source_health"]}
     for domain in ("crypto_spot", "crypto_futures", "crypto_onchain", "macro"):
         source_stale = (health[domain].get('collection_stale', health[domain]['stale'])

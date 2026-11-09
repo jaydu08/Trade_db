@@ -1392,7 +1392,9 @@ class MarketHeatMap:
                     df = AkShareClient._to_rank_schema(AkShareClient._safe_call(["stock_us_spot"]))
         except Exception as e:
             logger.error(f"Failed to fetch market data for {market}: {e}")
-            return
+            raise RuntimeError(f'{market} heatmap quote acquisition failed') from e
+        if df is None or df.empty:
+            raise RuntimeError(f'{market} heatmap received no usable quotes')
             
         # 2. 生成榜单配置：TG 推送仍保持精简，Web 当日强势额外落库更宽候选池。
         def _env_int(name: str, default: int) -> int:

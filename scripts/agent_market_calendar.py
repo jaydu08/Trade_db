@@ -8,6 +8,10 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 from zoneinfo import ZoneInfo
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from modules.market_sessions import us_archive_session, us_last_completed, us_is_session
 
 SOURCES = {
     'CN': 'https://www.sse.com.cn/disclosure/dealinstruc/closed/',
@@ -65,10 +69,10 @@ def last_session(market: str, day: date):
     return candidate
 
 
-def archived_session(market, archive_day):
+def archived_session(market, archive_day, source=None):
     """US EOD archives are dated by next UTC ingestion day, not exchange day."""
     day = date.fromisoformat(str(archive_day))
-    return day - timedelta(days=1) if market == 'US' else day
+    return us_archive_session(day, source) if market == 'US' else day
 
 
 def market_phase(market, now):
