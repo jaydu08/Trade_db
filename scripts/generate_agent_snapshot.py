@@ -97,8 +97,17 @@ def macro_freshness(item_id, observed, checked, now, category='macro'):
     if category == 'macro' and item_id == 'DFEDTARU':
         return 'unknown', False, 'policy target changes on announcement, not each trading day', None
     if category == 'futures':
-        age = (now.date() - observed_day).days
-        return ('stale', True, 'futures quote is not from the current session', now.date().isoformat()) if age > 1 else ('ok', False, None, now.date().isoformat())
+        try:
+            stamp = datetime.fromisoformat(str(observed).replace('Z','+00:00'))
+            if stamp.tzinfo is None:
+                return 'missing', True, 'futures observation requires timezone and intraday time', None
+            age = (now-stamp).total_seconds()
+        except ValueError:
+            return 'missing', True, 'invalid futures observation time', None
+        if age < -300:
+            return 'error', True, 'futures observation is in the future', None
+        stale = age > 7200
+        return ('stale', True, 'futures observation older than 2 hours; excluded from daily conclusions', now.date().isoformat()) if stale else ('ok', False, None, now.date().isoformat())
     if category == 'global_assets':
         expected = expected_h15_observation(now)
         return ('stale', True, f'last completed US session {expected} newer than quote', expected.isoformat()) if observed_day < expected else ('ok', False, None, expected.isoformat())
@@ -673,16 +682,28 @@ def macro_snapshot(root, now):
                 continue
             asof = item.get("asof")
             checked = number(payload.get(category + '_checked_at'))
+            item_checked = item.get('source_checked_at')
+            if item_checked:
+                try:
+                    check_stamp = datetime.fromisoformat(str(item_checked).replace('Z','+00:00'))
+                    checked = check_stamp.timestamp() if check_stamp.tzinfo else None
+                except ValueError:
+                    checked = None
             status, stale, reason, expected_day = macro_freshness(item.get('id'), asof, checked, now, category)
             ttl = 7200 if category == 'futures' else 86400
-            collector_stale = checked is None or now.timestamp() - checked > ttl
+            collector_stale = checked is None or now.timestamp() - checked > ttl or checked > now.timestamp() + 300
             if collector_stale:
                 stale = True
                 reason = (reason + '; ' if reason else '') + 'source collector has not checked recently'
             quality = 'stale' if stale else 'partial' if status == 'unknown' else status
+            daily_eligible = not stale and (category != 'futures' or str(asof)[:10] == now.astimezone(SHANGHAI).date().isoformat())
             observations.append(dict(category=category, id=item.get("id"), name=item.get("name"),
                                      value=number(item.get("value")), unit=item.get("unit"),
-                                     change_pct=number(item.get("change_pct")), observed_at=asof,
+                                     change_pct=number(item.get("change_pct")) if daily_eligible else None,
+                                     reported_change_pct=number(item.get('change_pct')),
+                                     eligible_for_daily_change=daily_eligible,
+                                     daily_change_exclusion_reason=None if daily_eligible else reason or 'quote not observed on report local date',
+                                     change_basis=item.get('change_basis'), observed_at=asof,
                                      data_asof=asof, session_date=str(asof)[:10] if asof else None,
                                      source_checked_at=epoch_iso(checked),
                                      expected_observation_date=expected_day,

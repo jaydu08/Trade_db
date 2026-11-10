@@ -18,6 +18,7 @@ from agent_market_scan import scan as scan_agent_market
 from agent_research_focus import write_focus
 from agent_market_extensions import write_extensions
 from collect_agent_market_context import collect as collect_market_context
+from collect_agent_commodities import collect as collect_commodities
 
 STAGE = 'sync'
 
@@ -79,6 +80,7 @@ def publish(root, crypto_db, repo, preview_periods=False, daily_only=False, peri
             if not today_archive.exists():
                 collect_market_context(root, now)
                 scan_agent_market(root, root / 'data/agent_market_scan', now)
+                collect_commodities(root,now)
                 # The quote scan runs after the timer fires. Audit against its
                 # completion time, not the earlier timer-entry timestamp.
                 now = datetime.now(ZoneInfo("Asia/Shanghai"))
@@ -96,6 +98,7 @@ def publish(root, crypto_db, repo, preview_periods=False, daily_only=False, peri
                         not (output / folder / f'{now.date().isoformat()}.json').exists()):
                     from collect_agent_us_closes import collect as collect_us
                     collect_us(root, now)
+                    collect_commodities(root,now)
                 snapshot, size = generate_period(root, crypto_db, output, days, now)
                 folder = "weekly" if days == 7 else "monthly"
                 allowed.add(f"agent/v1/{folder}/{now.date().isoformat()}.json")

@@ -1,5 +1,6 @@
 """Cached macro and commodity dashboard. Refresh runs outside HTTP requests."""
 import csv
+import fcntl
 import io
 import json
 import logging
@@ -276,11 +277,8 @@ def parse_futures_frame(frame):
 
 
 def fetch_futures():
-    import akshare as ak
-    result = parse_futures_frame(ak.futures_foreign_commodity_realtime(symbol=list(FUTURES)))
-    if len(result) < 3:
-        raise ValueError('too few futures quotes')
-    return result
+    from modules.ingestion.commodity_quote import fetch_quotes
+    return fetch_quotes()
 
 
 def refresh_snapshot(force=False, now=None):
@@ -320,16 +318,60 @@ def refresh_snapshot(force=False, now=None):
     update_crypto_history(snapshot, now)
     snapshot['errors'] = errors
     snapshot['refreshed_at'] = now
-    os.makedirs(os.path.dirname(SNAPSHOT_PATH), exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix='.macro_dashboard_', dir=os.path.dirname(SNAPSHOT_PATH))
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-            json.dump(snapshot, handle, ensure_ascii=False)
-        os.replace(tmp_path, SNAPSHOT_PATH)
-    finally:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+    return store_snapshot(snapshot)
+
+
+def store_snapshot(snapshot, path=None):
+    """Atomic shared writer; a slower refresh must not overwrite a newer feed."""
+    path = path or SNAPSHOT_PATH
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path+'.lock','a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        try:
+            with open(path,encoding='utf-8') as handle:
+                current = json.load(handle)
+        except (OSError,ValueError):
+            current = {}
+        for key in ('macro','futures','global_assets'):
+            if current.get(key+'_checked_at',0) > snapshot.get(key+'_checked_at',0):
+                snapshot[key] = current[key]
+                snapshot[key+'_checked_at'] = current[key+'_checked_at']
+                errors = snapshot.setdefault('errors',{})
+                if key not in current.get('errors',{}):
+                    errors.pop(key,None)
+        snapshot['refreshed_at'] = max(snapshot.get('refreshed_at',0),current.get('refreshed_at',0))
+        for key,entry in current.get('crypto_activity',{}).items():
+            if entry.get('checked_at',0)>snapshot.get('crypto_activity',{}).get(key,{}).get('checked_at',0):
+                snapshot.setdefault('crypto_activity',{})[key] = entry
+        fd, tmp_path = tempfile.mkstemp(prefix='.macro_dashboard_', dir=os.path.dirname(path))
+        try:
+            with os.fdopen(fd,'w',encoding='utf-8') as handle:
+                json.dump(snapshot,handle,ensure_ascii=False,allow_nan=False)
+            os.replace(tmp_path,path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
     return snapshot
+
+
+def refresh_futures_snapshot(path=None):
+    """Prepare only commodities before Agent freeze, leaving other feeds intact."""
+    path = str(path or SNAPSHOT_PATH)
+    try:
+        with open(path,encoding='utf-8') as handle:
+            snapshot = json.load(handle)
+    except (OSError,ValueError):
+        snapshot = {}
+    try:
+        rows = fetch_futures()
+        snapshot['futures'] = rows
+        snapshot['futures_checked_at'] = max(datetime.fromisoformat(r['source_checked_at']).timestamp() for r in rows)
+        snapshot.setdefault('errors',{}).pop('futures',None)
+    except Exception as exc:
+        snapshot.setdefault('errors',{})['futures'] = type(exc).__name__+': '+str(exc)[:160]
+        LOG.warning('Commodity pre-publication refresh failed: %s',type(exc).__name__)
+    snapshot['futures_last_attempt_at'] = time.time()
+    return store_snapshot(snapshot,path)
 
 
 def global_post_close_due(snapshot, now):

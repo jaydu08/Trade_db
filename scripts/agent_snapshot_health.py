@@ -74,6 +74,10 @@ def audit(snapshot, output, now):
                 value = item.get(field)
                 if value and datetime.fromisoformat(value.replace('Z', '+00:00')) > now:
                     problems.append(f'{market} future {field}')
+    for row in snapshot.get('overview', {}).get('macro', []):
+        if ((row.get('stale') or row.get('eligible_for_daily_change') is False)
+                and row.get('change_pct') is not None):
+            problems.append(f"macro {row.get('id')} ineligible observation exposes daily change")
     stale_macro = [row['id'] for row in snapshot.get('overview', {}).get('macro', []) if row.get('stale')]
     quality = 'error' if problems else 'partial' if stale_macro or any(v['significant_drop'] for v in comparisons.values()) else 'ok'
     result = dict(schema_version='1.0', snapshot_id=snapshot.get('snapshot_id'),
