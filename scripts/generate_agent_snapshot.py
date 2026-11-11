@@ -798,7 +798,8 @@ def build_snapshot(root, crypto_db, now):
         indices, breadth = market.get('major_indices') or [], market.get('breadth') or {}
         stale_context = not indices or any(i.get('stale') for i in indices) or breadth.get('stale', True)
         context_health.append(dict(domain='market_context_' + market['market'], session_date=market['session_date'],
-                                   data_asof=context.get('generated_at'), source='Tencent indices; Eastmoney independent market enumeration',
+                                   data_asof=context.get('generated_at'), source='Tencent indices; '+str(breadth.get('source') or 'breadth source unavailable'),
+                                   breadth_source=breadth.get('source'),breadth_source_checked_at=breadth.get('source_checked_at') or breadth.get('collected_at'),
                                    quality='missing' if not indices else 'partial', stale=stale_context,
                                    missing_reason='one or more index/breadth sources absent or unverified' if stale_context else breadth.get('missing_reason')))
     all_health = stock_health + anomaly_health + crypto_health + [macro_health] + context_health

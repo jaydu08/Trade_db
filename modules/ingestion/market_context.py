@@ -40,7 +40,7 @@ def full_market_rows(market, get=requests.get):
             raise ValueError('provider rejected request; remaining page requests cancelled')
         response = get('https://push2.eastmoney.com/api/qt/clist/get',
                        params=dict(params, pn=n), timeout=12)
-        if response.status_code in (403, 429):
+        if response.status_code in (403, 429) or (isinstance(response.status_code,int) and response.status_code>=500):
             stopped.set()
         response.raise_for_status()
         data = response.json().get('data') or {}

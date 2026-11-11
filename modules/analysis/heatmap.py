@@ -1395,6 +1395,14 @@ class MarketHeatMap:
             raise RuntimeError(f'{market} heatmap quote acquisition failed') from e
         if df is None or df.empty:
             raise RuntimeError(f'{market} heatmap received no usable quotes')
+        # Save breadth from the full pre-filter frame; never from the TG quota/Trend pool.
+        try:
+            from pathlib import Path
+            from modules.ingestion.breadth_fallback import save_frame
+            save_frame(Path(__file__).resolve().parents[2],market,df,
+                       datetime.datetime.now(datetime.timezone.utc))
+        except Exception as exc:
+            logger.warning('Independent breadth archive failed for %s: %s',market,type(exc).__name__)
             
         # 2. 生成榜单配置：TG 推送仍保持精简，Web 当日强势额外落库更宽候选池。
         def _env_int(name: str, default: int) -> int:
