@@ -803,6 +803,7 @@ def build_snapshot(root, crypto_db, now):
                                    quality='missing' if not indices else 'partial', stale=stale_context,
                                    missing_reason='one or more index/breadth sources absent or unverified' if stale_context else breadth.get('missing_reason')))
     all_health = stock_health + anomaly_health + crypto_health + [macro_health] + context_health
+    from modules.quant.export import summary as quant_summary
     return dict(schema_version="1.3", archive_date=now.date().isoformat(), snapshot_id=f"{now.date().isoformat()}-{int(now.timestamp())}",
                 generated_at=now.isoformat(timespec="seconds"), timezone="Asia/Shanghai",
                 snapshot_generated_at=now.isoformat(timespec="seconds"),
@@ -813,6 +814,7 @@ def build_snapshot(root, crypto_db, now):
                 overview=dict(markets=markets, macro=macro, crypto_activity=crypto_activity),
                 trend_selected=trend_selected,
                 research_focus=build_focus(root, now),
+                quant_signals=quant_summary(root,now),
                 market_extensions=build_extensions(root, crypto_db, now),
                 market_anomalies=dict(stocks_up=stocks_up, stocks_down=stocks_down,
                                       relative_strong=relative_up, relative_weak=relative_down,
@@ -903,6 +905,10 @@ def generate(root, crypto_db, output, now=None, require_daily_ready=False):
             if failures:
                 raise ValueError(f'Agent quality audit failed: {list(dict.fromkeys(failures))[:3]}')
         data = (json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+        if len(data)>MAX_BYTES and snapshot.get('quant_signals'):
+            from modules.quant.export import budget_reference
+            snapshot['quant_signals']=budget_reference(snapshot['quant_signals'])
+            data=(json.dumps(snapshot,ensure_ascii=False,separators=(',',':'),allow_nan=False)+'\n').encode()
         if len(data) > MAX_BYTES:
             raise ValueError(f"snapshot exceeds {MAX_BYTES} bytes")
         if not snapshot["overview"]["macro"] and not any(x["candidate_universe"] for x in snapshot["overview"]["markets"]):

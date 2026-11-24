@@ -6,6 +6,7 @@ import argparse
 import fcntl
 import json
 import subprocess
+from contextlib import contextmanager
 from datetime import datetime
 from datetime import timedelta
 from pathlib import Path
@@ -21,6 +22,28 @@ from collect_agent_market_context import collect as collect_market_context
 from collect_agent_commodities import collect as collect_commodities
 
 STAGE = 'sync'
+
+
+@contextmanager
+def quant_read_lock(root):
+    path=root/'data/quant/run.lock'
+    if not path.exists():
+        yield
+        return
+    with path.open('a') as handle:
+        fcntl.flock(handle,fcntl.LOCK_SH)
+        try:yield
+        finally:fcntl.flock(handle,fcntl.LOCK_UN)
+
+
+def prepare_quant(root):
+    if not (root/'data/quant/evidence.json').exists():return
+    try:
+        from modules.quant.runtime import run
+        run(root)
+    except Exception as exc:
+        import sys
+        print(json.dumps({'quant_prepare':'failed','error_type':type(exc).__name__}),file=sys.stderr)
 
 
 def verify_remote(repo, paths, archive_date):
@@ -81,11 +104,16 @@ def publish(root, crypto_db, repo, preview_periods=False, daily_only=False, peri
                 collect_market_context(root, now)
                 scan_agent_market(root, root / 'data/agent_market_scan', now)
                 collect_commodities(root,now)
+                prepare_quant(root)
                 # The quote scan runs after the timer fires. Audit against its
                 # completion time, not the earlier timer-entry timestamp.
                 now = datetime.now(ZoneInfo("Asia/Shanghai"))
             if not legacy_archive:
-                snapshot, size = generate(root, crypto_db, output, now, require_daily_ready=True)
+                with quant_read_lock(root):
+                    if (root/'data/quant/run.lock').exists():now=datetime.now(ZoneInfo('Asia/Shanghai'))
+                    snapshot, size = generate(root, crypto_db, output, now, require_daily_ready=True)
+                    from modules.quant.export import write as write_quant
+                    allowed.update(write_quant(root,output,now))
                 allowed.update({"agent/v1/latest.json", f"agent/v1/history/{now.date().isoformat()}.json",
                                 f"agent/v1/health/{now.date().isoformat()}.json"})
                 published.append((snapshot["snapshot_id"], size))
@@ -99,7 +127,12 @@ def publish(root, crypto_db, repo, preview_periods=False, daily_only=False, peri
                     from collect_agent_us_closes import collect as collect_us
                     collect_us(root, now)
                     collect_commodities(root,now)
-                snapshot, size = generate_period(root, crypto_db, output, days, now)
+                    prepare_quant(root)
+                with quant_read_lock(root):
+                    if (root/'data/quant/run.lock').exists():now=datetime.now(ZoneInfo('Asia/Shanghai'))
+                    snapshot, size = generate_period(root, crypto_db, output, days, now)
+                    from modules.quant.export import write as write_quant
+                    allowed.update(write_quant(root,output,now,days))
                 folder = "weekly" if days == 7 else "monthly"
                 allowed.add(f"agent/v1/{folder}/{now.date().isoformat()}.json")
                 published.append((snapshot["snapshot_id"], size))

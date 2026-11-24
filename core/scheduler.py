@@ -105,6 +105,12 @@ class TaskScheduler:
             replace_existing=True
         )
         
+        self.scheduler.add_job(
+            self._job_quant_monitor, IntervalTrigger(minutes=30),
+            id='quant_monitor', name='跨市场量化状态与前瞻评价',
+            replace_existing=True, max_instances=1, coalesce=True,
+        )
+
         # 4. CN 热度榜单 (工作日 17:35，错开港股避免OOM)
         self.scheduler.add_job(
             self._job_cn_heatmap,
@@ -439,6 +445,10 @@ class TaskScheduler:
         """Job: independently refresh read-only macro/commodity snapshots."""
         from modules.monitor.macro_dashboard import refresh_snapshot
         self._run_job("macro_dashboard", refresh_snapshot)
+
+    def _job_quant_monitor(self):
+        from modules.quant.runtime import run
+        self._run_job('quant_monitor',run)
 
     def _job_trend_7d(self):
         """Job: 7日趋势简报"""

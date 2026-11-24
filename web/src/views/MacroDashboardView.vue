@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import api from '../api'
+import QuantSignals from '../components/QuantSignals.vue'
 
 const payload = ref<any>({ macro: [], futures: [], movers: [], global_assets: [], commodity_trends: {}, stock_activity: [], crypto_activity: [], errors: {}, notes: [] })
 const loading = ref(false)
@@ -78,6 +79,7 @@ function sentimentName(value: number): string {
     <div v-if="error" class="error">{{ error }}</div>
     <p class="disclaimer">不同数据的交易时间和发布频率不同，请看每张卡片的时间戳。外盘期货为第三方行情快照，可能延迟；日度宏观指标不能当作盘中报价。页面刷新不会强制向上游重复抓取。</p>
 
+    <QuantSignals :payload="payload.quant" />
     <div class="section-head"><h3>利率与美元</h3><span>FRED 日度发布 · 快照 {{ timeText(payload.macro_checked_at) }}</span></div>
     <div class="card-grid">
       <a v-for="r in macroRows" :key="r.id" class="metric-card" :href="r.url" target="_blank" rel="noopener noreferrer">

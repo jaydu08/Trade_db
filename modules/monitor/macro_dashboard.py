@@ -430,7 +430,8 @@ def get_dashboard():
     except Exception:
         LOG.exception('Commodity trends unavailable')
         trends, trend_date = {}, None
-    return {'macro': snapshot.get('macro', []), 'futures': snapshot.get('futures', []),
+    from modules.quant.export import snapshot as quant_snapshot
+    return {'quant': quant_snapshot(ROOT,datetime.now(ZoneInfo('Asia/Shanghai'))), 'macro': snapshot.get('macro', []), 'futures': snapshot.get('futures', []),
             'global_assets': snapshot.get('global_assets', []),
             'global_assets_checked_at': snapshot.get('global_assets_checked_at'),
             'commodity_trends': trends, 'commodity_trend_date': trend_date,

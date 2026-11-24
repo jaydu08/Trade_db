@@ -2892,6 +2892,43 @@ def macro_dashboard(user: UserContext = Depends(get_current_user)):
         raise HTTPException(status_code=503, detail='宏观数据暂不可用，请稍后重试')
 
 
+# --------------- Quant research (same existing authentication) ---------------
+@app.get('/api/quant/evidence')
+def quant_evidence(market: str = '', user: UserContext = Depends(get_current_user)):
+    from modules.quant.runtime import evidence
+    data=evidence()
+    if market:
+        data=dict(data,records=[r for r in data.get('records',[]) if r['market']==market],primary=[r for r in data.get('primary',[]) if r['market']==market])
+    return data
+
+
+@app.get('/api/quant/events')
+def quant_events(market: str = 'BTC', limit: int = 200, user: UserContext = Depends(get_current_user)):
+    from modules.quant.store import Store
+    from modules.quant.runtime import ROOT,evidence
+    from modules.quant.engine import MARKETS,outcome,clean,contiguous
+    import pandas as pd
+    if market not in MARKETS:raise HTTPException(status_code=422,detail='Unknown quant market')
+    if not (ROOT/'data/quant/quant.sqlite').exists():return {'market':market,'events':[],'quality':'missing'}
+    store=Store(ROOT)
+    try:
+        rows=store.events(market,max(1,min(limit,1000)))
+        prices,_,_=store.frames(market,'9999-12-31')
+        for row in rows:
+            row['historical_evaluations']=[]
+            if row['origin']=='prospective' or prices is None:continue
+            i=prices.index.get_indexer([pd.Timestamp(row['session_date'])])[0]
+            if i<0:continue
+            for h in ([30,90,180] if MARKETS[market]['year']==365 else [21,63,126]):
+                out=outcome(prices,i,h,.004 if MARKETS[market]['year']==365 else .002)
+                gap=any(not contiguous(market,prices.index[j-1],prices.index[j]) for j in range(i+1,min(i+h+1,len(prices))))
+                if gap:out=None
+                row['historical_evaluations'].append(dict(horizon=h,status='data_gap' if gap else 'completed' if out else 'evaluating',
+                    validation_type='historical_event_detail_not_cooldown_sample',**(out or {})))
+        return clean({'market':market,'events':rows,'research_version':evidence().get('research_version')})
+    finally:store.db.close()
+
+
 # --------------- SPA Fallback ---------------
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web", "dist")
 

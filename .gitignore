@@ -65,6 +65,7 @@ data/vector_store/
 data/cache/
 data/macro_dashboard_snapshot.json
 data/market_relative_strength/
+data/quant/
 
 # Logs
 *.log

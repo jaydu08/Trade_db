@@ -445,6 +445,7 @@ def macro_period(root, days, now):
 
 
 def build(root, crypto_db, days, now, scores=None):
+    from modules.quant.export import summary as quant_summary
     if days not in (7, 30):
         raise ValueError('period must be 7 or 30 calendar days')
     scores = _stock_trend_scores(days) if scores is None else scores
@@ -492,6 +493,7 @@ def build(root, crypto_db, days, now, scores=None):
     return {'schema_version': '1.2', 'snapshot_id': f'{days}d-{now.date().isoformat()}-{int(now.timestamp())}',
             'generated_at': now.isoformat(timespec='seconds'), 'timezone': 'Asia/Shanghai',
             'research_focus': build_focus(root, now),
+            'quant_signals': quant_summary(root,now,days,compact=True),
             'market_extensions': build_extensions(root, crypto_db, now, days=days),
             'session_date': sessions,
             'data_asof': {h['domain']: h['data_asof'] for h in all_health},
@@ -539,6 +541,10 @@ def generate(root, crypto_db, output, days, now=None, scores=None):
     else:
         snapshot = build(root, crypto_db, days, now, scores)
         data = (json.dumps(snapshot, ensure_ascii=False, separators=(',', ':'), allow_nan=False) + '\n').encode()
+        if len(data)>MAX_BYTES and snapshot.get('quant_signals'):
+            from modules.quant.export import budget_reference
+            snapshot['quant_signals']=budget_reference(snapshot['quant_signals'])
+            data=(json.dumps(snapshot,ensure_ascii=False,separators=(',',':'),allow_nan=False)+'\n').encode()
         if len(data) > MAX_BYTES:
             raise ValueError(f'period snapshot exceeds {MAX_BYTES} bytes: {len(data)}')
         immutably_create(archive, data)
