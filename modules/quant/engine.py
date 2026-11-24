@@ -8,13 +8,19 @@ import numpy as np
 import pandas as pd
 
 FORMULA_VERSION='quant-1.0.0'
+CATALOG_VERSION='quant-catalog-1.1.0'
+FROZEN_MARKETS=('CYB','CSI300','HSI','HSTECH','BTC','ETH')
+US_MARKETS=('SPX','NDX','SOX')
 MARKETS={
  'CYB':dict(name='创业板指',symbol='399006',kind='PRICE_INDEX',year=252,zone='Asia/Shanghai',iv_name='创业板ETF QVIX（第三方，ETF/指数有跟踪差异）',source='Sina'),
  'CSI300':dict(name='沪深300',symbol='000300',kind='PRICE_INDEX',year=252,zone='Asia/Shanghai',iv_name='300ETF QVIX（第三方，ETF/指数有跟踪差异）',source='Sina'),
  'HSI':dict(name='恒生指数',symbol='HSI',kind='PRICE_INDEX',year=252,zone='Asia/Hong_Kong',iv_name='VHSI（恒指期权）',source='Yahoo'),
  'HSTECH':dict(name='恒生科技',symbol='HSTECH',kind='PRICE_INDEX',year=252,zone='Asia/Hong_Kong',iv_name='VHSI（恒指隐波，恒科跨指数参考）',source='Sina'),
  'BTC':dict(name='比特币',symbol='BTC-USD',kind='SPOT_USD',year=365,zone='UTC',iv_name='Deribit BTC DVOL',source='Yahoo'),
- 'ETH':dict(name='以太坊',symbol='ETH-USD',kind='SPOT_USD',year=365,zone='UTC',iv_name='Deribit ETH DVOL',source='Yahoo')}
+ 'ETH':dict(name='以太坊',symbol='ETH-USD',kind='SPOT_USD',year=365,zone='UTC',iv_name='Deribit ETH DVOL',source='Yahoo'),
+ 'SPX':dict(name='标普500',symbol='^GSPC',kind='PRICE_INDEX',year=252,zone='America/New_York',iv_name='VIX（标普500期权隐波）',source='Yahoo',venue='US',iv_applicable=True),
+ 'NDX':dict(name='纳斯达克100',symbol='^NDX',kind='PRICE_INDEX',year=252,zone='America/New_York',iv_name='VXN（纳斯达克100期权隐波）',source='Yahoo',venue='US',iv_applicable=True),
+ 'SOX':dict(name='费城半导体',symbol='^SOX',kind='PRICE_INDEX',year=252,zone='America/New_York',iv_name='不接入隐波；独立使用SOX自身RV',source='Yahoo',venue='US',iv_applicable=False)}
 RULES={
  'IV90_DOWN':'高隐波且20日下跌','RV90_DOWN':'高实际波动且20日下跌',
  'RSI_BELOW30':'RSI首次跌破30','RSI_RECOVER30':'RSI上穿30',
@@ -23,7 +29,20 @@ RULES={
  'VHSI_GE30_DOWN':'VHSI≥30且目标指数20日下跌',
  'FNG_LE20':'BTC延迟恐贪首次≤20','FNG_RECOVER25':'BTC恐贪低位后上穿25'}
 FOCUS={('BTC','BREAK20_ABOVE_MA200'):'重点纸面跟踪',('BTC','RV90_DOWN'):'重点纸面跟踪',
-       ('HSTECH','RV90_DOWN'):'小样本观察',('CYB','IV90_DOWN'):'小样本观察'}
+       ('HSTECH','RV90_DOWN'):'小样本观察',('CYB','IV90_DOWN'):'小样本观察',
+       ('SPX','IV90_DOWN'):'美股独立研究',('NDX','IV90_DOWN'):'美股独立研究',('SOX','RV90_DOWN'):'半导体独立研究'}
+
+
+def venue(market):
+    return MARKETS[market].get('venue','CN' if market in ('CYB','CSI300') else 'HK')
+
+
+def signal_names(market):
+    names=list(RULES)[:7]
+    if not MARKETS[market].get('iv_applicable',True):names.remove('IV90_DOWN')
+    if market in ('HSI','HSTECH'):names.append('VHSI_GE30_DOWN')
+    if market=='BTC':names+=['FNG_LE20','FNG_RECOVER25']
+    return names
 
 
 def clean(value):
@@ -41,18 +60,18 @@ def expected_session(market,now):
     local=now.astimezone(ZoneInfo(meta['zone']))
     if meta['year']==365:return local.date()-timedelta(days=1)
     from .calendar import last_session,close_time
-    venue='CN' if market in ('CYB','CSI300') else 'HK'
+    exchange=venue(market)
     day=local.date()
-    cutoff=close_time(venue,day,availability=True)
+    cutoff=close_time(exchange,day,availability=True)
     if local.time().replace(tzinfo=None)<cutoff:day-=timedelta(days=1)
-    return last_session(venue,day)
+    return last_session(exchange,day)
 
 
 def bar_end(market,day):
     day=date.fromisoformat(str(day)[:10]);meta=MARKETS[market]
     if meta['year']==365:return datetime.combine(day+timedelta(days=1),time(),timezone.utc)
     from .calendar import close_time
-    return datetime.combine(day,close_time('CN' if market in ('CYB','CSI300') else 'HK',day),ZoneInfo(meta['zone']))
+    return datetime.combine(day,close_time(venue(market),day),ZoneInfo(meta['zone']))
 
 
 def validate_prices(frame):
@@ -68,6 +87,7 @@ def validate_prices(frame):
 
 def compute(market,prices,iv=None,fng=None):
     d=validate_prices(prices);c=d.close;year=MARKETS[market]['year']
+    if not MARKETS[market].get('iv_applicable',True):iv=None
     x=(iv if iv is not None else pd.Series(dtype=float)).reindex(d.index)
     x=pd.to_numeric(x,errors='coerce').where(lambda s:s>0)
     r=np.log(c).diff();rv=r.rolling(20,min_periods=20).std(ddof=1)*math.sqrt(year)*100
@@ -112,6 +132,7 @@ def compute(market,prices,iv=None,fng=None):
     if market=='BTC':
         rules['FNG_LE20']=(fg<=20,fg.notna())
         rules['FNG_RECOVER25']=(cross(fg,25)&(fg.shift(1).rolling(30).min()<=20),fg.notna()&fg.shift(1).notna()&fg.shift(1).rolling(30).count().eq(30))
+    if not MARKETS[market].get('iv_applicable',True):rules.pop('IV90_DOWN')
     return f,rules
 
 
@@ -124,7 +145,7 @@ def contiguous(market,previous,current):
     if MARKETS[market]['year']==365:return (cur-prev).days==1
     if cur.year>=2026:
         from .calendar import last_session
-        try:return last_session('CN' if market in ('CYB','CSI300') else 'HK',cur-timedelta(days=1))==prev
+        try:return last_session(venue(market),cur-timedelta(days=1))==prev
         except ValueError:return False
     return True  # Frozen legacy research uses source-observed bars; explicitly disclosed.
 

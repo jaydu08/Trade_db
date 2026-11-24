@@ -6,10 +6,10 @@ from urllib.parse import quote
 import numpy as np
 import pandas as pd
 import requests
-from .engine import MARKETS,bar_end,expected_session,clean
+from .engine import MARKETS,US_MARKETS,bar_end,expected_session,clean,venue
 
 LOG=logging.getLogger(__name__)
-ADAPTER_VERSION='quant-sources-1.0.0'
+ADAPTER_VERSION='quant-sources-1.1.0'
 
 
 def response(store,key,url,params=None):
@@ -34,7 +34,7 @@ def normalize_prices(rows,market,now):
         if day>str(expected) or bar_end(market,day)>now:continue
         if MARKETS[market]['year']==252 and day>='2026-01-01':
             from .calendar import closed
-            if closed('CN' if market in ('CYB','CSI300') else 'HK',pd.Timestamp(day).date()):continue
+            if closed(venue(market),pd.Timestamp(day).date()):continue
         try:
             item={k:float(bar[k]) for k in ('open','high','low','close')}
             if not all(np.isfinite(v) and v>0 for v in item.values()):continue
@@ -63,10 +63,13 @@ def sina(store,market,now):
     return {k:v for k,v in rows.items() if k>=lower},meta
 
 
-def yahoo(store,market,now):
-    symbol='^HSI' if market=='HSI' else market+'-USD'
-    r,meta=response(store,'Yahoo-'+symbol,'https://query1.finance.yahoo.com/v8/finance/chart/'+quote(symbol,safe=''),dict(range='2y',interval='1d'))
+def yahoo(store,market,now,history=False):
+    symbol=MARKETS[market]['symbol'] if market in US_MARKETS else '^HSI' if market=='HSI' else market+'-USD'
+    params=dict(period1=631152000,period2=int(now.timestamp()),interval='1d') if history or (market in US_MARKETS and not store.series(market,'price')) else dict(range='2y',interval='1d')
+    r,meta=response(store,'Yahoo-'+symbol,'https://query1.finance.yahoo.com/v8/finance/chart/'+quote(symbol,safe=''),params)
     data=r.json()['chart']['result'][0]
+    if market in US_MARKETS and (data['meta'].get('symbol')!=symbol or data['meta'].get('exchangeTimezoneName')!='America/New_York'):
+        raise ValueError('US index symbol/timezone conflict; no ETF substitution')
     if data.get('meta',{}).get('currency') not in (None,'HKD' if market=='HSI' else 'USD'):raise ValueError('quote currency conflict')
     q=data['indicators']['quote'][0];zone=MARKETS[market]['zone']
     from zoneinfo import ZoneInfo
@@ -82,7 +85,7 @@ def coinbase(store,market,now):
 
 
 def price(store,market,now):
-    adapters=[sina] if market in ('CYB','CSI300','HSTECH') else [yahoo,sina] if market=='HSI' else [yahoo,coinbase]
+    adapters=[yahoo] if market in US_MARKETS else [sina] if market in ('CYB','CSI300','HSTECH') else [yahoo,sina] if market=='HSI' else [yahoo,coinbase]
     failures=[]
     for adapter in adapters:
         try:
@@ -104,6 +107,27 @@ def price(store,market,now):
         except Exception as exc:
             failures.append(dict(adapter=adapter.__name__,error_type=type(exc).__name__,reason=str(exc)[:160]))
     raise ValueError(json.dumps(failures,ensure_ascii=False))
+
+
+def cboe_iv(store,market,now):
+    symbol={'SPX':'VIX','NDX':'VXN'}[market]
+    r,meta=response(store,'Cboe-'+symbol,f'https://cdn.cboe.com/api/global/us_indices/daily_prices/{symbol}_History.csv')
+    data=pd.read_csv(io.BytesIO(r.content))
+    if not {'DATE','CLOSE'}<=set(data.columns):raise ValueError('Cboe daily CSV schema changed')
+    days=pd.to_datetime(data.DATE,format='%m/%d/%Y',errors='coerce')
+    values=pd.to_numeric(data.CLOSE,errors='coerce')
+    if days.duplicated().any():raise ValueError('duplicate Cboe daily dates')
+    expected=str(expected_session(market,now))
+    rows={str(d.date()):dict(value=float(v)) for d,v in zip(days,values) if pd.notna(d) and pd.notna(v) and np.isfinite(v) and v>0 and str(d.date())<=expected}
+    if not rows:raise ValueError('Cboe IV has no completed valid sessions')
+    meta.update(index_symbol=symbol,underlying=MARKETS[market]['symbol'],unit='annualized volatility percent',
+                session_scope='Cboe daily close; distinct from equity close',first_session=min(rows))
+    return rows,meta
+
+
+def us_iv(store,market,now):
+    # Official historical-download endpoint, not scraping the restricted quote dashboard.
+    return cboe_iv(store,market,now)
 
 
 def indicators(store,now):
@@ -129,6 +153,9 @@ def indicators(store,now):
         for market in ('HSI','HSTECH'):results[market]=({k:dict(value=v['close']) for k,v in rows.items()},meta)
     except Exception as exc:
         for market in ('HSI','HSTECH'):errors[market]=dict(error_type=type(exc).__name__,reason=str(exc)[:150])
+    for market in ('SPX','NDX'):
+        try:results[market]=us_iv(store,market,now)
+        except Exception as exc:errors[market]=dict(error_type=type(exc).__name__,reason=str(exc)[:150])
     for market in ('BTC','ETH'):
         try:
             r,meta=response(store,'Deribit-'+market+'-DVOL','https://www.deribit.com/api/v2/public/get_volatility_index_data',

@@ -2,7 +2,7 @@
 import copy,hashlib,json
 from datetime import datetime,timedelta
 from pathlib import Path
-from .engine import MARKETS,FOCUS,FORMULA_VERSION,expected_session,RULES,clean
+from .engine import MARKETS,FOCUS,FORMULA_VERSION,CATALOG_VERSION,expected_session,RULES,clean,signal_names
 from .runtime import cached,evidence,atomic
 
 
@@ -58,7 +58,7 @@ def summary(root,now,days=None,compact=False):
                     rule_counts=dict(new=sum(r.get('new_event') is True for r in rows),true=sum(r.get('state') is True for r in rows),unknown=sum(r.get('state') is None for r in rows)),
                     history_path=result['history_path'],evidence_path=result['evidence_path'],window=result.get('window'),
                     period_event_count=len(result.get('period_events',[])),
-                    note='Complete 46-rule state, all period events, evidence and forward evaluation are in history_path; no market rankings removed')
+                    note='Complete rule state, all period events, evidence and forward evaluation are in history_path; no market rankings removed')
     return clean(result)
 
 
@@ -100,11 +100,13 @@ def write(root,output,now,days=None,preview=False):
                              formula_version=frozen.get('formula_version'),research_version=frozen.get('research_version'),quality=frozen.get('quality'),files=hashes))
         paths.add(manifest)
         return {str(p.relative_to(output.parent.parent)) for p in paths}
-    catalog=dict(schema_version='1.0',formula_version=FORMULA_VERSION,markets=MARKETS,rules=RULES,
-                 states=['ok','pending','stale','missing','invalid','insufficient_history','source_conflict'],
+    catalog=dict(schema_version='1.0',catalog_version=CATALOG_VERSION,formula_version=FORMULA_VERSION,markets=MARKETS,rules=RULES,
+                 rule_applicability={market:signal_names(market) for market in MARKETS},
+                 states=['ok','pending','stale','missing','invalid','insufficient_history','source_conflict','not_applicable'],
                  purpose='research monitor, not trade execution',percentile_ties='prior valid values <= current',
                  baseline_policy='Historical full sample/subperiod evidence separated from prospective evaluations')
-    catalog_path=output/'quant/catalog_versions'/(FORMULA_VERSION+'.json')
+    catalog_path=output/'quant/catalog_versions'/(CATALOG_VERSION+'.json')
+    if catalog_path.exists() and json.loads(catalog_path.read_text())!=catalog:raise ValueError('immutable quant catalog changed without version bump')
     files={output/'quant/catalog.json':catalog,catalog_path:catalog}
     data['catalog_ref']=dict(path=str(catalog_path.relative_to(output.parent.parent)),sha256=hashlib.sha256(_bytes(catalog)).hexdigest())
     ev=evidence(root)

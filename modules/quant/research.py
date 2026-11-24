@@ -3,7 +3,7 @@ import hashlib,json
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from .engine import compute,edges,outcome,wilson,MARKETS,FORMULA_VERSION,clean
+from .engine import compute,edges,outcome,wilson,MARKETS,FROZEN_MARKETS,FORMULA_VERSION,clean
 
 RESEARCH_VERSION='frozen-20261120-audit-r1'
 
@@ -13,7 +13,7 @@ def load_frozen(directory):
     fear=pd.DataFrame(json.loads((root/'raw/feargreed.json').read_text())['data'])
     fear.index=pd.to_datetime(pd.to_numeric(fear.timestamp),unit='s').dt.normalize()+pd.Timedelta(days=1)
     fear=pd.Series(pd.to_numeric(fear.value).to_numpy(),index=fear.index).sort_index().loc[:'2026-11-20']
-    for market in MARKETS:
+    for market in FROZEN_MARKETS:
         prices=pd.read_csv(root/f'{market}_prices.csv',index_col=0,parse_dates=True).loc[:'2026-11-20']
         features=pd.read_csv(root/f'{market}_features.csv',index_col=0,parse_dates=True).loc[:'2026-11-20']
         result[market]=(prices,features.iv.dropna(),fear if market=='BTC' else None)
@@ -32,7 +32,7 @@ def evidence(directory,replay_directory=None):
     if replay_directory:
         replay=pd.read_csv(Path(replay_directory)/'results_all.csv')
         pd.testing.assert_frame_equal(original,replay,check_exact=False,rtol=1e-9,atol=1e-9)
-        for market in MARKETS:
+        for market in FROZEN_MARKETS:
             for suffix in ('prices','features'):
                 given=pd.read_csv(root/f'{market}_{suffix}.csv',index_col=0,parse_dates=True)
                 rebuilt=pd.read_csv(Path(replay_directory)/f'{market}_{suffix}.csv',index_col=0,parse_dates=True)

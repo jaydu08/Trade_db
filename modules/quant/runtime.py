@@ -4,7 +4,7 @@ from datetime import datetime,timezone,timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import pandas as pd
-from .engine import MARKETS,RULES,FOCUS,FORMULA_VERSION,clean,compute,observations,expected_session,bar_end
+from .engine import MARKETS,RULES,FOCUS,FORMULA_VERSION,US_MARKETS,clean,compute,observations,expected_session,bar_end,venue,signal_names
 from .store import Store
 from . import sources
 
@@ -55,16 +55,14 @@ def _quality(market,prices,expected):
         if any(day not in prices.index for day in required):return 'invalid','最近40个UTC日存在价格缺口'
     else:
         from .calendar import closed
-        venue='CN' if market in ('CYB','CSI300') else 'HK'
+        exchange=venue(market)
         required=pd.date_range(prices.index[-1]-pd.Timedelta(days=45),prices.index[-1],freq='D')
-        if any(d.year>=2026 and not closed(venue,d.date()) and d not in prices.index for d in required):return 'invalid','最近45日存在未解释的交易日价格缺口'
+        if any(d.year>=2026 and not closed(exchange,d.date()) and d not in prices.index for d in required):return 'invalid','最近45日存在未解释的交易日价格缺口'
     return 'ok',None
 
 
 def unavailable_signals(market,quality,reason,ev):
-    names=list(RULES)[:7]
-    if market in ('HSI','HSTECH'):names.append('VHSI_GE30_DOWN')
-    if market=='BTC':names+=['FNG_LE20','FNG_RECOVER25']
+    names=signal_names(market)
     return [dict(market=market,signal_id=name,label=RULES[name],tier=FOCUS.get((market,name),'对照规则'),
                  state=None,new_event=None,quality=quality,missing_reason=reason,session_date=None,
                  formula_version=FORMULA_VERSION,research_version=ev.get('research_version'),current_values={},thresholds=[],
@@ -121,6 +119,7 @@ def run(root=ROOT,force=False,refresh=True,now=None):
         completed=datetime.now(timezone.utc) if refresh else now
         markets=[];signals=[];changes=0
         for market,meta in MARKETS.items():
+            market_launched=datetime.fromisoformat(store.setting('launched_at:'+FORMULA_VERSION+':'+market,completed.isoformat() if market in US_MARKETS else launched.isoformat()))
             try:expected=expected_session(market,completed)
             except ValueError as exc:
                 markets.append(dict(market=market,name=meta['name'],quality='pending',missing_reason=str(exc)))
@@ -144,14 +143,15 @@ def run(root=ROOT,force=False,refresh=True,now=None):
             latest_iv=str(lastiv.index[-1].date()) if len(lastiv) else None
             iv_lag_sessions=sum(str(d.date())>latest_iv for d in prices.index) if latest_iv else None
             iv_quality='ok' if latest_iv==day else 'pending' if iv_lag_sessions is not None and iv_lag_sessions<=1 else 'stale' if latest_iv else 'missing'
+            if not meta.get('iv_applicable',True):iv_quality='not_applicable'
             # Recalculate every historical edge on revision, but never emit TG notices.
-            if quality=='ok':changes+=store.update_events(market,prices,features,rules,completed,version,launched)
+            if quality=='ok':changes+=store.update_events(market,prices,features,rules,completed,version,market_launched)
             for row in obs:
                 if len(features)>1:
                     prior_day=str(features.index[-2].date())
                     prior=store.db.execute('SELECT payload FROM observations WHERE id=?',(f"{market}:{row['signal_id']}:{prior_day}:{FORMULA_VERSION}",)).fetchone()
                     prior_data=json.loads(prior[0]) if prior else None
-                    unknown=(prior_data.get('state') is None) if prior_data is not None else bar_end(market,prior_day)>=launched
+                    unknown=(prior_data.get('state') is None) if prior_data is not None else bar_end(market,prior_day)>=market_launched
                     if unknown:
                         row.update(new_event=None,event_id=None,event_start_uncertain=True)
                     elif row.get('state') is True and prior_data and prior_data.get('state') is True and prior_data.get('event_start_uncertain'):
@@ -177,7 +177,9 @@ def run(root=ROOT,force=False,refresh=True,now=None):
             signals.extend(obs)
             feature=clean(features.iloc[-1].to_dict());year=meta['year']
             price_point=price_points.get(day,{})
-            markets.append(dict(market=market,**meta,quality=quality,missing_reason=reason,expected_session_date=str(expected),session_date=day,
+            coverage=next((r for r in ev.get('audit',{}).get('us_extension',{}).get('markets',[]) if r['market']==market),{})
+            markets.append(dict(market=market,**meta,quality=quality,missing_reason=reason,expected_session_date=str(expected),session_date=day,launched_at=market_launched.isoformat(),
+                research_coverage={k:coverage.get(k) for k in ('price_start','price_end','iv_start','iv_end','price_bars','iv_bars')} if coverage else None,
                 bar_end_at=bar_end(market,day).isoformat(),available_at=price_point.get('available_at'),fetched_at=price_point.get('fetched_at'),
                 price=feature['close'],price_source=price_point.get('source'),price_adjustment='unadjusted OHLC/price index; excludes dividends',
                 features=feature,iv_last_value=float(lastiv.iloc[-1]) if len(lastiv) else None,iv_last_session=latest_iv,
@@ -194,11 +196,13 @@ def run(root=ROOT,force=False,refresh=True,now=None):
         for market,events in history.items():atomic(directory/'events'/f'{market}.json',dict(market=market,events=events))
         result=clean(dict(schema_version='1.0',snapshot_id=run_id,generated_at=completed.isoformat(),timezone='UTC',
             formula_version=FORMULA_VERSION,research_version=ev.get('research_version'),research_cutoff='2026-11-20',launched_at=launched.isoformat(),
-            markets=markets,signals=signals,quality='ok' if all(m['quality']=='ok' and m.get('iv_quality')=='ok' for m in markets) else 'partial',
+            markets=markets,signals=signals,quality='ok' if all(m['quality']=='ok' and m.get('iv_quality') in ('ok','not_applicable') for m in markets) else 'partial',
             source_errors=errors,forward=store.forward_summary(),duration_seconds=time.monotonic()-started,event_changes=changes,
             notes=['研究监控，不下单、不自动配仓；半年胜率不是明日或下周上涨概率',
                    'RV为实际波动率，不是隐波/VIX；恒科VHSI为跨指数参考；QVIX为第三方ETF隐波',
                    '历史回补不算上线后前瞻；未到期不计完成胜率；MAE为相对进入价最坏浮亏',
+                   '美股SPX配VIX、NDX配VXN；SOX只用自身RV；分别独立回测，不借用其他市场胜率',
+                   'VXN此次官方CSV起于2009-09-14，不能检验互联网泡沫和2008危机；美股按纽约完整交易日/夏令时/半日市',
                    '原始供应商发布时间未知时 available_at 是首次HTTP观测时间，不是事先可用时间']))
         store.db.execute('INSERT OR REPLACE INTO snapshots VALUES(?,?)',(run_id,json.dumps(result,ensure_ascii=False,allow_nan=False)));store.db.commit()
         atomic(directory/'latest.json',result);store.db.close()

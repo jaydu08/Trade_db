@@ -7,6 +7,9 @@ from modules.quant.runtime import atomic
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--input',type=Path,required=True);p.add_argument('--replay',type=Path,required=True);p.add_argument('--root',type=Path,required=True)
     a=p.parse_args();result,events=evidence(a.input,a.replay)
+    current=a.root/'data/quant/evidence.json'
+    if current.exists() and json.loads(current.read_text()).get('research_version')!=result['research_version']:
+        raise ValueError('Newer research bundle is installed; audit original study into an isolated --root to avoid removing its US extension')
     atomic(a.root/'data/quant/evidence.json',result)
     atomic(a.root/'data/quant/backtest_events.json',dict(research_version=result['research_version'],events=events))
     print(json.dumps(dict(research_version=result['research_version'],original_replay_verified=result['audit']['original_replay_verified'],

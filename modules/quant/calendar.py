@@ -17,6 +17,9 @@ def override(venue,year):
 
 
 def closed(venue,day):
+    if venue=='US':
+        from modules.market_sessions import us_is_session
+        return not us_is_session(day)
     if day.year==2026:
         from scripts.agent_market_calendar import closed_reason
         return bool(closed_reason(venue,day))
@@ -32,6 +35,9 @@ def last_session(venue,day):
 
 
 def close_time(venue,day,availability=False):
+    if venue=='US':
+        from modules.market_sessions import us_close_at
+        return us_close_at(day).time().replace(minute=20 if availability else 0)
     half=venue=='HK' and day in {date(2026,2,16),date(2026,12,24),date(2026,12,31),date(2027,2,5),date(2027,12,24),date(2027,12,31)}
     half=half or str(day) in override(venue,day.year).get('half_sessions',[])
     if half:return time(12,20 if availability else 10)
